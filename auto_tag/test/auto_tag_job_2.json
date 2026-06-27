@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "input_dirs": [
+    "/SDA/data_aqu_2024-12-26/试采/Pictures/Front"
+  ],
+  "rotate_angle": "ROTATE_90_COUNTERCLOCKWISE",
+  "b_yuv_image": false,
+  "mixed_yuv": true,
+  "yuv_type": "nv21",
+  "image_width": 640,
+  "image_height": 480
+}
