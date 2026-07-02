@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from auto_tag.backend.export_path_utils import save_export_file
 from auto_tag.core.config import settings
 from auto_tag.core.config_file_params import merge_stats_params_from_file
 from auto_tag.core.db_build_snapshot import read_build_snapshot
@@ -24,6 +25,27 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/database", tags=["database"])
 
 _EXPORT_MAX = 200_000
+
+
+def _finalize_json_export(
+    payload_bytes: bytes,
+    filename: str,
+    output_dir: Optional[str],
+) -> Response | Dict[str, Any]:
+    """浏览器附件下载，或写入 output_dir 后返回 JSON。"""
+    od = (output_dir or "").strip()
+    if od:
+        try:
+            return save_export_file(od, filename, payload_bytes)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    return Response(
+        content=payload_bytes,
+        media_type="application/json; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
 
 
 def _json_safe_response(obj: Any) -> Any:
@@ -289,14 +311,15 @@ def _database_stats_impl(
         "has_relation_diff": has_relation_diff,
         "has_questions_diff": has_questions_diff,
         "enable_recompute_relations": bool(has_snapshot and has_relation_diff),
-        "enable_rebuild_relations": True,
-        "enable_reannotate": bool(has_snapshot and has_questions_diff),
+        "enable_rebuild_relations": bool(has_snapshot),
+        "enable_reannotate": bool(has_snapshot and emb_count > 0),
+        "enable_reannotate_centers_only": bool(has_snapshot and emb_count > 0),
         "param_diff_table": diff_rows,
     }
     return _json_safe_response(payload)
 
 
-@router.get("/export_embeddings")
+@router.get("/export_embeddings", response_model=None)
 def export_embeddings(
     work_dir: Optional[str] = Query(None),
     mode: str = Query("range", description="range | cluster | chunk"),
@@ -305,7 +328,10 @@ def export_embeddings(
     cluster_id: Optional[str] = Query(None),
     chunk_index: int = Query(0, ge=0),
     chunk_size: int = Query(_EXPORT_MAX, ge=1, le=_EXPORT_MAX),
-) -> Response:
+    output_dir: Optional[str] = Query(
+        None, description="若指定则将 JSON 写入该目录（后端所在机器路径），否则浏览器下载"
+    ),
+) -> Response | Dict[str, Any]:
     """仅导出向量索引中的记录（embedding_records）。"""
     wr, emb_path, log_dir = _resolve_paths(work_dir)
     if not os.path.isdir(emb_path):
@@ -339,16 +365,10 @@ def export_embeddings(
     }
 
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="auto_tag_embeddings_{mode}.json"'
-        },
-    )
+    return _finalize_json_export(body, f"auto_tag_embeddings_{mode}.json", output_dir)
 
 
-@router.get("/export_duplicates")
+@router.get("/export_duplicates", response_model=None)
 def export_duplicates(
     work_dir: Optional[str] = Query(None),
     mode: str = Query("range", description="range | chunk"),
@@ -356,7 +376,8 @@ def export_duplicates(
     limit: int = Query(_EXPORT_MAX, ge=1, le=_EXPORT_MAX),
     chunk_index: int = Query(0, ge=0),
     chunk_size: int = Query(_EXPORT_MAX, ge=1, le=_EXPORT_MAX),
-) -> Response:
+    output_dir: Optional[str] = Query(None, description="若指定则写入该目录，否则浏览器下载"),
+) -> Response | Dict[str, Any]:
     """仅导出近重复侧车 duplicate_links。"""
     wr, emb_path, log_dir = _resolve_paths(work_dir)
     dup_file = os.path.join(log_dir, settings.duplicate_links_filename)
@@ -395,13 +416,7 @@ def export_duplicates(
         )
 
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="auto_tag_duplicates_{mode}.json"'
-        },
-    )
+    return _finalize_json_export(body, f"auto_tag_duplicates_{mode}.json", output_dir)
 
 
 class OptionalWorkDirBody(BaseModel):
@@ -417,8 +432,11 @@ class ReannotateBody(BaseModel):
     )
 
 
-@router.get("/export_compact_shared")
-def export_compact_shared(work_dir: Optional[str] = Query(None)) -> Response:
+@router.get("/export_compact_shared", response_model=None)
+def export_compact_shared(
+    work_dir: Optional[str] = Query(None),
+    output_dir: Optional[str] = Query(None, description="若指定则写入该目录，否则浏览器下载"),
+) -> Response | Dict[str, Any]:
     """紧凑导出：共享字典（labels / prefix / cluster / cluster_to_labels）。"""
     from auto_tag.core.compact_labels_export import (
         build_compact_export,
@@ -432,21 +450,16 @@ def export_compact_shared(work_dir: Optional[str] = Query(None)) -> Response:
         raise HTTPException(status_code=400, detail=str(e)) from e
     payload = shared_compact_dict(full)
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={
-            "Content-Disposition": 'attachment; filename="auto_tag_compact_labels_shared.json"'
-        },
-    )
+    return _finalize_json_export(body, "auto_tag_compact_labels_shared.json", output_dir)
 
 
-@router.get("/export_compact_slice")
+@router.get("/export_compact_slice", response_model=None)
 def export_compact_slice(
     work_dir: Optional[str] = Query(None),
     offset: int = Query(0, ge=0),
     limit: int = Query(_EXPORT_MAX, ge=1, le=_EXPORT_MAX),
-) -> Response:
+    output_dir: Optional[str] = Query(None, description="若指定则写入该目录，否则浏览器下载"),
+) -> Response | Dict[str, Any]:
     """紧凑导出：平行字段切片（images / labels_id / prefix_id / cluster_id）。"""
     from auto_tag.core.compact_labels_export import (
         build_compact_export,
@@ -460,21 +473,18 @@ def export_compact_slice(
         raise HTTPException(status_code=400, detail=str(e)) from e
     payload = slice_compact_parallel(full, offset=offset, limit=limit)
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="auto_tag_compact_slice_{offset}_{limit}.json"'
-        },
+    return _finalize_json_export(
+        body, f"auto_tag_compact_slice_{offset}_{limit}.json", output_dir
     )
 
 
-@router.get("/export_compact_chunk")
+@router.get("/export_compact_chunk", response_model=None)
 def export_compact_chunk(
     work_dir: Optional[str] = Query(None),
     chunk_index: int = Query(0, ge=0),
     chunk_size: int = Query(_EXPORT_MAX, ge=1, le=_EXPORT_MAX),
-) -> Response:
+    output_dir: Optional[str] = Query(None, description="若指定则写入该目录，否则浏览器下载"),
+) -> Response | Dict[str, Any]:
     """紧凑导出：按块切平行字段。"""
     from auto_tag.core.compact_labels_export import (
         build_compact_export,
@@ -490,12 +500,8 @@ def export_compact_chunk(
         full, chunk_index=chunk_index, chunk_size=chunk_size
     )
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    return Response(
-        content=body,
-        media_type="application/json; charset=utf-8",
-        headers={
-            "Content-Disposition": f'attachment; filename="auto_tag_compact_chunk_{chunk_index}.json"'
-        },
+    return _finalize_json_export(
+        body, f"auto_tag_compact_chunk_{chunk_index}.json", output_dir
     )
 
 

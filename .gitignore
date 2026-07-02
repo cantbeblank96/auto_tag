@@ -10,6 +10,8 @@ __pycache__/
 dist/
 build/
 *.whl
+.ruff_cache/
+.mypy_cache/
 
 # ============================================================
 # Virtual environments
@@ -24,26 +26,38 @@ ENV/
 # ============================================================
 work_dir/
 run_work/
+auto_tag/work_dir/
+auto_tag/chroma_data/
+**/embedding_index/
+**/chroma_data/
 *.log
 *.sqlite
 *.db
 output.json
 output/*.json
+failed_images.json
+web_job_history.json
+auto_tag_db_build_snapshot.json
 
 # ============================================================
-# Configuration & secrets
+# Configuration & secrets（勿提交真实密钥）
 # ============================================================
 .env
 .env.*
 !.env.example
+auto_tag/.env
 config.json
+auto_tag/config.json
 *.bak
+*.local
 
 # ============================================================
-# IDE / Editor
+# IDE / Editor / Cursor（协作工具，非开源产物）
 # ============================================================
 .idea/
 .vscode/
+.cursor/
+.cursorignore
 *.swp
 *~
 .DS_Store
@@ -63,14 +77,13 @@ htmlcov/
 .ipynb_checkpoints/
 
 # ============================================================
-# Project-internal files (not for open source)
+# Internal / draft（不随开源发布）
 # ============================================================
 AGENTS.md
-.cursor/
-.cursorignore
 plan.md
 promt.md
-notes/
+git_push.sh
+plans/
 
 # ============================================================
 # SpecStory
@@ -83,11 +96,9 @@ notes/
 checkpoints/
 _old_version/
 temp/
-git_push.sh
 .playwright-mcp/
 .temp
 test_preview.jpg
-plans/
 
 # ============================================================
 # Node / JS (Vite frontend)

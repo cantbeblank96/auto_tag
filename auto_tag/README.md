@@ -20,12 +20,11 @@
 
 ### 环境依赖
 
-确保系统中已安装 Python 3.10+ 环境。在 `auto_tag` 目录下执行：
+在**仓库根目录**使用 [uv](https://docs.astral.sh/uv/) 安装依赖（见 `pyproject.toml` / `uv.lock`）：
 
 ```bash
-pip install -r requirements.txt
-# 可选：Web 控制台（FastAPI + Streamlit）
-pip install -r requirements-web.txt
+bash scripts/linux/setup_uv_env.sh
+# 或：uv sync --extra web
 ```
 
 系统依赖于 `PyTorch` 运行 CLIP，建议您的系统具备可用的 CUDA 环境以获得最佳性能。
@@ -75,7 +74,6 @@ VLM_API_KEY=None
     "tau_dup": 0.05,
     "tau_cls": 0.15,
     "embedding_subdir": "embedding_index",
-    "embedding_subdir": "embedding_index",
     "duplicate_links_filename": "duplicate_links.sqlite"
 }
 ```
@@ -89,10 +87,10 @@ VLM_API_KEY=None
 使用入口脚本 `main.py` 即可开始对配置的目录下的图像进行扫描、聚类和自动打标：
 
 ```bash
-conda activate agent_d   # 本仓库请在 agent_d 环境中运行（见仓库根目录 AGENTS.md）
-cd [auto_tag父目录]
-cur=`pwd`
-export PYTHONPATH=$cur:$PYTHONPATH
+bash scripts/linux/setup_uv_env.sh   # 首次：uv 创建 .venv 并安装依赖
+source .venv/bin/activate
+cd [仓库根目录]
+export PYTHONPATH=$PWD:$PYTHONPATH
 
 # 基本运行：日志写入 work_dir/log，向量索引写入 work_dir/<embedding_subdir>（见 config.json）
 python -m auto_tag.main --input_dir /path/to/images --work_dir ./work
@@ -164,19 +162,19 @@ python -m auto_tag.view_db --output_path xxxxx
 
 FastAPI（`auto_tag/backend`）与 React 前端（`auto_tag/web/`）分进程，经 HTTP 通信。v2 前端使用 **Vite + Tailwind v4 + React 19 + react-router-dom v7**，开发服务器端口 **5020**，通过 Vite proxy 代理 `/api` 到后端 **8000**。
 
-启动可参考 `auto_tag/scripts/run_web_backend.sh`、`run_web_frontend_v2.sh`。
+启动可参考 `scripts/linux/run_web_backend.sh`、`scripts/linux/run_web_frontend_v2.sh`（Windows 见 `scripts/windows/`）。
 
 > 旧版 Streamlit 前端保留在 `auto_tag/frontend_streamlit/`，由 `run_web_frontend.sh` 启动（端口 8501）。
 
 ### React 页面概要
 
-* **标注任务**：创建/提交/监控标注流水线。包含任务表单、参数配置（YUV/旋转/跳过库中已有路径）、确认前目录校验、任务队列管理（2s 轮询进度）、**清除历史记录**（隐藏此刻之前的任务，实际数据保留在服务端内存中）。
-* **任务查询**：浏览后端全部历史任务记录，支持按时间正序/倒序排列、手动刷新。
-* **图片查询**：先查向量索引，再查 `log` 下侧车；仅命中侧车时除 `duplicate_links` 外，会附带 **`anchor_embedding_records`**（自动查询各 `anchor_path` 在索引中的结果）。支持编辑/保存标签（仅本图或整簇同步）、插入新记录。
-* **数据库**：状态刷新带 config 差异比对；仅重算关系/完全重建索引/更新标注（全量/增量/仅簇中心）；多种导出（索引记录、侧车、紧凑标注）。默认 `limit` / 分块大小均为 **200000**。
-* **设置**：VLM 模型列表、熔断器参数、Questions 在线编辑。
-* **教程**：使用指南。
-* **其他**：健康检查、关于信息。
+侧栏顺序：**任务** → **数据库** → **图片查询** → **设置**；点击顶部 **Auto Tag** 进入首页（教程 + 系统信息）。访问地址：**http://localhost:5020**。
+
+* **首页**：可折叠使用教程；服务状态（`GET /api/health`）、**重启后端**（从磁盘重载 `config.json`，会中断进行中任务）。
+* **标注任务**：创建/提交/监控标注流水线；任务表单、YUV/旋转/跳过库中已有路径、目录校验、队列与进度轮询；页内 **「查询」** 章节浏览全部历史（默认折叠）、清除历史显示。
+* **图片查询**：先查向量索引，再查侧车；侧车命中时附带 **`anchor_embedding_records`**。支持标签编辑（`image_only` / `with_cluster`）、预览与 YUV 解码。
+* **数据库**：统计与 config 快照差异比对；重算关系 / 完全重建 / 更新标注；多种导出（默认 `limit` **200000**）。「更新」区内 JSON 详情默认折叠。
+* **设置**：`vlm_models`（含 **`id`** 端点标识）、熔断器、Questions 在线编辑；保存后可重启后端生效。
 
 ### REST 要点
 
@@ -283,5 +281,5 @@ graph TD
 * `core/duplicate_store.py`：Stage 1 冗余侧车（默认 SQLite，可选 JSONL）。
 * `core/utils/load_image.py`：普通图 / YUV / 旋转 / `load_image_for_job`。
 * `backend/`：FastAPI 服务（`uvicorn auto_tag.backend.app:app`），与 Streamlit 分进程、HTTP 对接。
-* `frontend_streamlit/`：Streamlit 控制台（`streamlit run auto_tag/frontend_streamlit/app.py`）。Web 依赖见 `requirements-web.txt`，说明见 [notes/IMPLEMENTATION_AND_ARCHITECTURE.md](notes/IMPLEMENTATION_AND_ARCHITECTURE.md)。
-* `scripts/`：试跑与 Web 启动脚本（`run_trial_front.sh`、`run_web_backend.sh`、`run_web_frontend.sh`）。
+* `frontend_streamlit/`：Streamlit 控制台（`streamlit run auto_tag/frontend_streamlit/app.py`）。Web 依赖见仓库根目录 `pyproject.toml` 的 `[project.optional-dependencies.web]`。
+* `scripts/linux/`、`scripts/windows/`：uv 检测/安装、环境配置与 Web/试跑启动脚本。

@@ -4,7 +4,7 @@ from kevin_toolbox.data_flow.file import json_
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
-from auto_tag.core.circuit_breaker import CircuitBreakerConfig
+from auto_tag.core.circuit_breaker import CircuitBreakerConfig, get_circuit_breaker
 
 # auto_tag 包根目录（与 config.json、.env 同级）
 _AUTO_TAG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,11 +54,14 @@ def _cfg_db_path() -> str:
     return f"./{_cfg_embedding_subdir()}"
 
 
+from auto_tag.core.vlm_model_utils import ensure_vlm_model_ids
+
+
 def _cfg_vlm_models() -> List[Dict[str, Any]]:
     """从 config.json 读取多模型列表，若无则从 .env 回退为单模型。"""
     models = cfg.get("vlm_models")
     if isinstance(models, list) and len(models) > 0:
-        return models
+        return ensure_vlm_model_ids(models)
     # 向后兼容：从 .env 的单模型
     name = os.getenv("VLM_MODEL_NAME", "None")
     key = os.getenv("VLM_API_KEY", "None")
@@ -161,3 +164,44 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def reload_settings_from_disk() -> None:
+    """从磁盘 config.json 重新加载配置到进程内 settings 与全局 cfg。"""
+    global cfg
+    path = config_json_path
+    new_cfg: dict = {}
+    if os.path.exists(path):
+        new_cfg = json_.read(file_path=path, b_use_suggested_converter=True)
+    cfg.clear()
+    cfg.update(new_cfg)
+
+    cb = _cfg_circuit_breaker()
+    updates: Dict[str, Any] = {
+        "work_dir": _cfg_work_dir(),
+        "db_path": _cfg_db_path(),
+        "embedding_subdir": _cfg_embedding_subdir(),
+        "batch_size": int(cfg.get("batch_size", 32)),
+        "tau_dup": float(cfg.get("tau_dup", 0.05)),
+        "tau_cls": float(cfg.get("tau_cls", 0.25)),
+        "vlm_models": _cfg_vlm_models(),
+        "vlm_strategy": str(cfg.get("vlm_strategy", "priority")),
+        "questions": dict(cfg.get("questions") or {}),
+        "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),
+        "duplicate_links_filename": str(
+            cfg.get("duplicate_links_filename", "duplicate_links.sqlite")
+        ),
+        "circuit_breaker_time_window": cb["time_window_seconds"],
+        "circuit_breaker_failure_threshold": cb["failure_rate_threshold"],
+        "circuit_breaker_cooldown": cb["cooldown_seconds"],
+    }
+    for key, value in updates.items():
+        object.__setattr__(settings, key, value)
+
+    get_circuit_breaker().update_config(
+        CircuitBreakerConfig(
+            time_window_seconds=cb["time_window_seconds"],
+            failure_rate_threshold=cb["failure_rate_threshold"],
+            cooldown_seconds=cb["cooldown_seconds"],
+        )
+    )

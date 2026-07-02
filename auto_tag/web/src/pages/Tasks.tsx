@@ -1,5 +1,33 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { api, type JobStatusResponse, type JobSummary } from '../api/client'
+import TaskQuerySection from '../components/TaskQuerySection'
+
+const sectionTitleCls =
+  'text-lg font-semibold text-gray-800 dark:text-gray-100 border-b border-gray-200 dark:border-gray-700 pb-2 mb-4'
+
+function ChapterSection({
+  title,
+  children,
+  defaultCollapsed = false,
+}: {
+  title: string
+  children: ReactNode
+  defaultCollapsed?: boolean
+}) {
+  const [open, setOpen] = useState(!defaultCollapsed)
+  return (
+    <section className="mb-10 last:mb-0">
+      <h3
+        className={`${sectionTitleCls} cursor-pointer select-none flex items-center gap-2`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="text-xs text-blue-500 shrink-0">{open ? '▼' : '▶'}</span>
+        {title}
+      </h3>
+      {open && children}
+    </section>
+  )
+}
 
 const ROTATE_OPTIONS = [
   { label: '不旋转', value: '' },
@@ -132,7 +160,7 @@ export default function Tasks() {
     const now = Date.now()
     setLastSeenAt(now)
     localStorage.setItem(LS_LAST_SEEN, String(now))
-    showMsg('已隐藏此时间之前的任务记录（可在「任务查询」中查看全部）')
+    showMsg('已隐藏此时间之前的任务记录（可在下方「查询」章节查看全部）')
   }
 
   // Poll running jobs
@@ -294,12 +322,16 @@ export default function Tasks() {
 
   return (
     <div>
-      <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">标注任务</h2>
-      {msg && <div className="mb-4 px-4 py-2 rounded text-sm bg-blue-50 text-blue-700 border border-blue-200">{msg}</div>}
+      <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-6">任务</h2>
+      {msg && (
+        <div className="mb-4 px-4 py-2 rounded text-sm bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+          {msg}
+        </div>
+      )}
 
-      {/* Load & Save */}
-      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
-        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">加载 & 保存</h3>
+      <ChapterSection title="标注">
+        <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
+          <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">加载 & 保存</h4>
         <div className="flex items-center gap-4">
           <button onClick={downloadTaskJson} className="px-3 py-1.5 text-sm border border-gray-300 rounded hover:bg-gray-50">
             保存并下载任务 JSON
@@ -309,11 +341,10 @@ export default function Tasks() {
             <input type="file" accept=".json" onChange={uploadTaskJson} className="hidden" />
           </label>
         </div>
-      </section>
+        </section>
 
-      {/* New task form */}
-      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
-        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">新建</h3>
+        <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
+          <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">新建</h4>
         <div className="space-y-4">
           <div>
             <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">输入目录（每行一个绝对路径）</label>
@@ -364,11 +395,10 @@ export default function Tasks() {
             确认
           </button>
         </div>
-      </section>
+        </section>
 
-      {/* Run section */}
-      <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
-        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">运行</h3>
+        <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+          <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">运行</h4>
         <div className="mb-4">
           <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={skipIfInDb} onChange={e => setSkipIfInDb(e.target.checked)} />
@@ -475,9 +505,14 @@ export default function Tasks() {
         </div>
 
         {displayQueue.length === 0 && (
-          <p className="text-xs text-gray-400 mt-2">尚无已确认的任务；请先在「新建」中填写并点击「确认」加入队列。</p>
+          <p className="text-xs text-gray-400 dark:text-gray-500 mt-2">尚无已确认的任务；请先在「新建」中填写并点击「确认」加入队列。</p>
         )}
-      </section>
+        </section>
+      </ChapterSection>
+
+      <ChapterSection title="查询" defaultCollapsed>
+        <TaskQuerySection />
+      </ChapterSection>
     </div>
   )
 }

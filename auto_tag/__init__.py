@@ -1,1 +1,3 @@
-__version__ = "0.0.1"
+from auto_tag.constant import VERSION
+
+__version__ = VERSION

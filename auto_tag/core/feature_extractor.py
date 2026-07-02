@@ -7,6 +7,28 @@ from transformers import CLIPProcessor, CLIPModel
 logger = logging.getLogger(__name__)
 
 
+def _cuda_usable() -> bool:
+    """``torch.cuda.is_available()`` 为 True 时仍可能因算力/驱动与 wheel 不匹配而无法执行。"""
+    if not torch.cuda.is_available():
+        return False
+    try:
+        torch.zeros(1, device="cuda").add_(1)
+        torch.cuda.synchronize()
+        return True
+    except Exception as e:
+        logger.warning("CUDA 不可用（将回退 CPU）: %s", e)
+        return False
+
+
+def _resolve_device(preferred: str) -> str:
+    pref = (preferred or "cpu").strip().lower()
+    if pref == "cuda" and _cuda_usable():
+        return "cuda"
+    if pref == "cuda":
+        logger.warning("配置为 cuda 但当前 GPU/PyTorch 无法执行 CUDA 算子，改用 CPU。")
+    return "cpu"
+
+
 class FeatureExtractor:
     def __init__(self, model_name: str, device: str = "cuda"):
         """
@@ -16,7 +38,7 @@ class FeatureExtractor:
             model_name: HuggingFace 模型名称
             device: 运行设备 ('cuda' 或 'cpu')
         """
-        self.device = device if torch.cuda.is_available() and device == "cuda" else "cpu"
+        self.device = _resolve_device(device)
         logger.info(f"Loading CLIP model {model_name} on {self.device}...")
         try:
             self.model = CLIPModel.from_pretrained(model_name).to(self.device)
@@ -42,10 +64,18 @@ class FeatureExtractor:
             return []
 
         try:
-            # 前向传播提取特征
-            inputs = self.processor(images=images, return_tensors="pt").to(self.device)
+            # 前向传播提取特征（仅传 pixel_values，兼容 transformers 5.x 返回值）
+            inputs = self.processor(images=images, return_tensors="pt")
+            pixel_values = inputs["pixel_values"].to(self.device)
             with torch.no_grad():
-                features = self.model.get_image_features(**inputs)
+                features = self.model.get_image_features(pixel_values=pixel_values)
+                if not isinstance(features, torch.Tensor):
+                    if hasattr(features, "pooler_output") and features.pooler_output is not None:
+                        features = features.pooler_output
+                    else:
+                        raise TypeError(
+                            f"Unexpected get_image_features return type: {type(features)}"
+                        )
                 # 必须进行 L2 归一化，以便计算余弦相似度
                 features = features / features.norm(p=2, dim=-1, keepdim=True)
 

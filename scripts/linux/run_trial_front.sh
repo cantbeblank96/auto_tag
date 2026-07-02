@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# 试采 Front 目录：混合 JPG/NV21、640x480、逆时针 90°（与 notes 中示例一致）
-# 用法：在任意目录执行 bash auto_tag/scripts/run_trial_front.sh
-# 可覆盖：INPUT_DIR、WORK_DIR、PYTHON_EXECUTABLE（见 _conda_agent_d.sh）
+# 试采 Front 目录
+# 用法：bash scripts/linux/run_trial_front.sh
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "$SCRIPT_DIR/_conda_agent_d.sh"
+source "$SCRIPT_DIR/_uv_env.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
 INPUT_DIR="${INPUT_DIR:-/SDA/data_aqu_2024-12-26/试采/Pictures/Front}"
 WORK_DIR="${WORK_DIR:-$REPO_ROOT/run_work_front}"

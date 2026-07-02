@@ -3,7 +3,6 @@ import { api, type ByPathResponse } from '../api/client'
 
 export default function ImageQuery() {
   const [imagePath, setImagePath] = useState('')
-  const [workDir, setWorkDir] = useState('')
   const [yuvW, setYuvW] = useState(640)
   const [yuvH, setYuvH] = useState(480)
   const [yuvType, setYuvType] = useState('nv21')
@@ -28,7 +27,6 @@ export default function ImageQuery() {
     try {
       const res = await api.recordByPath({
         image_path: imagePath.trim(),
-        ...(workDir.trim() ? { work_dir: workDir.trim() } : {}),
       })
       setResult(res)
       // Auto-populate label text
@@ -50,7 +48,6 @@ export default function ImageQuery() {
     try {
       const blob = await api.previewImage({
         image_path: path,
-        ...(workDir.trim() ? { work_dir: workDir.trim() } : {}),
         image_width: yuvW,
         image_height: yuvH,
         yuv_type: yuvType,
@@ -71,7 +68,6 @@ export default function ImageQuery() {
         image_path: path,
         labels,
         mode,
-        ...(workDir.trim() ? { work_dir: workDir.trim() } : {}),
         image_width: yuvW,
         image_height: yuvH,
         yuv_type: yuvType,
@@ -93,7 +89,6 @@ export default function ImageQuery() {
         image_path: imagePath.trim(),
         labels,
         mode: 'image_only',
-        ...(workDir.trim() ? { work_dir: workDir.trim() } : {}),
         image_width: yuvW,
         image_height: yuvH,
         yuv_type: yuvType,
@@ -111,7 +106,7 @@ export default function ImageQuery() {
     <div>
       <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-2">图片查询</h2>
       <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
-        按 image_path 查询：优先向量索引；若无记录再查 log 下近重复侧车表（不占索引空间）。
+        按 image_path 查询：优先向量索引；若无记录再查 log 下近重复侧车表。work_dir 使用服务端 config 默认配置。
       </p>
 
       {msg && <div className="mb-4 px-4 py-2 rounded text-sm bg-blue-50 text-blue-700 border border-blue-200">{msg}</div>}
@@ -119,12 +114,8 @@ export default function ImageQuery() {
       <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6 max-w-2xl">
         <div className="space-y-3">
           <div>
-            <label className="block text-sm text-gray-600 mb-1">图片绝对路径</label>
-            <input type="text" value={imagePath} onChange={e => setImagePath(e.target.value)} className="w-full border rounded px-3 py-2 text-sm font-mono" />
-          </div>
-          <div>
-            <label className="block text-sm text-gray-600 mb-1">work_dir（可选，不填则使用服务端默认配置）</label>
-            <input type="text" value={workDir} onChange={e => setWorkDir(e.target.value)} placeholder="/path/to/work_dir" className="w-full border rounded px-3 py-2 text-sm font-mono" />
+            <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">图片绝对路径</label>
+            <input type="text" value={imagePath} onChange={e => setImagePath(e.target.value)} className="w-full border border-gray-300 dark:border-gray-600 rounded px-3 py-2 text-sm font-mono bg-white dark:bg-gray-900 dark:text-gray-200" />
           </div>
           <p className="text-xs text-gray-400">若未入库且为 YUV，可在下方填写解码参数后再点预览。</p>
           <div className="flex gap-4">

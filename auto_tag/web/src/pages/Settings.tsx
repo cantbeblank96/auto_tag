@@ -1,13 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api/client'
-
-const PROJECT_ROOT = '/home/SENSETIME/xukaiming/Desktop/my_repos/python_projects/kevin_auto_tag/auto_tag'
-const PROJECT_PATH_MACRO = '{PROJECT_PATH}'
-const DEFAULT_CONFIG_PATH = `${PROJECT_PATH_MACRO}/config.json`
-
-function fromMacroPath(macro: string): string {
-  return macro.replace(PROJECT_PATH_MACRO, PROJECT_ROOT)
-}
+import { DEFAULT_CONFIG_PATH, fromMacroPath, PROJECT_PATH_MACRO, PROJECT_ROOT } from '../constants/config'
+import { waitForBackendHealthy } from '../utils/backendHealth'
 
 // ── Types ──────────────────────────────────────────────
 
@@ -25,9 +19,30 @@ interface QuestionEntry {
 }
 
 interface ModelEntry {
+  id: string
   name: string; base_url: string | null; api_key: string; priority: number; enabled?: boolean
   tripped?: boolean; failures_in_window?: number; total_calls?: number
   failure_rate?: number; last_error?: string
+}
+
+function newModelId(): string {
+  return crypto.randomUUID()
+}
+
+function normalizeModelEntry(m: Partial<ModelEntry>, index: number): ModelEntry {
+  return {
+    id: m.id || newModelId(),
+    name: m.name || '',
+    base_url: m.base_url ?? null,
+    api_key: m.api_key || '',
+    priority: m.priority ?? index + 1,
+    enabled: m.enabled ?? true,
+    tripped: m.tripped,
+    failures_in_window: m.failures_in_window,
+    total_calls: m.total_calls,
+    failure_rate: m.failure_rate,
+    last_error: m.last_error,
+  }
 }
 
 type QuestionDetail = Record<string, any>
@@ -51,6 +66,16 @@ function questionToDetail(q: QuestionEntry): QuestionDetail | null {
   return d
 }
 
+function questionsToObject(entries: QuestionEntry[]): Record<string, any> {
+  const questionsObj: Record<string, any> = {}
+  for (const q of entries) {
+    if (!q.key.trim()) continue
+    const detail = questionToDetail(q)
+    if (detail) questionsObj[q.key.trim()] = detail
+  }
+  return questionsObj
+}
+
 function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
   const t = String(detail.type || 'string')
   return {
@@ -67,6 +92,16 @@ function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
 
 function emptyQuestion(): QuestionEntry {
   return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}' }
+}
+
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_, v) => v, 0)
+}
+
+interface RestartDialogState {
+  open: boolean
+  activeJobCount: number
+  restarting: boolean
 }
 
 // ── Component ──────────────────────────────────────────
@@ -97,8 +132,40 @@ export default function Settings() {
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
   const [questionSearch, setQuestionSearch] = useState('')
+  const baselineConfigRef = useRef<string>('')
+  const [restartDialog, setRestartDialog] = useState<RestartDialogState>({
+    open: false,
+    activeJobCount: 0,
+    restarting: false,
+  })
 
   useEffect(() => { loadEverything() }, [])
+
+  const buildConfigPayload = useCallback(() => {
+    return {
+      work_dir: workDir,
+      batch_size: batchSize,
+      tau_dup: tauDup,
+      tau_cls: tauCls,
+      embedding_subdir: 'embedding_index',
+      record_stage1_duplicates: recDup,
+      duplicate_links_filename: 'duplicate_links.sqlite',
+      vlm_models: models.map(m => ({
+        id: m.id,
+        name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
+      })),
+      questions: questionsToObject(questions),
+      vlm_strategy: vlmStrategy,
+      circuit_breaker: {
+        time_window_seconds: cbTimeWindow,
+        failure_rate_threshold: cbFailureThreshold,
+        cooldown_seconds: cbCooldown,
+      },
+    }
+  }, [
+    questions, workDir, batchSize, tauDup, tauCls, recDup, models,
+    vlmStrategy, cbTimeWindow, cbFailureThreshold, cbCooldown,
+  ])
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
     setMsg(text); setMsgType(type); setTimeout(() => setMsg(''), 5000)
@@ -119,61 +186,104 @@ export default function Settings() {
         setRecDup(cfg.record_stage1_duplicates ?? true)
         // Load questions
         const qs = cfg.questions || {}
-        setQuestions(Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail)))
-        // Load models from config.json (not from API, avoids stale in-memory state)
+        const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
+        setQuestions(loadedQuestions)
+        // Load models from config.json（id 以磁盘为准；熔断状态从后端 API 合并）
         const rawModels = cfg.vlm_models || []
-        if (rawModels.length > 0) {
-          setModels(rawModels.map((m: any, i: number) => ({ ...m, priority: m.priority ?? (i + 1) })))
-        } else {
-          // Fallback: single model from .env
-          setModels([{ name: 'None', base_url: null, api_key: '', priority: 1 }])
-        }
+        let loadedModels = rawModels.length > 0
+          ? rawModels.map((m: any, i: number) => normalizeModelEntry(m, i))
+          : [normalizeModelEntry({ name: 'None', base_url: null, api_key: '', priority: 1 }, 0)]
+        try {
+          const live = await api.getModels()
+          const stateById = new Map<string, any>(
+            (live.models || []).map((m: any) => [String(m.id || m.endpoint_id), m]),
+          )
+          loadedModels = loadedModels.map((m) => {
+            const st = stateById.get(m.id)
+            if (!st) return m
+            return {
+              ...m,
+              tripped: st.tripped,
+              failures_in_window: st.failures_in_window,
+              total_calls: st.total_calls,
+              failure_rate: st.failure_rate,
+              last_error: st.last_error,
+            }
+          })
+        } catch { /* 后端未就绪时仅展示 config */ }
+        setModels(loadedModels)
         setVlmStrategy(cfg.vlm_strategy || 'priority')
         // Circuit breaker config
         const cb = cfg.circuit_breaker || {}
         setCbTimeWindow(cb.time_window_seconds ?? 300)
         setCbFailureThreshold(cb.failure_rate_threshold ?? 0.5)
         setCbCooldown(cb.cooldown_seconds ?? 600)
+        baselineConfigRef.current = stableStringify({
+          work_dir: cfg.work_dir ?? `${PROJECT_PATH_MACRO}/work_dir`,
+          batch_size: cfg.batch_size ?? 32,
+          tau_dup: cfg.tau_dup ?? 0.05,
+          tau_cls: cfg.tau_cls ?? 0.25,
+          embedding_subdir: cfg.embedding_subdir ?? 'embedding_index',
+          record_stage1_duplicates: cfg.record_stage1_duplicates ?? true,
+          duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
+          vlm_models: loadedModels.map((m) => ({
+            id: m.id,
+            name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
+          })),
+          questions: questionsToObject(loadedQuestions),
+          vlm_strategy: cfg.vlm_strategy || 'priority',
+          circuit_breaker: {
+            time_window_seconds: cb.time_window_seconds ?? 300,
+            failure_rate_threshold: cb.failure_rate_threshold ?? 0.5,
+            cooldown_seconds: cb.cooldown_seconds ?? 600,
+          },
+        })
       }
     } catch { /* ignore */ }
   }
 
-  const saveAll = async () => {
+  const writeConfigToDisk = async (cfg: Record<string, any>) => {
     const p = fromMacroPath(configPath)
-    // Build config
-    const questionsObj: Record<string, any> = {}
-    for (const q of questions) {
-      if (!q.key.trim()) continue
-      const detail = questionToDetail(q)
-      if (detail) questionsObj[q.key.trim()] = detail
-    }
-    const cfg = {
-      work_dir: workDir,
-      batch_size: batchSize,
-      tau_dup: tauDup,
-      tau_cls: tauCls,
-      embedding_subdir: 'embedding_index',
-      record_stage1_duplicates: recDup,
-      duplicate_links_filename: 'duplicate_links.sqlite',
-      vlm_models: models.map(m => ({
-        name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
-      })),
-      questions: questionsObj,
-      vlm_strategy: vlmStrategy,
-      circuit_breaker: {
-        time_window_seconds: cbTimeWindow,
-        failure_rate_threshold: cbFailureThreshold,
-        cooldown_seconds: cbCooldown,
-      },
-    }
+    const res = await fetch('/api/utils/write_file', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: p, content: JSON.stringify(cfg, null, 4) }),
+    })
+    if (!res.ok) throw new Error((await res.json()).detail || 'write failed')
+  }
+
+  const handleRestartBackend = async () => {
+    setRestartDialog(prev => ({ ...prev, restarting: true }))
     try {
-      const res = await fetch('/api/utils/write_file', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: p, content: JSON.stringify(cfg, null, 4) }),
-      })
-      if (!res.ok) throw new Error((await res.json()).detail || 'write failed')
-      showMsg('所有设置已保存')
+      await api.restartBackend()
+      const ok = await waitForBackendHealthy()
+      if (!ok) throw new Error('后端重启后未能及时恢复，请手动执行 run_web_backend.sh')
+      await loadEverything()
+      setRestartDialog({ open: false, activeJobCount: 0, restarting: false })
+      showMsg('后端已重启，新配置已加载到内存')
+    } catch (e: any) {
+      setRestartDialog(prev => ({ ...prev, restarting: false }))
+      showMsg(`重启失败: ${e.message}`, 'error')
+    }
+  }
+
+  const saveAll = async () => {
+    const cfg = buildConfigPayload()
+    const effectiveChange = stableStringify(cfg) !== baselineConfigRef.current
+    try {
+      await writeConfigToDisk(cfg)
+      baselineConfigRef.current = stableStringify(cfg)
       setIsDirty(false)
+      if (!effectiveChange) {
+        showMsg('设置已保存（无实质变更）')
+        return
+      }
+      showMsg('设置已保存到磁盘')
+      let activeJobCount = 0
+      try {
+        const status = await api.backendStatus()
+        activeJobCount = status.active_job_count
+      } catch { /* ignore */ }
+      setRestartDialog({ open: true, activeJobCount, restarting: false })
     } catch (e: any) { showMsg(`保存失败: ${e.message}`, 'error') }
   }
 
@@ -201,9 +311,9 @@ export default function Settings() {
 
   // Model handlers
   const addModel = () => {
-    setModels([...models, {
+    setModels([...models, normalizeModelEntry({
       name: '', base_url: null, api_key: '', priority: models.length + 1, enabled: true,
-    }])
+    }, models.length)])
     markDirty()
   }
   const removeModel = (idx: number) => {
@@ -231,12 +341,22 @@ export default function Settings() {
     setModels(next.map((m, i) => ({ ...m, priority: i + 1 })))
     markDirty()
   }
-  const handleTestModel = async (name: string) => {
-    if (!name) { showMsg('请先填写模型名称', 'error'); return }
-    setTestingModels(p => ({ ...p, [name]: true }))
-    try { const res = await api.testModel(name); setTestResults(p => ({ ...p, [name]: res })) }
-    catch (e: any) { setTestResults(p => ({ ...p, [name]: { ok: false, error: e.message } })) }
-    finally { setTestingModels(p => ({ ...p, [name]: false })) }
+  const handleTestModel = async (model: ModelEntry) => {
+    if (!model.name) { showMsg('请先填写模型名称', 'error'); return }
+    const key = model.id
+    setTestingModels(p => ({ ...p, [key]: true }))
+    try {
+      const res = await api.testModel({
+        id: model.id,
+        name: model.name,
+        base_url: model.base_url,
+        api_key: model.api_key,
+        priority: model.priority,
+      })
+      setTestResults(p => ({ ...p, [key]: res }))
+    }
+    catch (e: any) { setTestResults(p => ({ ...p, [key]: { ok: false, error: e.message } })) }
+    finally { setTestingModels(p => ({ ...p, [key]: false })) }
   }
 
   /** 判断自由形式 JSON 是否包含模版必需的字段，从而能否被形式校验。 */
@@ -286,7 +406,7 @@ export default function Settings() {
           {models.length === 0 && <p className="text-xs text-gray-400 py-4 text-center">暂无模型。点击「+ 添加模型」添加。</p>}
           <div className="space-y-3 max-h-[26rem] overflow-y-auto pr-1">
             {models.map((m, idx) => (
-              <div key={idx} className={`border rounded-lg p-3 ${(m.enabled ?? true) ? 'border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50' : 'border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/30 opacity-60'}`}>
+              <div key={m.id} className={`border rounded-lg p-3 ${(m.enabled ?? true) ? 'border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50' : 'border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/30 opacity-60'}`}>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs font-medium text-gray-500 dark:text-gray-400"># {m.priority}</span>
                   <div className="flex gap-1">
@@ -312,12 +432,12 @@ export default function Settings() {
                     {m.last_error && <span className="text-red-400 truncate max-w-48" title={m.last_error}>{m.last_error}</span>}
                   </div>
                 )}
-                {testResults[m.name] && (
-                  <div className={`mt-1 text-xs ${testResults[m.name].ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                    {testResults[m.name].ok ? `连通成功 (${testResults[m.name].latency_ms}ms)` : `连通失败: ${testResults[m.name].error}`}
+                {testResults[m.id] && (
+                  <div className={`mt-1 text-xs ${testResults[m.id].ok ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                    {testResults[m.id].ok ? `连通成功 (${testResults[m.id].latency_ms}ms)` : `连通失败: ${testResults[m.id].error}`}
                   </div>
                 )}
-                <button onClick={() => handleTestModel(m.name)} disabled={testingModels[m.name] || !m.name} className="mt-2 px-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-50 dark:text-gray-300">{testingModels[m.name] ? '测试中...' : '测试连通'}</button>
+                <button onClick={() => handleTestModel(m)} disabled={testingModels[m.id] || !m.name} className="mt-2 px-3 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-50 dark:text-gray-300">{testingModels[m.id] ? '测试中...' : '测试连通'}</button>
                 </>)}
               </div>
             ))}
@@ -461,6 +581,53 @@ export default function Settings() {
           </div>
         </section>
       </div>
+
+      {restartDialog.open && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="restart-dialog-title"
+            className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-600 dark:bg-gray-800"
+          >
+            <h3 id="restart-dialog-title" className="text-base font-semibold text-gray-900 dark:text-gray-100">
+              是否立即重启后端？
+            </h3>
+            <div className="mt-3 space-y-2 text-sm leading-relaxed text-gray-600 dark:text-gray-300">
+              <p>
+                配置已写入磁盘，但后端进程仍在使用<strong className="font-medium text-gray-800 dark:text-gray-100">启动时加载到内存</strong>的旧配置。
+                标注任务、数据库维护、VLM 调用等实际执行都读取内存中的 settings，不会自动重读 config.json。
+              </p>
+              <p>
+                若希望新配置<strong className="font-medium text-gray-800 dark:text-gray-100">正式生效</strong>，需要重启后端，让进程重新加载 config。
+              </p>
+              {restartDialog.activeJobCount > 0 && (
+                <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-300">
+                  当前有 {restartDialog.activeJobCount} 个标注/维护任务正在进行。重启会<strong className="font-medium">立即中断</strong>这些任务，已处理进度可能不完整。
+                </p>
+              )}
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={restartDialog.restarting}
+                onClick={() => setRestartDialog({ open: false, activeJobCount: 0, restarting: false })}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+              >
+                稍后手动重启
+              </button>
+              <button
+                type="button"
+                disabled={restartDialog.restarting}
+                onClick={handleRestartBackend}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {restartDialog.restarting ? '正在重启…' : '立即重启后端'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

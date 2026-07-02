@@ -19,6 +19,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from auto_tag.core.circuit_breaker import CircuitBreaker, get_circuit_breaker
+from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,10 @@ def _clean_json(content: str) -> str:
 
 
 class VLMClient:
+    @staticmethod
+    def _is_enabled(model: Dict[str, Any]) -> bool:
+        return model.get("enabled") is not False
+
     def __init__(
         self,
         model_name: str = None,
@@ -193,71 +198,92 @@ class VLMClient:
 
     def _annotate_with_failover(self, image: Image.Image) -> Dict[str, Any]:
         last_error = ""
-        for model in self.models:
-            name = model["name"]
-            if self.circuit_breaker.is_tripped(name):
+        for idx, model in enumerate(self.models):
+            if not self._is_enabled(model):
+                continue
+            endpoint_id = vlm_model_endpoint_id(model, idx)
+            if self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
                 result = self._call_single_model(model, image)
-                self.circuit_breaker.record_success(name)
+                self.circuit_breaker.record_success(endpoint_id)
                 return result
             except Exception as e:
-                self.circuit_breaker.record_failure(name, str(e))
+                self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
-                logger.warning(f"Model '{name}' failed: {e}, trying next...")
+                logger.warning(
+                    f"Endpoint '{endpoint_id}' (model={model.get('name')}) failed: {e}, trying next..."
+                )
         raise AllModelsFailedError(f"All models failed. Last error: {last_error}")
 
     def _annotate_subset_with_failover(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
         last_error = ""
-        for model in self.models:
-            name = model["name"]
-            if self.circuit_breaker.is_tripped(name):
+        for idx, model in enumerate(self.models):
+            if not self._is_enabled(model):
+                continue
+            endpoint_id = vlm_model_endpoint_id(model, idx)
+            if self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
                 result = self._call_single_model_subset(model, image, keys)
-                self.circuit_breaker.record_success(name)
+                self.circuit_breaker.record_success(endpoint_id)
                 return result
             except Exception as e:
-                self.circuit_breaker.record_failure(name, str(e))
+                self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
-                logger.warning(f"Model '{name}' subset failed: {e}, trying next...")
+                logger.warning(
+                    f"Endpoint '{endpoint_id}' (model={model.get('name')}) subset failed: {e}, trying next..."
+                )
         raise AllModelsFailedError(f"All models failed for subset. Last error: {last_error}")
 
     # ── Round-Robin ────────────────────────────────────
 
-    def _get_available_models(self) -> List[Dict[str, Any]]:
-        return [m for m in self.models if not self.circuit_breaker.is_tripped(m["name"])]
+    def _get_available_models(self) -> List[tuple[int, Dict[str, Any]]]:
+        available: List[tuple[int, Dict[str, Any]]] = []
+        for idx, model in enumerate(self.models):
+            if not self._is_enabled(model):
+                continue
+            endpoint_id = vlm_model_endpoint_id(model, idx)
+            if not self.circuit_breaker.is_tripped(endpoint_id):
+                available.append((idx, model))
+        return available
 
     def _annotate_with_round_robin(self, image: Image.Image) -> Dict[str, Any]:
         available = self._get_available_models()
         if not available:
             raise AllModelsFailedError("All models are currently tripped (round_robin).")
-        idx = self._round_robin_index % len(available)
+        pick = available[self._round_robin_index % len(available)]
         self._round_robin_index += 1
-        model = available[idx]
+        model_idx, model = pick
+        endpoint_id = vlm_model_endpoint_id(model, model_idx)
         try:
             result = self._call_single_model(model, image)
-            self.circuit_breaker.record_success(model["name"])
+            self.circuit_breaker.record_success(endpoint_id)
             return result
         except Exception as e:
-            self.circuit_breaker.record_failure(model["name"], str(e))
-            logger.warning(f"Model '{model['name']}' round_robin failed: {e}, falling back...")
+            self.circuit_breaker.record_failure(endpoint_id, str(e))
+            logger.warning(
+                f"Endpoint '{endpoint_id}' (model={model.get('name')}) round_robin failed: {e}, falling back..."
+            )
             return self._annotate_with_failover(image)
 
     def _annotate_subset_with_round_robin(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
         available = self._get_available_models()
         if not available:
             raise AllModelsFailedError("All models are currently tripped (round_robin).")
-        idx = self._round_robin_index % len(available)
+        pick = available[self._round_robin_index % len(available)]
         self._round_robin_index += 1
-        model = available[idx]
+        model_idx, model = pick
+        endpoint_id = vlm_model_endpoint_id(model, model_idx)
         try:
             result = self._call_single_model_subset(model, image, keys)
-            self.circuit_breaker.record_success(model["name"])
+            self.circuit_breaker.record_success(endpoint_id)
             return result
         except Exception as e:
-            self.circuit_breaker.record_failure(model["name"], str(e))
-            logger.warning(f"Model '{model['name']}' round_robin subset failed: {e}, falling back...")
+            self.circuit_breaker.record_failure(endpoint_id, str(e))
+            logger.warning(
+                f"Endpoint '{endpoint_id}' (model={model.get('name')}) round_robin subset failed: {e}, falling back..."
+            )
             return self._annotate_subset_with_failover(image, keys)
 
     # ── 实际的 API 调用（含 tenacity 重试） ─────────────

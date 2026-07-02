@@ -9,8 +9,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from auto_tag.backend.routers import database, duplicates, health, jobs, models, records
+from auto_tag.constant import VERSION
 
-app = FastAPI(title="auto_tag API", version="0.1.0")
+app = FastAPI(title="auto_tag API", version=VERSION)
 
 app.add_middleware(
     CORSMiddleware,

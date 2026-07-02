@@ -6,19 +6,14 @@
     "embedding_subdir": "embedding_index",
     "record_stage1_duplicates": true,
     "duplicate_links_filename": "duplicate_links.sqlite",
+    "device": "cuda",
     "vlm_models": [
         {
-            "name": "sensenova-6.7-flash-lite",
-            "base_url": "https://token.sensenova.cn/v1/",
-            "api_key": "sk-A33W3xSuWd57TbFCc7TrSBLtZO16SK29",
+            "id": "00000000-0000-4000-8000-000000000001",
+            "name": "gemini/gemini-2.5-flash",
+            "base_url": null,
+            "api_key": "your_api_key_here",
             "priority": 1,
-            "enabled": true
-        },
-        {
-            "name": "sensenova-6.7-flash-lite",
-            "base_url": "https://token.sensenova.cn/v1/",
-            "api_key": "sk-C9EbDACXRL3X6jpN25P93xvGjYMhFldy",
-            "priority": 2,
             "enabled": true
         }
     ],
@@ -29,12 +24,8 @@
         },
         "time_of_day": {
             "description": "Determine the shooting time shown in the picture scene",
-            "type": "enum",
-            "choices": [
-                "day",
-                "night",
-                "unknown"
-            ]
+            "type": "category",
+            "choices": ["day", "night", "unknown"]
         },
         "num_of_person": {
             "description": "Number of people in the picture",

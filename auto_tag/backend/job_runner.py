@@ -9,6 +9,7 @@ from collections import deque
 from dataclasses import replace
 from typing import Any, Callable, Deque, Dict, List, Optional, TypeVar
 
+from auto_tag.backend.job_store import hydrate_jobs_from_disk, persist_job_record
 from auto_tag.core.db_build_snapshot import write_build_snapshot
 from auto_tag.core.pipeline import (
     PipelineConfig,
@@ -24,6 +25,12 @@ _submit_lock = threading.Lock()
 _busy = False
 _jobs: Dict[str, Dict[str, Any]] = {}
 _server_started_at: float = time.time()
+
+# 从磁盘恢复历史任务（后端重启后仍可查询）
+try:
+    hydrate_jobs_from_disk(_jobs)
+except Exception:
+    logger.exception("hydrate_jobs_from_disk failed")
 
 
 def _memory_handler(logs: Deque[str]) -> logging.Handler:
@@ -72,6 +79,7 @@ def submit_job(cfg: PipelineConfig) -> str:
             "stage2_joins": 0,
             "created_at": time.time(),
         }
+        persist_job_record(job_id, _jobs[job_id])
     except Exception:
         with _submit_lock:
             _busy = False
@@ -83,6 +91,7 @@ def submit_job(cfg: PipelineConfig) -> str:
         root = logging.getLogger()
         try:
             _jobs[job_id]["status"] = "running"
+            persist_job_record(job_id, _jobs[job_id])
             mem_handler = _memory_handler(logs)
             root.addHandler(mem_handler)
 
@@ -117,10 +126,12 @@ def submit_job(cfg: PipelineConfig) -> str:
                 write_build_snapshot(work_log_dir(cfg.work_dir), cfg)
             except Exception:
                 logger.exception("write_build_snapshot failed for job %s", job_id)
+            persist_job_record(job_id, _jobs[job_id])
         except Exception as e:
             logger.exception("Job %s failed", job_id)
             _jobs[job_id]["status"] = "failed"
             _jobs[job_id]["error"] = str(e)
+            persist_job_record(job_id, _jobs[job_id])
         finally:
             if mem_handler is not None:
                 root.removeHandler(mem_handler)

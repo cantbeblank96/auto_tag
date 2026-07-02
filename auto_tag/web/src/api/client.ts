@@ -36,10 +36,72 @@ async function downloadJSON(url: string, params?: Record<string, any>, filename?
   URL.revokeObjectURL(a.href)
 }
 
+function exportQueryString(params?: Record<string, any>): string {
+  if (!params) return ''
+  const qs = new URLSearchParams(
+    Object.entries(params)
+      .filter(([_, v]) => v != null && v !== '')
+      .map(([k, v]) => [k, String(v)]),
+  ).toString()
+  return qs ? `?${qs}` : ''
+}
+
+export type ExportDelivery = 'browser' | 'local'
+
+export interface ExportOptions {
+  delivery?: ExportDelivery
+  outputDir?: string
+  browserFilename?: string
+}
+
+export interface ExportSaveResult {
+  ok: boolean
+  saved: boolean
+  path: string
+  directory?: string
+  filename: string
+  bytes: number
+}
+
+export interface ExportDirCheck {
+  name: string
+  passed: boolean
+  message: string
+}
+
+export interface ValidateExportDirResult {
+  ok: boolean
+  input_path: string
+  path: string | null
+  exists: boolean
+  is_directory: boolean
+  writable: boolean
+  probe_write_ok: boolean
+  created: boolean
+  checks: ExportDirCheck[]
+  message: string
+}
+
+async function runDatabaseExport(
+  url: string,
+  params?: Record<string, any>,
+  options?: ExportOptions,
+): Promise<ExportSaveResult | void> {
+  const delivery = options?.delivery ?? 'browser'
+  if (delivery === 'local') {
+    const dir = options?.outputDir?.trim()
+    if (!dir) throw new Error('请先验证本机导出目录')
+    const merged = { ...params, output_dir: dir }
+    return fetchJSON<ExportSaveResult>(`${url}${exportQueryString(merged)}`)
+  }
+  await downloadJSON(url, params, options?.browserFilename)
+}
+
 // --- Types ---
 
 export interface HealthResponse {
   status: string
+  version: string
   chroma_path: string
   embedding_parent_exists: boolean
   chroma_parent_exists: boolean
@@ -128,6 +190,19 @@ export interface JobSummary {
   created_at: number
 }
 
+export interface BackendStatusResponse {
+  busy: boolean
+  active_jobs: JobSummary[]
+  active_job_count: number
+}
+
+export interface RestartBackendResponse {
+  ok: boolean
+  restarting: boolean
+  was_busy: boolean
+  active_job_count: number
+}
+
 export interface ListJobsResponse {
   jobs: JobSummary[]
   server_started_at: number
@@ -151,6 +226,7 @@ export interface StatsResponse {
   enable_recompute_relations: boolean
   enable_rebuild_relations: boolean
   enable_reannotate: boolean
+  enable_reannotate_centers_only: boolean
   param_diff_table: any[]
   config_path_effective?: string
 }
@@ -183,10 +259,18 @@ export const api = {
   listJobs: () => fetchJSON<ListJobsResponse>('/jobs'),
 
   // Utils
+  backendStatus: () => fetchJSON<BackendStatusResponse>('/utils/backend_status'),
+  restartBackend: () =>
+    fetchJSON<RestartBackendResponse>('/utils/restart_backend', { method: 'POST' }),
   checkDirs: (dirs: string[]) =>
     fetchJSON<{ exist: string[]; not_exist: string[] }>('/utils/check_dirs', {
       method: 'POST',
       body: JSON.stringify({ dirs }),
+    }),
+  validateExportDir: (path: string, createIfMissing = false) =>
+    fetchJSON<ValidateExportDirResult>('/utils/validate_export_dir', {
+      method: 'POST',
+      body: JSON.stringify({ path, create_if_missing: createIfMissing }),
     }),
 
   // Records
@@ -230,16 +314,24 @@ export const api = {
     if (params.config_path) qs.set('config_path', params.config_path)
     return fetchJSON<StatsResponse>(`/database/stats?${qs}`)
   },
-  exportEmbeddings: (params: Record<string, any>) =>
-    downloadJSON('/database/export_embeddings', params),
-  exportDuplicates: (params: Record<string, any>) =>
-    downloadJSON('/database/export_duplicates', params),
-  exportCompactShared: (params?: { work_dir?: string }) =>
-    downloadJSON('/database/export_compact_shared', params, 'auto_tag_compact_labels_shared.json'),
-  exportCompactSlice: (params: { work_dir?: string; offset?: number; limit?: number }) =>
-    downloadJSON('/database/export_compact_slice', params),
-  exportCompactChunk: (params: { work_dir?: string; chunk_index?: number; chunk_size?: number }) =>
-    downloadJSON('/database/export_compact_chunk', params),
+  exportEmbeddings: (params: Record<string, any>, options?: ExportOptions) =>
+    runDatabaseExport('/database/export_embeddings', params, options),
+  exportDuplicates: (params: Record<string, any>, options?: ExportOptions) =>
+    runDatabaseExport('/database/export_duplicates', params, options),
+  exportCompactShared: (params?: { work_dir?: string }, options?: ExportOptions) =>
+    runDatabaseExport(
+      '/database/export_compact_shared',
+      params,
+      { browserFilename: 'auto_tag_compact_labels_shared.json', ...options },
+    ),
+  exportCompactSlice: (
+    params: { work_dir?: string; offset?: number; limit?: number },
+    options?: ExportOptions,
+  ) => runDatabaseExport('/database/export_compact_slice', params, options),
+  exportCompactChunk: (
+    params: { work_dir?: string; chunk_index?: number; chunk_size?: number },
+    options?: ExportOptions,
+  ) => runDatabaseExport('/database/export_compact_chunk', params, options),
   recomputeRelations: (body: { work_dir?: string }) =>
     fetchJSON<any>('/database/recompute_relations', {
       method: 'POST',
@@ -260,17 +352,19 @@ export const api = {
   // Models
   getModels: () => fetchJSON<any>('/models'),
   resetCircuitBreaker: () => fetchJSON<any>('/models/reset', { method: 'POST' }),
-  testModel: (modelName: string) =>
-    fetchJSON<any>(`/models/test/${encodeURIComponent(modelName)}`, { method: 'POST' }),
+  resetModelCircuitBreaker: (endpointId: string) =>
+    fetchJSON<any>(`/models/reset/${encodeURIComponent(endpointId)}`, { method: 'POST' }),
+  testModel: (body: {
+    id?: string
+    name: string
+    base_url?: string | null
+    api_key?: string
+    priority?: number
+  }) => fetchJSON<any>('/models/test', { method: 'POST', body: JSON.stringify(body) }),
   updateCircuitBreaker: (body: {
     time_window_seconds: number; failure_rate_threshold: number; cooldown_seconds: number
   }) => fetchJSON<any>('/models/circuit-breaker', {
     method: 'PUT',
     body: JSON.stringify(body),
   }),
-  resetCircuitBreaker: () => fetchJSON<any>('/models/reset', { method: 'POST' }),
-  resetModelCircuitBreaker: (modelName: string) =>
-    fetchJSON<any>(`/models/reset/${encodeURIComponent(modelName)}`, { method: 'POST' }),
-  testModel: (modelName: string) =>
-    fetchJSON<any>(`/models/test/${encodeURIComponent(modelName)}`, { method: 'POST' }),
 }
