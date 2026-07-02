@@ -39,14 +39,31 @@ class ImageAutoAnnotator:
             db_path=db_path if db_path is not None else settings.db_path,
             collection_name=settings.collection_name
         )
-        self.vlm = VLMClient(
-            model_name=settings.vlm_model_name,
-            api_key=settings.vlm_api_key
-        )
+        self.vlm = self._create_vlm_client()
         self.tau_dup = settings.tau_dup
         self.tau_cls = settings.tau_cls
         self.duplicate_link_writer = duplicate_link_writer
         self._path_registry = path_prefix_registry
+
+    @staticmethod
+    def _create_vlm_client():
+        """根据配置创建 VLMClient：若有多模型配置则使用 failover 模式，否则回退到旧单模型。"""
+        from auto_tag.core.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
+
+        models = getattr(settings, "vlm_models", None)
+        if models and len(models) > 0:
+            cb_config = CircuitBreakerConfig(
+                time_window_seconds=settings.circuit_breaker_time_window,
+                failure_rate_threshold=settings.circuit_breaker_failure_threshold,
+                cooldown_seconds=settings.circuit_breaker_cooldown,
+            )
+            cb = get_circuit_breaker()
+            cb.update_config(cb_config)
+            return VLMClient(models=models, circuit_breaker=cb)
+        return VLMClient(
+            model_name=settings.vlm_model_name,
+            api_key=settings.vlm_api_key,
+        )
 
     @staticmethod
     def _row_meta(
@@ -227,6 +244,16 @@ class ImageAutoAnnotator:
         try:
             labels_dict = self.vlm.annotate_image(image)
             labels_json = json.dumps(labels_dict, ensure_ascii=False)
+            # 校验 VLM 结果是否符合 questions schema
+            try:
+                v = VLMClient.validate_against_questions(labels_dict)
+                if not v["valid"]:
+                    logger.warning(
+                        f"VLM result validation failed for {image_path}: "
+                        f"{'; '.join(v['errors'])}"
+                    )
+            except Exception:
+                pass  # 校验本身不应抛出异常
         except Exception as e:
             logger.error(f"Failed to get VLM annotation for {image_path}, using empty labels. Error: {e}")
             labels_json = "{}"

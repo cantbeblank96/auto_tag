@@ -221,7 +221,7 @@ def build_compact_export(work_dir: str) -> Dict[str, Any]:
         "cluster_to_labels": cluster_to_labels,
         "export_meta": {
             "work_dir": wr,
-            "embedding_store_path": emb_d,
+            "chroma_path": emb_d,
             "log_dir": log_d,
             "row_count": len(images),
             "path_prefix_registry_file": os.path.join(log_d, REGISTRY_FILENAME),

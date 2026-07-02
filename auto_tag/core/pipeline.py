@@ -19,6 +19,9 @@ from auto_tag.core.utils.load_image import load_image_for_job
 
 logger = logging.getLogger(__name__)
 
+# auto_tag 包根目录（与 config.json 同级）
+_AUTO_TAG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def _walk_collect_images(input_dir: str, suffix_ls: List[str]) -> List[str]:
     """递归收集目录下匹配后缀的文件（支持多层子目录）。"""
@@ -64,10 +67,12 @@ def decode_meta_for_path(path: str, cfg: "PipelineConfig") -> Dict[str, Any]:
 
 
 def normalize_work_dir(work_dir: str) -> str:
-    """工作根目录：去空白、展开 ~、绝对路径 + realpath，避免线程内相对路径错误。"""
+    """工作根目录：去空白、展开 ~、{PROJECT_PATH} 宏、绝对路径 + realpath，避免线程内相对路径错误。"""
     s = (work_dir or "").strip()
+    # 替换 {PROJECT_PATH} 宏
+    s = s.replace("{PROJECT_PATH}", _AUTO_TAG_DIR)
     if not s:
-        s = "./work"
+        s = os.path.join(_AUTO_TAG_DIR, "work_dir")
     return os.path.realpath(os.path.abspath(os.path.expanduser(s)))
 
 
@@ -104,7 +109,8 @@ class PipelineConfig:
 
     input_dirs: List[str] = field(default_factory=list)
     image_ls_files: List[str] = field(default_factory=list)
-    work_dir: str = "./work"
+    work_dir: str = ""
+    """空字符串表示使用默认路径（normalize_work_dir 时会解析为 auto_tag/work_dir）。"""
     rotate_angle: Optional[str] = None
     b_yuv_image: bool = False
     """整批均为 YUV 时使用。"""

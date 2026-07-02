@@ -1,12 +1,27 @@
 {
+    "work_dir": "{PROJECT_PATH}/work_dir",
     "batch_size": 32,
     "tau_dup": 0.05,
     "tau_cls": 0.25,
-    "log_dir": "./log",
-    "embedding_store_path": "./embedding_index",
     "embedding_subdir": "embedding_index",
     "record_stage1_duplicates": true,
     "duplicate_links_filename": "duplicate_links.sqlite",
+    "vlm_models": [
+        {
+            "name": "sensenova-6.7-flash-lite",
+            "base_url": "https://token.sensenova.cn/v1/",
+            "api_key": "sk-A33W3xSuWd57TbFCc7TrSBLtZO16SK29",
+            "priority": 1,
+            "enabled": true
+        },
+        {
+            "name": "sensenova-6.7-flash-lite",
+            "base_url": "https://token.sensenova.cn/v1/",
+            "api_key": "sk-C9EbDACXRL3X6jpN25P93xvGjYMhFldy",
+            "priority": 2,
+            "enabled": true
+        }
+    ],
     "questions": {
         "scene": {
             "description": "description of the overall scene",
@@ -14,14 +29,17 @@
         },
         "time_of_day": {
             "description": "Determine the shooting time shown in the picture scene",
-            "type": "category",
-            "choices": ["day", "night", "unknown"]
+            "type": "enum",
+            "choices": [
+                "day",
+                "night",
+                "unknown"
+            ]
         },
         "num_of_person": {
             "description": "Number of people in the picture",
             "type": "int",
-            "min": 0,
-            "max": null
+            "min": 0
         },
         "brightness": {
             "description": "Brightness of the picture (0 to 10 points, the bigger, the brighter)",
@@ -30,5 +48,11 @@
             "max": 10,
             "step": 0.1
         }
+    },
+    "vlm_strategy": "priority",
+    "circuit_breaker": {
+        "time_window_seconds": 300,
+        "failure_rate_threshold": 0.5,
+        "cooldown_seconds": 600
     }
 }

@@ -92,14 +92,16 @@ class VectorDB:
         image_path: str,
         registry: Optional[PathPrefixRegistry] = None,
     ) -> bool:
-        full = os.path.realpath(os.path.abspath(os.path.expanduser(str(image_path).strip())))
+        full = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(image_path).strip()))
+        )
         if self.count() == 0:
             return False
         try:
             if registry is not None:
                 pid, rel = registry.split(full)
                 r = self.collection.get(
-                    where={"path_prefix_id": str(pid), "image_rel_path": rel},
+                    where={"$and": [{"path_prefix_id": {"$eq": str(pid)}}, {"image_rel_path": {"$eq": rel}}]},
                     limit=1,
                 )
                 if r.get("ids"):
@@ -117,13 +119,15 @@ class VectorDB:
     ) -> int:
         if self.count() == 0:
             return 0
-        full = os.path.realpath(os.path.abspath(os.path.expanduser(str(image_path).strip())))
+        full = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(image_path).strip()))
+        )
         try:
             all_ids: List[str] = []
             if registry is not None:
                 pid, rel = registry.split(full)
                 r = self.collection.get(
-                    where={"path_prefix_id": str(pid), "image_rel_path": rel},
+                    where={"$and": [{"path_prefix_id": {"$eq": str(pid)}}, {"image_rel_path": {"$eq": rel}}]},
                     limit=100000,
                 )
                 all_ids.extend(r.get("ids") or [])
@@ -147,11 +151,13 @@ class VectorDB:
     ) -> Tuple[List[str], List[Dict[str, Any]]]:
         if self.count() == 0:
             return [], []
-        full = os.path.realpath(os.path.abspath(os.path.expanduser(str(image_path).strip())))
+        full = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(image_path).strip()))
+        )
         if registry is not None:
             pid, rel = registry.split(full)
             r = self.collection.get(
-                where={"path_prefix_id": str(pid), "image_rel_path": rel},
+                where={"$and": [{"path_prefix_id": {"$eq": str(pid)}}, {"image_rel_path": {"$eq": rel}}]},
                 limit=limit,
                 include=["metadatas"],
             )
@@ -205,9 +211,7 @@ class VectorDB:
                 break
         return out
 
-    def iter_metadatas(
-        self, *, batch_size: int = 500
-    ) -> List[Dict[str, Any]]:
+    def iter_metadatas(self, *, batch_size: int = 500) -> List[Dict[str, Any]]:
         """返回全部 metadata（分批拉取后合并）。"""
         n = self.count()
         out: List[Dict[str, Any]] = []
@@ -237,7 +241,9 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     try:
-        db = VectorDB(db_path=settings.db_path, collection_name=settings.collection_name)
+        db = VectorDB(
+            db_path=settings.db_path, collection_name=settings.collection_name
+        )
         print(f"Vector DB test successful. Current document count: {db.count()}")
     except Exception as e:
         print(f"Vector DB test failed: {e}")

@@ -7,6 +7,8 @@ import os
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from auto_tag.core.annotator import ImageAutoAnnotator
+from auto_tag.core.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
 from auto_tag.core.config import settings
 from auto_tag.core.db_build_snapshot import read_build_snapshot, write_build_snapshot
 from auto_tag.core.duplicate_store import DuplicateLinkWriter, load_all_duplicate_rows
@@ -19,6 +21,7 @@ from auto_tag.core.pipeline import (
     work_log_dir,
 )
 from auto_tag.core.utils.load_image import load_image_for_job
+from auto_tag.core.utils.path_utils import path_variants
 from auto_tag.core.vector_db import VectorDB
 from auto_tag.core.vlm_client import VLMClient
 
@@ -115,19 +118,6 @@ def _dup_pair_key(anchor_path: str, dup_path: str) -> Tuple[str, str]:
     return _norm_dup_path_key(anchor_path), _norm_dup_path_key(dup_path)
 
 
-def _path_variants_for_dup_lookup(p: str) -> List[str]:
-    s = (p or "").strip()
-    if not s:
-        return []
-    out = [s]
-    try:
-        r = os.path.realpath(os.path.abspath(os.path.expanduser(s)))
-        if r not in out:
-            out.append(r)
-    except OSError:
-        pass
-    return out
-
 
 def _build_anchor_path_to_doc_id(
     db: VectorDB, reg: PathPrefixRegistry
@@ -189,7 +179,7 @@ def _merge_legacy_duplicate_links_after_recompute(
             continue
         nid = anchor_to_id.get(pk[0])
         if not nid:
-            for v in _path_variants_for_dup_lookup(ap):
+            for v in path_variants(ap):
                 nk = _norm_dup_path_key(v)
                 nid = anchor_to_id.get(nk)
                 if nid:
@@ -458,7 +448,7 @@ def recompute_relations_only(work_dir: str) -> Dict[str, Any]:
         "skipped_no_neighbor": stats["skipped_no_neighbor"],
         "preserved_duplicate_links_loaded": len(preserved_duplicate_rows),
         "merged_legacy_duplicate_links": merged_legacy_duplicate_links,
-        "embedding_store_path": emb_d,
+        "chroma_path": emb_d,
         "log_dir": log_d,
     }
 
@@ -514,7 +504,7 @@ def rebuild_relations(work_dir: str) -> Dict[str, Any]:
         "total_images": result.total_images,
         "processed_ok": result.processed_ok,
         "failed_count": len(result.failed_paths),
-        "embedding_store_path": emb_d,
+        "chroma_path": emb_d,
         "log_dir": log_d,
     }
 
@@ -540,10 +530,7 @@ def reannotate(
 
     reg = PathPrefixRegistry(log_d)
     db = VectorDB(db_path=emb_d, collection_name=settings.collection_name)
-    vlm = VLMClient(
-        model_name=settings.vlm_model_name,
-        api_key=settings.vlm_api_key,
-    )
+    vlm = ImageAutoAnnotator._create_vlm_client()
 
     n = db.count()
     offset = 0
@@ -627,5 +614,5 @@ def reannotate(
         "skipped": skipped,
         "errors_sample": errs[:20],
         "error_count": len(errs),
-        "embedding_store_path": emb_d,
+        "chroma_path": emb_d,
     }

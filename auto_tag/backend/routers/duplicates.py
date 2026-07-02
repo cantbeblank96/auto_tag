@@ -49,9 +49,11 @@ def list_duplicates(
     elif log_dir:
         log_dir_path = os.path.abspath(os.path.expanduser(log_dir))
     else:
-        raise HTTPException(
-            status_code=400, detail="Provide query param work_dir or log_dir"
+        # 未指定时从 settings.db_path 反向推导
+        emb = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(settings.db_path).strip()))
         )
+        log_dir_path = os.path.join(os.path.dirname(emb.rstrip(os.sep)), "log") or os.path.join(".", "log")
 
     if not os.path.isdir(log_dir_path):
         raise HTTPException(status_code=400, detail="Resolved log directory does not exist")

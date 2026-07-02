@@ -13,7 +13,10 @@ from auto_tag.core.annotator import ImageAutoAnnotator
 from auto_tag.core.config import settings
 from auto_tag.core.duplicate_store import find_duplicate_links_for_paths
 from auto_tag.core.feature_extractor import FeatureExtractor
-from auto_tag.core.path_prefix_registry import PathPrefixRegistry, resolve_stored_image_path
+from auto_tag.core.path_prefix_registry import (
+    PathPrefixRegistry,
+    resolve_stored_image_path,
+)
 from auto_tag.core.pipeline import (
     PipelineConfig,
     decode_meta_for_path,
@@ -21,13 +24,16 @@ from auto_tag.core.pipeline import (
     work_chroma_dir,
     work_log_dir,
 )
+from auto_tag.core.utils.path_utils import path_variants
 from auto_tag.core.utils.load_image import load_image_for_job
 from auto_tag.core.vector_db import VectorDB
 
 router = APIRouter(prefix="/records", tags=["records"])
 
 
-def _open_vector_db(work_dir: Optional[str], output_dir: Optional[str]) -> Tuple[VectorDB, str]:
+def _open_vector_db(
+    work_dir: Optional[str], output_dir: Optional[str]
+) -> Tuple[VectorDB, str]:
     db_path = _resolve_records_db_path(work_dir, output_dir)
     if not os.path.isdir(db_path):
         raise HTTPException(
@@ -185,9 +191,7 @@ def list_records(
         res = db.collection.get(**get_kw)
         metas: List[Optional[Dict[str, Any]]] = res.get("metadatas") or []
         reg = _registry_for_chroma(db_path, work_dir)
-        items = [
-            public_chroma_metadata(m, registry=reg) for m in metas if m
-        ]
+        items = [public_chroma_metadata(m, registry=reg) for m in metas if m]
         total_out = n if cluster_id is None else None
         return {
             "total": total_out,
@@ -238,29 +242,17 @@ def _infer_log_dir_from_chroma(chroma_path: str) -> Optional[str]:
     return os.path.join(parent, "log")
 
 
-def _path_variants(p: str) -> List[str]:
-    s = (p or "").strip()
-    if not s:
-        return []
-    out = [s]
-    try:
-        r = os.path.realpath(os.path.abspath(os.path.expanduser(s)))
-        if r not in out:
-            out.append(r)
-    except OSError:
-        pass
-    return out
-
-
 @router.get("/by_path")
 def record_by_path(
-    image_path: str = Query(..., description="与入库时一致的绝对路径（或等价 realpath）"),
+    image_path: str = Query(
+        ..., description="与入库时一致的绝对路径（或等价 realpath）"
+    ),
     work_dir: Optional[str] = Query(None),
     output_dir: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """先查向量索引；若无记录再查 Stage1 侧车 duplicate_links（可能仅登记在侧车）。"""
     emb_path = _resolve_records_db_path(work_dir, output_dir)
-    variants = _path_variants(image_path)
+    variants = path_variants(image_path)
 
     if os.path.isdir(emb_path):
         try:
@@ -303,7 +295,9 @@ def record_by_path(
         anchor_records: List[Dict[str, Any]] = []
         if os.path.isdir(emb_path):
             try:
-                qdb = VectorDB(db_path=emb_path, collection_name=settings.collection_name)
+                qdb = VectorDB(
+                    db_path=emb_path, collection_name=settings.collection_name
+                )
                 seen_anchor: set[str] = set()
                 for row in dup_rows:
                     ap = str(row.get("anchor_path") or "").strip()
@@ -312,7 +306,7 @@ def record_by_path(
                     seen_anchor.add(ap)
                     ah = _embedding_hit_payload(
                         qdb,
-                        _path_variants(ap),
+                        path_variants(ap),
                         chroma_path=emb_path,
                         work_dir=work_dir,
                     )
@@ -375,7 +369,7 @@ def preview_image(
     mixed = mixed_yuv
     yw, yh = image_width, image_height
     yt = yuv_type
-    for cand in _path_variants(p):
+    for cand in path_variants(p):
         ids, metas = db.get_by_image_path(cand, limit=1, registry=reg)
         if ids and metas and metas[0]:
             m = metas[0]
@@ -407,7 +401,9 @@ def preview_image(
 
 class UpdateLabelsBody(BaseModel):
     work_dir: Optional[str] = None
-    image_path: str = Field(..., description="要更新的图片路径（与库中 image_path 一致或等价 realpath）")
+    image_path: str = Field(
+        ..., description="要更新的图片路径（与库中 image_path 一致或等价 realpath）"
+    )
     labels: Dict[str, Any] = Field(default_factory=dict)
     mode: Literal["with_cluster", "image_only"] = Field(
         default="image_only",
@@ -433,10 +429,8 @@ def update_labels(body: UpdateLabelsBody) -> Dict[str, Any]:
     labels_json = json.dumps(body.labels, ensure_ascii=False)
     matched_ids: List[str] = []
     matched_metas: List[Dict[str, Any]] = []
-    for cand in _path_variants(body.image_path):
-        matched_ids, matched_metas = db.get_by_image_path(
-            cand, limit=100, registry=reg
-        )
+    for cand in path_variants(body.image_path):
+        matched_ids, matched_metas = db.get_by_image_path(cand, limit=100, registry=reg)
         if matched_ids:
             break
 
@@ -458,7 +452,9 @@ def update_labels(body: UpdateLabelsBody) -> Dict[str, Any]:
             }
 
         # 库中无该路径（例如 Stage1 重复未入库）：插入新文档
-        p = os.path.realpath(os.path.abspath(os.path.expanduser(body.image_path.strip())))
+        p = os.path.realpath(
+            os.path.abspath(os.path.expanduser(body.image_path.strip()))
+        )
         if not os.path.isfile(p):
             raise HTTPException(
                 status_code=404,
@@ -483,7 +479,9 @@ def update_labels(body: UpdateLabelsBody) -> Dict[str, Any]:
                 rotate_angle=cfg.rotate_angle,
             )
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load image: {e}") from e
+            raise HTTPException(
+                status_code=400, detail=f"Failed to load image: {e}"
+            ) from e
 
         extractor = FeatureExtractor(
             model_name=settings.clip_model_name,
@@ -491,7 +489,9 @@ def update_labels(body: UpdateLabelsBody) -> Dict[str, Any]:
         )
         embeddings = extractor.extract_features_batch([img])
         if not embeddings:
-            raise HTTPException(status_code=500, detail="Feature extraction returned empty")
+            raise HTTPException(
+                status_code=500, detail="Feature extraction returned empty"
+            )
         cluster_id = _generate_unique_cluster_id(db)
         dm = decode_meta_for_path(p, cfg)
         meta = ImageAutoAnnotator._row_meta(

@@ -36,6 +36,7 @@ output/*.json
 .env
 .env.*
 !.env.example
+config.json
 *.bak
 
 # ============================================================
@@ -83,3 +84,14 @@ checkpoints/
 _old_version/
 temp/
 git_push.sh
+.playwright-mcp/
+.temp
+test_preview.jpg
+plans/
+
+# ============================================================
+# Node / JS (Vite frontend)
+# ============================================================
+node_modules/
+auto_tag/web/node_modules/
+auto_tag/web/dist/

@@ -72,11 +72,18 @@ def main():
     parser.add_argument("--image_height", type=int, default=0, help="Height for YUV images.")
     parser.add_argument("--image_width", type=int, default=0, help="Width for YUV images.")
     parser.add_argument("--b_skip_image_manually_verified", action="store_true", help="Skip manual verification.")
+    parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="自动确认所有提示（跳过样图校验），用于自动化脚本。",
+    )
 
     args = parser.parse_args()
     # --config_file 已在模块顶部通过 parse_known_args 写入 AUTO_TAG_CONFIG_FILE
 
-    work_d = args.work_dir or args.output_dir or "./work"
+    work_d = args.work_dir or args.output_dir or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "work_dir"
+    )
     log_d = work_log_dir(work_d)
     logger = setup_logging(log_d)
 
@@ -97,7 +104,7 @@ def main():
         logger.warning("No images found to process.")
         return
 
-    if not args.b_skip_image_manually_verified:
+    if not args.b_skip_image_manually_verified and not args.yes:
         logger.info("Starting manual verification phase...")
         save_verify_samples(all_sources, log_d, cfg)
         user_input = input("Please check the sample images in work_dir/log. Continue? [Y/n]: ")

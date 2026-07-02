@@ -51,9 +51,4 @@ def merge_stats_params_from_file(
         out["duplicate_links_filename"] = str(raw["duplicate_links_filename"])
     if "embedding_subdir" in raw:
         out["embedding_subdir"] = str(raw["embedding_subdir"])
-    esp = raw.get("embedding_store_path")
-    if esp is None:
-        esp = raw.get("chroma_data")
-    if esp is not None:
-        out["embedding_store_path"] = str(esp)
     return out

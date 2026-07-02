@@ -18,7 +18,9 @@ def main() -> None:
     p = argparse.ArgumentParser(description="导出紧凑标注（平行数组 + 共享字典）")
     p.add_argument(
         "--work_dir",
-        default=os.environ.get("AUTO_TAG_WORK_DIR", "./work"),
+        default=os.environ.get("AUTO_TAG_WORK_DIR", os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "work_dir"
+        )),
         help="工作根目录（含 log 与向量索引）",
     )
     p.add_argument(

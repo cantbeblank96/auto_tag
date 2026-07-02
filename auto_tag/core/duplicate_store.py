@@ -256,6 +256,8 @@ def load_all_duplicate_rows(
         out.extend(chunk)
         if not chunk or off + len(chunk) >= total:
             break
+        if not chunk:
+            break
         off += len(chunk)
     return out
 

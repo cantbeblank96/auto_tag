@@ -66,9 +66,7 @@ VLM_API_KEY=None
 * `batch_size`: (默认 `32`) 特征提取批量大小。根据您的显存大小增减。
 * `tau_dup`: (默认 `0.05`) 去重余弦距离阈值。值越小要求两张图越雷同。
 * `tau_cls`: (默认 `0.15`) 聚类余弦距离阈值。
-* `embedding_store_path`: **默认**向量索引持久化目录（未指定 `work_dir` 时；功能命名，实现上当前为 Chroma 持久化目录）。
 * `embedding_subdir`: 使用 **`--work_dir`** 时，索引落在 `work_dir/<embedding_subdir>`（默认 `embedding_index`）。若目录下仍存在旧版 **`chroma_data`** 且新子目录尚未创建，会自动继续使用 `chroma_data`，避免破坏已有数据。
-* 兼容旧配置键 **`chroma_data`**（等价于 `embedding_store_path`）。
 * `duplicate_links_filename`: Stage1 近重复侧车文件名，默认 `duplicate_links.sqlite`（亦可为 `.jsonl`）。
 
 ```json
@@ -76,7 +74,7 @@ VLM_API_KEY=None
     "batch_size": 32,
     "tau_dup": 0.05,
     "tau_cls": 0.15,
-    "embedding_store_path": "./embedding_index",
+    "embedding_subdir": "embedding_index",
     "embedding_subdir": "embedding_index",
     "duplicate_links_filename": "duplicate_links.sqlite"
 }
@@ -139,7 +137,7 @@ python -m auto_tag.main --image_ls_file ./work/log/failed_images.json --work_dir
 
 ### 查看标签与聚类结果
 
-程序运行完毕后，图片特征和打好的标签将固化在向量索引目录中（见 `embedding_store_path` / `work_dir` 下子目录）。
+程序运行完毕后，图片特征和打好的标签将固化在向量索引目录中（见 `work_dir/{embedding_subdir}` 子目录）。
 
 您可以使用查看器工具打印出当前已入库的所有图片及其结构化 Json 标签：
 
@@ -162,24 +160,31 @@ python -m auto_tag.view_db --output_path xxxxx
 
 
 
-## Web 控制台与 HTTP API
+## Web 控制台与 HTTP API（v2 前端）
 
-FastAPI（`auto_tag/backend`）与 Streamlit（`auto_tag/frontend_streamlit`）分进程，经 HTTP 通信。启动可参考 `auto_tag/scripts/run_web_backend.sh`、`run_web_frontend.sh` 或仓库根目录 `AGENTS.md`。
+FastAPI（`auto_tag/backend`）与 React 前端（`auto_tag/web/`）分进程，经 HTTP 通信。v2 前端使用 **Vite + Tailwind v4 + React 19 + react-router-dom v7**，开发服务器端口 **5020**，通过 Vite proxy 代理 `/api` 到后端 **8000**。
 
-### Streamlit 页面概要
+启动可参考 `auto_tag/scripts/run_web_backend.sh`、`run_web_frontend_v2.sh`。
 
-* **设置**：全局 `work_dir`；`config.json`、`.env` 的路径与在线编辑（保存后需**重启后端**方可使新的环境变量与部分配置生效）。
-* **任务**：**「跳过库中已有路径」**在 **「运行」** 小节标题下、队列表格**之上**渲染（**不在**定时刷新的 fragment 内，避免默认勾选被覆盖）。对队列**统一**生效（默认勾选；旧会话会随前端版本号重置为勾选）。队列表格列为：**已收集**、**已处理（占已收集比例）**、**打标数 / 跳过数 / 失败数（占已处理比例，三者比例之和为 100%）**；打标数为本次任务中实际调用大模型次数。表格不含 `work_dir`（由「设置」统一指定）。
-* **图片查询**：先查向量索引，再查 `log` 下侧车；仅命中侧车时除 `duplicate_links` 外，会附带 **`anchor_embedding_records`**（自动查询各 `anchor_path` 在索引中的结果）。
-* **数据库**：**状态**刷新时会带「设置」中的 **config.json 路径**（`config_path` 查询参数），用磁盘上的 JSON 与快照比对。快照与当前配置 **左右两列**展示；若关键字段一致则 JSON 折叠为收起，并提示 **「完全一致。」**。**仅重算关系**（在关系类参数与快照不一致时可点）复用索引中已有 **向量与 labels**，按当前 **τ_dup / τ_cls** 重算簇与侧车，**不调用 VLM/CLIP**（处理顺序为路径字典序）。**完全重建索引** 始终可点：清空后按快照 **`input_dirs`** 重跑完整流水线（CLIP+VLM 等，与排队任务互斥；无快照会失败）。**更新标注** 为 **全量 / 增量二选一**（radio），可选 **仅簇中心**。**导出** 含索引、侧车，以及 **紧凑标注**（共享字典 + 平行字段切片/分块）。默认 `limit` / 分块大小均为 **200000**。列表 JSON 展示时 key 已排序。
-* **其他**：健康检查；关于（作者、版本号）。
+> 旧版 Streamlit 前端保留在 `auto_tag/frontend_streamlit/`，由 `run_web_frontend.sh` 启动（端口 8501）。
+
+### React 页面概要
+
+* **标注任务**：创建/提交/监控标注流水线。包含任务表单、参数配置（YUV/旋转/跳过库中已有路径）、确认前目录校验、任务队列管理（2s 轮询进度）、**清除历史记录**（隐藏此刻之前的任务，实际数据保留在服务端内存中）。
+* **任务查询**：浏览后端全部历史任务记录，支持按时间正序/倒序排列、手动刷新。
+* **图片查询**：先查向量索引，再查 `log` 下侧车；仅命中侧车时除 `duplicate_links` 外，会附带 **`anchor_embedding_records`**（自动查询各 `anchor_path` 在索引中的结果）。支持编辑/保存标签（仅本图或整簇同步）、插入新记录。
+* **数据库**：状态刷新带 config 差异比对；仅重算关系/完全重建索引/更新标注（全量/增量/仅簇中心）；多种导出（索引记录、侧车、紧凑标注）。默认 `limit` / 分块大小均为 **200000**。
+* **设置**：VLM 模型列表、熔断器参数、Questions 在线编辑。
+* **教程**：使用指南。
+* **其他**：健康检查、关于信息。
 
 ### REST 要点
 
 | 能力 | 方法 | 路径 |
 |------|------|------|
 | 创建任务（含 `skip_if_in_db`） | POST | `/api/jobs` |
-| 任务状态（`total`、`processed`、`failed_so_far`、`skip_in_db`、`vlm_calls`、`stage1_skips`、`stage2_joins`） | GET | `/api/jobs/{job_id}` |
+| 任务列表（所有历史任务 + 服务启动时间） | GET | `/api/jobs` |
+| 任务状态（`total`、`processed`、`failed_so_far`、`skip_in_db`、`vlm_calls`、`stage1_skips`、`stage2_joins`、`created_at`） | GET | `/api/jobs/{job_id}` |
 | 任务日志 | GET | `/api/jobs/{job_id}/logs` |
 | 按路径查记录 | GET | `/api/records/by_path?image_path=...&work_dir=...` |
 | 预览 PNG | GET | `/api/records/preview?image_path=...` |

@@ -73,7 +73,7 @@ def _parse_labels_nonempty(meta: Optional[Dict[str, Any]]) -> bool:
 
 
 def _resolve_paths(work_dir: Optional[str]) -> Tuple[str, str, str]:
-    """(work_root, embedding_store_path, log_dir)。"""
+    """(work_root, chroma_path, log_dir)。"""
     if work_dir and str(work_dir).strip():
         wr = normalize_work_dir(work_dir)
         return wr, work_chroma_dir(wr), work_log_dir(wr)
@@ -93,7 +93,6 @@ def _scalar_differs(key: str, sv: Any, cv: Any) -> bool:
         "vlm_model_name",
         "duplicate_links_filename",
         "embedding_subdir",
-        "embedding_store_path",
     ):
         return str(sv) != str(cv)
     try:
@@ -201,7 +200,6 @@ def _database_stats_impl(
         "vlm_model_name": str(settings.vlm_model_name),
         "duplicate_links_filename": str(settings.duplicate_links_filename),
         "embedding_subdir": str(settings.embedding_subdir),
-        "embedding_store_path": str(settings.db_path),
     }
     current_params = merge_stats_params_from_file(current_params, config_path)
 
@@ -272,7 +270,6 @@ def _database_stats_impl(
 
     payload: Dict[str, Any] = {
         "work_dir": wr,
-        "embedding_store_path": emb_path,
         "chroma_path": emb_path,
         "log_dir": log_dir,
         "embedding_record_count": emb_count,
@@ -328,7 +325,6 @@ def export_embeddings(
     payload: Dict[str, Any] = {
         "export_meta": {
             "work_dir": wr,
-            "embedding_store_path": emb_path,
             "log_dir": log_dir,
             "resource": "embedding_records",
             "mode": mode,
@@ -381,7 +377,6 @@ def export_duplicates(
     payload: Dict[str, Any] = {
         "export_meta": {
             "work_dir": wr,
-            "embedding_store_path": emb_path,
             "log_dir": log_dir,
             "resource": "duplicate_links",
             "mode": mode,

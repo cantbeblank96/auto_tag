@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import replace
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 _submit_lock = threading.Lock()
 _busy = False
 _jobs: Dict[str, Dict[str, Any]] = {}
+_server_started_at: float = time.time()
 
 
 def _memory_handler(logs: Deque[str]) -> logging.Handler:
@@ -68,6 +70,7 @@ def submit_job(cfg: PipelineConfig) -> str:
             "vlm_calls": 0,
             "stage1_skips": 0,
             "stage2_joins": 0,
+            "created_at": time.time(),
         }
     except Exception:
         with _submit_lock:
@@ -140,6 +143,34 @@ def get_job_logs(job_id: str, tail: int = 200) -> List[str]:
     if tail <= 0:
         return list(logs)
     return list(logs)[-tail:]
+
+
+def list_jobs() -> List[Dict[str, Any]]:
+    """返回所有历史任务摘要（不含 logs 以减少传输量）。"""
+    out: List[Dict[str, Any]] = []
+    for jid, j in _jobs.items():
+        out.append({
+            "job_id": jid,
+            "status": j["status"],
+            "processed": j["processed"],
+            "total": j["total"],
+            "error": j["error"],
+            "failed_count": j["failed_count"],
+            "failed_so_far": j.get("failed_so_far", 0),
+            "skip_in_db": j.get("skip_in_db", 0),
+            "vlm_calls": j.get("vlm_calls", 0),
+            "stage1_skips": j.get("stage1_skips", 0),
+            "stage2_joins": j.get("stage2_joins", 0),
+            "work_dir": j.get("work_dir", ""),
+            "log_dir": j.get("log_dir", ""),
+            "created_at": j.get("created_at", 0),
+        })
+    out.sort(key=lambda x: x.get("created_at", 0))
+    return out
+
+
+def get_server_started_at() -> float:
+    return _server_started_at
 
 
 def is_busy() -> bool:

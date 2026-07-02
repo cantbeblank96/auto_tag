@@ -1,9 +1,8 @@
 {
   "version": 1,
   "input_dirs": [
-    "/home/SENSETIME/xukaiming/Desktop/my_repos/python_projects/kevin_agent/auto_tag/test/test_data"
+    "/home/SENSETIME/xukaiming/Desktop/my_repos/python_projects/kevin_auto_tag/auto_tag/test/test_data"
   ],
-  "output_dir": "/home/SENSETIME/xukaiming/Desktop/my_repos/python_projects/kevin_agent/auto_tag/test/temp",
   "rotate_angle": "ROTATE_90_COUNTERCLOCKWISE",
   "b_yuv_image": false,
   "mixed_yuv": true,

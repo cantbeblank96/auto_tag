@@ -8,7 +8,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from auto_tag.backend.routers import database, duplicates, health, jobs, records
+from auto_tag.backend.routers import database, duplicates, health, jobs, models, records
 
 app = FastAPI(title="auto_tag API", version="0.1.0")
 
@@ -22,6 +22,7 @@ app.add_middleware(
 
 app.include_router(health.router, prefix="/api")
 app.include_router(jobs.router, prefix="/api")
+app.include_router(models.router, prefix="/api")
 app.include_router(records.router, prefix="/api")
 app.include_router(duplicates.router, prefix="/api")
 app.include_router(database.router, prefix="/api")

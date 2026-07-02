@@ -1,14 +1,24 @@
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from auto_tag.backend.job_runner import get_job, get_job_logs, submit_job
-from auto_tag.core.pipeline import PipelineConfig
+from auto_tag.backend.job_runner import get_job, get_job_logs, get_server_started_at, list_jobs, submit_job
+from auto_tag.core.config import settings
+from auto_tag.core.pipeline import PipelineConfig, normalize_work_dir
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
-_DEFAULT_WORK_DIR = "./work"
+
+def _resolve_work_dir(work_dir: Optional[str]) -> str:
+    """与 database 路由 _resolve_paths 一致：None 时从 settings.db_path 反向推导。"""
+    if work_dir and str(work_dir).strip():
+        return normalize_work_dir(work_dir)
+    emb = os.path.realpath(
+        os.path.abspath(os.path.expanduser(str(settings.db_path).strip()))
+    )
+    return os.path.dirname(emb.rstrip(os.sep)) or os.getcwd()
 
 
 class JobCreate(BaseModel):
@@ -16,7 +26,10 @@ class JobCreate(BaseModel):
 
     input_dirs: List[str] = Field(default_factory=list)
     image_ls_files: List[str] = Field(default_factory=list)
-    work_dir: str = _DEFAULT_WORK_DIR
+    work_dir: Optional[str] = Field(
+        default=None,
+        description="工作根目录；不传则使用服务端 config 中的 embedding_store_path 反向推导",
+    )
     log_dir: Optional[str] = Field(
         default=None,
         description="已废弃；仅当 work_dir 仍为默认值且传入时，才将其当作工作根目录",
@@ -44,17 +57,18 @@ class JobCreate(BaseModel):
         ld = (self.log_dir or "").strip()
         if not ld:
             return self
-        wd = str(self.work_dir).strip()
-        if wd in (_DEFAULT_WORK_DIR, "work", "./output", "output"):
+        wd = (self.work_dir or "").strip()
+        if wd in ("", "./work", "work", "./output", "output"):
             return self.model_copy(update={"work_dir": ld})
         return self
 
 
 def _to_pipeline_config(body: JobCreate) -> PipelineConfig:
+    wd = _resolve_work_dir(body.work_dir)
     return PipelineConfig(
         input_dirs=body.input_dirs,
         image_ls_files=body.image_ls_files,
-        work_dir=body.work_dir,
+        work_dir=wd,
         rotate_angle=body.rotate_angle,
         b_yuv_image=body.b_yuv_image,
         mixed_yuv=body.mixed_yuv,
@@ -79,6 +93,15 @@ def create_job(body: JobCreate) -> Dict[str, Any]:
     except RuntimeError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     return {"job_id": job_id}
+
+
+@router.get("")
+def list_all_jobs() -> Dict[str, Any]:
+    """返回所有历史任务列表 + 服务启动时间。"""
+    return {
+        "jobs": list_jobs(),
+        "server_started_at": get_server_started_at(),
+    }
 
 
 @router.get("/{job_id}")
