@@ -1,4 +1,6 @@
-# Kevin Auto Tag
+# Auto Tag
+
+**[English](./README.en.md)** | **简体中文**
 
 基于 **ChromaDB** + **CLIP** + **VLM** 的图像自动标注系统，从 `kevin_agent` 项目抽取而来。
 
@@ -11,8 +13,8 @@
 ├── scripts/
 │   ├── linux/              # Linux/macOS 脚本（bash）
 │   └── windows/            # Windows 脚本（PowerShell）
-├── AGENTS.md
-└── notes/                  # 文档（Release_Record、for_developer、for_test）
+├── notes/                  # 文档（Release_Record、for_developer、for_test）
+└── LICENSE                 # MIT
 ```
 
 当前版本见 [notes/Release_Record.md](./notes/Release_Record.md)（**v0.0.2**）。Web 控制台：http://localhost:5020
@@ -61,6 +63,6 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_backend.ps1
 powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_frontend_v2.ps1
 ```
 
-## 许可
+## License
 
-仅供内部使用。
+本项目采用 [MIT License](./LICENSE)。
