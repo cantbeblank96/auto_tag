@@ -45,9 +45,12 @@ def _record_from_job(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
         "failed_so_far": int(job.get("failed_so_far") or 0),
         "skip_in_db": int(job.get("skip_in_db") or 0),
         "vlm_calls": int(job.get("vlm_calls") or 0),
+        "new_centers": int(job.get("new_centers") or 0),
         "stage1_skips": int(job.get("stage1_skips") or 0),
         "stage2_joins": int(job.get("stage2_joins") or 0),
         "created_at": float(job.get("created_at") or 0),
+        "started_at": float(job["started_at"]) if job.get("started_at") else None,
+        "finished_at": float(job["finished_at"]) if job.get("finished_at") else None,
     }
 
 
@@ -127,9 +130,12 @@ def hydrate_jobs_from_disk(target: Dict[str, Dict[str, Any]]) -> int:
             "failed_so_far": int(rec.get("failed_so_far") or 0),
             "skip_in_db": int(rec.get("skip_in_db") or 0),
             "vlm_calls": int(rec.get("vlm_calls") or 0),
+            "new_centers": int(rec.get("new_centers") or 0),
             "stage1_skips": int(rec.get("stage1_skips") or 0),
             "stage2_joins": int(rec.get("stage2_joins") or 0),
             "created_at": float(rec.get("created_at") or 0),
+            "started_at": float(rec["started_at"]) if rec.get("started_at") else None,
+            "finished_at": float(rec["finished_at"]) if rec.get("finished_at") else None,
         }
         loaded += 1
     return loaded

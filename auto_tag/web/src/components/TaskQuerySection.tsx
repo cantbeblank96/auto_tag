@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { api, type JobSummary } from '../api/client'
+import { formatJobRuntime } from '../utils/jobDuration'
 
 const STATUS_LABEL: Record<string, string> = {
   queued: '排队中',
@@ -13,6 +14,7 @@ export default function TaskQuerySection() {
   const [loading, setLoading] = useState(true)
   const [sortDesc, setSortDesc] = useState(true)
   const [serverStartedAt, setServerStartedAt] = useState<number | null>(null)
+  const [nowSec, setNowSec] = useState(() => Date.now() / 1000)
 
   const loadJobs = () => {
     setLoading(true)
@@ -28,6 +30,17 @@ export default function TaskQuerySection() {
   useEffect(() => {
     loadJobs()
   }, [])
+
+  useEffect(() => {
+    const hasRunning = jobs.some(j => j.status === 'running')
+    if (!hasRunning) return
+    const poll = setInterval(loadJobs, 3000)
+    const tick = setInterval(() => setNowSec(Date.now() / 1000), 1000)
+    return () => {
+      clearInterval(poll)
+      clearInterval(tick)
+    }
+  }, [jobs])
 
   const sorted = [...jobs].sort((a, b) => {
     const diff = (a.created_at || 0) - (b.created_at || 0)
@@ -79,6 +92,7 @@ export default function TaskQuerySection() {
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">任务 ID</th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">状态</th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">创建时间</th>
+                <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">耗时</th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">工作目录</th>
                 <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">已收集</th>
                 <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">已处理</th>
@@ -93,6 +107,8 @@ export default function TaskQuerySection() {
                 const proc = j.processed || 0
                 const skipAll = (j.skip_in_db || 0) + (j.stage1_skips || 0) + (j.stage2_joins || 0)
                 const den = proc || 1
+                const vlmTotal = j.new_centers || 0
+                const vlmDen = vlmTotal > 0 ? vlmTotal : den
                 const ts = j.created_at ? new Date(j.created_at * 1000).toLocaleString() : '-'
                 return (
                   <tr key={j.job_id} className="border-t border-gray-100 dark:border-gray-700">
@@ -115,6 +131,9 @@ export default function TaskQuerySection() {
                       </span>
                     </td>
                     <td className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400">{ts}</td>
+                    <td className="px-3 py-2 text-right text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                      {formatJobRuntime(j, nowSec)}
+                    </td>
                     <td className="px-3 py-2 text-xs text-gray-500 dark:text-gray-400 max-w-40 truncate">
                       {j.work_dir || '-'}
                     </td>
@@ -123,8 +142,8 @@ export default function TaskQuerySection() {
                       {total > 0 ? `${proc} (${((proc / total) * 100).toFixed(0)}%)` : proc || '-'}
                     </td>
                     <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">
-                      {den > 0
-                        ? `${j.vlm_calls || 0} (${(((j.vlm_calls || 0) / den) * 100).toFixed(0)}%)`
+                      {vlmDen > 0
+                        ? `${j.vlm_calls || 0}/${vlmTotal > 0 ? vlmTotal : vlmDen} (${(((j.vlm_calls || 0) / vlmDen) * 100).toFixed(0)}%)`
                         : j.vlm_calls || 0}
                     </td>
                     <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">

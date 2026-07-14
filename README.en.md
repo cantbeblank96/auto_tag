@@ -14,10 +14,11 @@ Image auto-annotation pipeline built on **ChromaDB** + **CLIP** + **VLM**, extra
 │   ├── linux/              # Linux/macOS (bash)
 │   └── windows/            # Windows (PowerShell)
 ├── notes/                  # Docs (Release_Record, for_developer, for_test)
+├── temp/                   # Local exports / scratch (gitignored)
 └── LICENSE                 # MIT
 ```
 
-Current version: [notes/Release_Record.md](./notes/Release_Record.md) (**v0.0.2**). Web console: http://localhost:5020
+Current version: [notes/Release_Record.md](./notes/Release_Record.md) (**v0.0.3**). Web console: http://localhost:5020
 
 ## Quick start
 

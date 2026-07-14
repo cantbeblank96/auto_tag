@@ -75,9 +75,12 @@ def submit_job(cfg: PipelineConfig) -> str:
             "failed_so_far": 0,
             "skip_in_db": 0,
             "vlm_calls": 0,
+            "new_centers": 0,
             "stage1_skips": 0,
             "stage2_joins": 0,
             "created_at": time.time(),
+            "started_at": None,
+            "finished_at": None,
         }
         persist_job_record(job_id, _jobs[job_id])
     except Exception:
@@ -91,6 +94,7 @@ def submit_job(cfg: PipelineConfig) -> str:
         root = logging.getLogger()
         try:
             _jobs[job_id]["status"] = "running"
+            _jobs[job_id]["started_at"] = time.time()
             persist_job_record(job_id, _jobs[job_id])
             mem_handler = _memory_handler(logs)
             root.addHandler(mem_handler)
@@ -102,6 +106,7 @@ def submit_job(cfg: PipelineConfig) -> str:
                 *,
                 skip_in_db: int = 0,
                 vlm_calls: int = 0,
+                new_centers: int = 0,
                 stage1_skips: int = 0,
                 stage2_joins: int = 0,
             ) -> None:
@@ -110,6 +115,7 @@ def submit_job(cfg: PipelineConfig) -> str:
                 _jobs[job_id]["failed_so_far"] = failed_n
                 _jobs[job_id]["skip_in_db"] = skip_in_db
                 _jobs[job_id]["vlm_calls"] = vlm_calls
+                _jobs[job_id]["new_centers"] = new_centers
                 _jobs[job_id]["stage1_skips"] = stage1_skips
                 _jobs[job_id]["stage2_joins"] = stage2_joins
 
@@ -122,6 +128,7 @@ def submit_job(cfg: PipelineConfig) -> str:
             _jobs[job_id]["failed_so_far"] = n_failed
             _jobs[job_id]["status"] = "done"
             _jobs[job_id]["processed"] = result.total_images
+            _jobs[job_id]["finished_at"] = time.time()
             try:
                 write_build_snapshot(work_log_dir(cfg.work_dir), cfg)
             except Exception:
@@ -131,8 +138,21 @@ def submit_job(cfg: PipelineConfig) -> str:
             logger.exception("Job %s failed", job_id)
             _jobs[job_id]["status"] = "failed"
             _jobs[job_id]["error"] = str(e)
+            _jobs[job_id]["finished_at"] = time.time()
             persist_job_record(job_id, _jobs[job_id])
         finally:
+            if _jobs.get(job_id, {}).get("finished_at") is None:
+                _jobs[job_id]["finished_at"] = time.time()
+                try:
+                    persist_job_record(job_id, _jobs[job_id])
+                except Exception:
+                    logger.exception("persist job finished_at failed for %s", job_id)
+            try:
+                from auto_tag.core.vlm_endpoint_stats_store import persist_circuit_breaker_states
+
+                persist_circuit_breaker_states(cfg.work_dir)
+            except Exception:
+                logger.exception("persist VLM endpoint stats failed for job %s", job_id)
             if mem_handler is not None:
                 root.removeHandler(mem_handler)
             with _submit_lock:
@@ -170,11 +190,14 @@ def list_jobs() -> List[Dict[str, Any]]:
             "failed_so_far": j.get("failed_so_far", 0),
             "skip_in_db": j.get("skip_in_db", 0),
             "vlm_calls": j.get("vlm_calls", 0),
+            "new_centers": j.get("new_centers", 0),
             "stage1_skips": j.get("stage1_skips", 0),
             "stage2_joins": j.get("stage2_joins", 0),
             "work_dir": j.get("work_dir", ""),
             "log_dir": j.get("log_dir", ""),
             "created_at": j.get("created_at", 0),
+            "started_at": j.get("started_at"),
+            "finished_at": j.get("finished_at"),
         })
     out.sort(key=lambda x: x.get("created_at", 0))
     return out

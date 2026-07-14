@@ -113,7 +113,10 @@ export default function Settings() {
 
   // Model management (unchanged)
   const [models, setModels] = useState<ModelEntry[]>([])
-  const [vlmStrategy, setVlmStrategy] = useState('priority')
+  const [vlmStrategy, setVlmStrategy] = useState('round_robin')
+  const [vlmConcurrency, setVlmConcurrency] = useState(3)
+  const [vlmHttpTimeout, setVlmHttpTimeout] = useState(60)
+  const [vlmValidationMaxCorrections, setVlmValidationMaxCorrections] = useState(2)
   const [cbTimeWindow, setCbTimeWindow] = useState(300)
   const [cbFailureThreshold, setCbFailureThreshold] = useState(0.5)
   const [cbCooldown, setCbCooldown] = useState(600)
@@ -124,10 +127,12 @@ export default function Settings() {
 
   // General settings (from config.json)
   const [batchSize, setBatchSize] = useState(32)
+  const [clipDevice, setClipDevice] = useState('cuda')
   const [tauDup, setTauDup] = useState(0.05)
   const [tauCls, setTauCls] = useState(0.25)
   const [workDir, setWorkDir] = useState(`${PROJECT_PATH_MACRO}/work_dir`)
   const [recDup, setRecDup] = useState(true)
+  const [pipelineDebug, setPipelineDebug] = useState(false)
 
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
@@ -140,6 +145,42 @@ export default function Settings() {
   })
 
   useEffect(() => { loadEverything() }, [])
+
+  const refreshModelStats = useCallback(async () => {
+    try {
+      const live = await api.getModels()
+      const stateById = new Map<string, any>(
+        (live.models || []).map((m: any) => [String(m.id || m.endpoint_id), m]),
+      )
+      setModels(prev => prev.map(m => {
+        const st = stateById.get(m.id)
+        if (!st) return m
+        return {
+          ...m,
+          tripped: st.tripped,
+          failures_in_window: st.failures_in_window,
+          total_calls: st.total_calls,
+          failure_rate: st.failure_rate,
+          last_error: st.last_error,
+        }
+      }))
+    } catch { /* backend not ready */ }
+  }, [])
+
+  useEffect(() => {
+    const onVisible = () => { refreshModelStats() }
+    window.addEventListener('focus', onVisible)
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') onVisible()
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    const timer = window.setInterval(refreshModelStats, 15000)
+    return () => {
+      window.removeEventListener('focus', onVisible)
+      document.removeEventListener('visibilitychange', onVisibility)
+      window.clearInterval(timer)
+    }
+  }, [refreshModelStats])
 
   const buildConfigPayload = useCallback(() => {
     return {
@@ -156,6 +197,11 @@ export default function Settings() {
       })),
       questions: questionsToObject(questions),
       vlm_strategy: vlmStrategy,
+      vlm_concurrency: vlmConcurrency,
+      vlm_http_timeout: vlmHttpTimeout,
+      vlm_validation_max_corrections: vlmValidationMaxCorrections,
+      device: clipDevice,
+      pipeline_debug: pipelineDebug,
       circuit_breaker: {
         time_window_seconds: cbTimeWindow,
         failure_rate_threshold: cbFailureThreshold,
@@ -164,7 +210,7 @@ export default function Settings() {
     }
   }, [
     questions, workDir, batchSize, tauDup, tauCls, recDup, models,
-    vlmStrategy, cbTimeWindow, cbFailureThreshold, cbCooldown,
+    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, cbTimeWindow, cbFailureThreshold, cbCooldown,
   ])
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
@@ -180,10 +226,12 @@ export default function Settings() {
         const data = await res.json()
         const cfg = typeof data.content === 'string' ? JSON.parse(data.content) : data.content
         setBatchSize(cfg.batch_size ?? 32)
+        setClipDevice(cfg.device ?? 'cuda')
         setTauDup(cfg.tau_dup ?? 0.05)
         setTauCls(cfg.tau_cls ?? 0.25)
         setWorkDir(cfg.work_dir ?? `${PROJECT_PATH_MACRO}/work_dir`)
         setRecDup(cfg.record_stage1_duplicates ?? true)
+        setPipelineDebug(cfg.pipeline_debug ?? false)
         // Load questions
         const qs = cfg.questions || {}
         const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
@@ -212,7 +260,10 @@ export default function Settings() {
           })
         } catch { /* 后端未就绪时仅展示 config */ }
         setModels(loadedModels)
-        setVlmStrategy(cfg.vlm_strategy || 'priority')
+        setVlmStrategy(cfg.vlm_strategy || 'round_robin')
+        setVlmConcurrency(cfg.vlm_concurrency ?? 3)
+        setVlmHttpTimeout(cfg.vlm_http_timeout ?? 60)
+        setVlmValidationMaxCorrections(cfg.vlm_validation_max_corrections ?? 2)
         // Circuit breaker config
         const cb = cfg.circuit_breaker || {}
         setCbTimeWindow(cb.time_window_seconds ?? 300)
@@ -221,17 +272,22 @@ export default function Settings() {
         baselineConfigRef.current = stableStringify({
           work_dir: cfg.work_dir ?? `${PROJECT_PATH_MACRO}/work_dir`,
           batch_size: cfg.batch_size ?? 32,
+          device: cfg.device ?? 'cuda',
           tau_dup: cfg.tau_dup ?? 0.05,
           tau_cls: cfg.tau_cls ?? 0.25,
           embedding_subdir: cfg.embedding_subdir ?? 'embedding_index',
           record_stage1_duplicates: cfg.record_stage1_duplicates ?? true,
+          pipeline_debug: cfg.pipeline_debug ?? false,
           duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
           vlm_models: loadedModels.map((m) => ({
             id: m.id,
             name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
           })),
           questions: questionsToObject(loadedQuestions),
-          vlm_strategy: cfg.vlm_strategy || 'priority',
+          vlm_strategy: cfg.vlm_strategy || 'round_robin',
+          vlm_concurrency: cfg.vlm_concurrency ?? 3,
+          vlm_http_timeout: cfg.vlm_http_timeout ?? 60,
+          vlm_validation_max_corrections: cfg.vlm_validation_max_corrections ?? 2,
           circuit_breaker: {
             time_window_seconds: cb.time_window_seconds ?? 300,
             failure_rate_threshold: cb.failure_rate_threshold ?? 0.5,
@@ -395,12 +451,21 @@ export default function Settings() {
               <button onClick={addModel} className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">+ 添加模型</button>
             </div>
           </div>
-          <div className="flex items-center gap-4 mb-3 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
+          <div className="flex flex-wrap items-center gap-4 mb-3 p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg">
             <label className="text-sm font-medium text-gray-700 dark:text-gray-300">调用策略</label>
             <select value={vlmStrategy} onChange={e => { setVlmStrategy(e.target.value); markDirty() }} className="border rounded px-3 py-1.5 text-sm bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200">
               <option value="priority">优先级顺序（Failover）</option>
               <option value="round_robin">均衡负载（Round-Robin）</option>
             </select>
+            <label className="text-sm font-medium text-gray-700 dark:text-gray-300">VLM 并发数</label>
+            <input type="number" value={vlmConcurrency} onChange={e => { setVlmConcurrency(Number(e.target.value)); markDirty() }} min={1} max={32} className="border rounded px-3 py-1.5 text-sm w-20 bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200" />
+            <span className="text-xs text-gray-500 dark:text-gray-400">同一批内最多并行调用 VLM 的次数（1=串行）</span>
+            <label className="text-sm font-medium text-gray-700 dark:text-gray-300">HTTP 超时（秒）</label>
+            <input type="number" value={vlmHttpTimeout} onChange={e => { setVlmHttpTimeout(Number(e.target.value)); markDirty() }} min={5} max={600} className="border rounded px-3 py-1.5 text-sm w-20 bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200" />
+            <span className="text-xs text-gray-500 dark:text-gray-400">单次 VLM HTTP 读超时；服务端无响应时最多等待此时长（默认 60s）</span>
+            <label className="text-sm font-medium text-gray-700 dark:text-gray-300">校验失败改正轮数</label>
+            <input type="number" value={vlmValidationMaxCorrections} onChange={e => { setVlmValidationMaxCorrections(Number(e.target.value)); markDirty() }} min={0} max={8} className="border rounded px-3 py-1.5 text-sm w-20 bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200" />
+            <span className="text-xs text-gray-500 dark:text-gray-400">validate 不通过时，将结果与错误发回模型改正（0=仅首轮）</span>
           </div>
           <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">配置保存在：<code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{configPath}</code></p>
           {models.length === 0 && <p className="text-xs text-gray-400 py-4 text-center">暂无模型。点击「+ 添加模型」添加。</p>}
@@ -465,6 +530,12 @@ export default function Settings() {
           <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">通用设置</h3>
           <div className="grid grid-cols-2 gap-4">
             <div><label className={labelCls}>batch_size</label><input type="number" value={batchSize} onChange={e => { setBatchSize(Number(e.target.value)); markDirty() }} min={1} className={inputCls} /></div>
+            <div><label className={labelCls}>CLIP 设备（device）</label>
+              <select value={clipDevice} onChange={e => { setClipDevice(e.target.value); markDirty() }} className={inputCls}>
+                <option value="cuda">cuda（GPU，不可用时自动回退 CPU）</option>
+                <option value="cpu">cpu</option>
+              </select>
+            </div>
             <div><label className={labelCls}>tau_dup（去重阈值）</label><input type="number" value={tauDup} onChange={e => { setTauDup(Number(e.target.value)); markDirty() }} min={0} max={1} step={0.01} className={inputCls} /></div>
             <div><label className={labelCls}>tau_cls（聚类阈值）</label><input type="number" value={tauCls} onChange={e => { setTauCls(Number(e.target.value)); markDirty() }} min={0} max={1} step={0.01} className={inputCls} /></div>
             <div className="col-span-2"><label className={labelCls}>work_dir（工作根目录）</label>
@@ -474,6 +545,9 @@ export default function Settings() {
               </p>
             </div>
             <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={recDup} onChange={e => { setRecDup(e.target.checked); markDirty() }} className="rounded" /> record_stage1_duplicates（记录近重复对到侧车）</label></div>
+            <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={pipelineDebug} onChange={e => { setPipelineDebug(e.target.checked); markDirty() }} className="rounded" /> pipeline_debug（性能剖析 + VLM 时序图）</label>
+              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 ml-6">开启后任务结束于 work_dir/log 写入 pipeline_profile.json、vlm_timing.json、vlm_timing.png、vlm_http_trace.txt、vlm_timing_summary.json</p>
+            </div>
           </div>
         </section>
 

@@ -44,6 +44,7 @@ class JobCreate(BaseModel):
     record_stage1_duplicates: Optional[bool] = None
     batch_size: Optional[int] = None
     skip_if_in_db: bool = True
+    pipeline_debug: Optional[bool] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -78,6 +79,7 @@ def _to_pipeline_config(body: JobCreate) -> PipelineConfig:
         batch_size=body.batch_size,
         record_stage1_duplicates=body.record_stage1_duplicates,
         skip_if_in_db=body.skip_if_in_db,
+        pipeline_debug=body.pipeline_debug,
     )
 
 
@@ -119,8 +121,12 @@ def job_status(job_id: str) -> Dict[str, Any]:
         "failed_so_far": j.get("failed_so_far", 0),
         "skip_in_db": j.get("skip_in_db", 0),
         "vlm_calls": j.get("vlm_calls", 0),
+        "new_centers": j.get("new_centers", 0),
         "stage1_skips": j.get("stage1_skips", 0),
         "stage2_joins": j.get("stage2_joins", 0),
+        "created_at": j.get("created_at", 0),
+        "started_at": j.get("started_at"),
+        "finished_at": j.get("finished_at"),
     }
 
 

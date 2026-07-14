@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { api, type JobStatusResponse, type JobSummary } from '../api/client'
 import TaskQuerySection from '../components/TaskQuerySection'
+import { formatJobRuntime } from '../utils/jobDuration'
 
 const sectionTitleCls =
   'text-lg font-semibold text-gray-800 dark:text-gray-100 border-b border-gray-200 dark:border-gray-700 pb-2 mb-4'
@@ -97,6 +98,15 @@ export default function Tasks() {
 
   const skipIfInDbRef = useRef(skipIfInDb)
   skipIfInDbRef.current = skipIfInDb
+
+  // 运行中任务时长每秒刷新
+  const [nowSec, setNowSec] = useState(() => Date.now() / 1000)
+  useEffect(() => {
+    const hasRunning = queue.some(q => q.status === 'running')
+    if (!hasRunning) return
+    const t = setInterval(() => setNowSec(Date.now() / 1000), 1000)
+    return () => clearInterval(t)
+  }, [queue])
 
   // --- 挂载时从后端拉取历史任务 ---
   useEffect(() => {
@@ -432,6 +442,7 @@ export default function Tasks() {
                   <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">ID</th>
                   <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">摘要</th>
                   <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">状态</th>
+                  <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">耗时</th>
                   <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">已收集</th>
                   <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">已处理</th>
                   <th className="text-right px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">打标数</th>
@@ -447,10 +458,12 @@ export default function Tasks() {
                   const fail = lj?.failed_so_far || 0
                   const skDb = lj?.skip_in_db || 0
                   const vlm = lj?.vlm_calls || 0
+                  const vlmTotal = lj?.new_centers || 0
                   const s1 = lj?.stage1_skips || 0
                   const s2 = lj?.stage2_joins || 0
                   const skipAll = skDb + s1 + s2
                   const den = proc || 1
+                  const vlmDen = vlmTotal > 0 ? vlmTotal : den
                   return (
                     <tr key={item.queueId} className="border-t border-gray-100">
                       <td className="px-3 py-2 text-xs font-mono text-gray-500">{item.queueId}</td>
@@ -462,9 +475,20 @@ export default function Tasks() {
                                 'bg-gray-100 text-gray-600 dark:text-gray-400'
                           }`}>{STATUS_LABEL[item.status]}</span>
                       </td>
+                      <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400 text-xs whitespace-nowrap">
+                        {formatJobRuntime(
+                          {
+                            status: item.status === 'completed' ? 'done' : item.status === 'running' ? 'running' : item.status,
+                            created_at: item.createdAt > 0 ? item.createdAt / 1000 : lj?.created_at,
+                            started_at: lj?.started_at,
+                            finished_at: lj?.finished_at,
+                          },
+                          nowSec,
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{total || '-'}</td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{total > 0 ? fmtRatio(proc, total) : proc || '-'}</td>
-                      <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{den > 0 ? fmtRatio(vlm, den) : vlm || '-'}</td>
+                      <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{vlmDen > 0 ? fmtRatio(vlm, vlmDen) : vlm || '-'}</td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{den > 0 ? fmtRatio(skipAll, den) : skipAll || '-'}</td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{den > 0 ? fmtRatio(fail, den) : fail || '-'}</td>
                     </tr>
@@ -475,21 +499,55 @@ export default function Tasks() {
           </div>
         )}
 
-        {/* Running progress */}
+        {/* Running progress：建簇与 VLM 双进度条 */}
         {queue.filter(q => q.status === 'running').map((item, idx) => {
           const lj = item.lastJob
           const total = lj?.total || 0
           const proc = lj?.processed || 0
-          const pct = total > 0 ? Math.min(proc / total, 1) : 0
+          const vlmDone = lj?.vlm_calls || 0
+          const vlmTotal = lj?.new_centers || 0
+          const clusterPct = total > 0 ? Math.min(proc / total, 1) : 0
+          const vlmPct = vlmTotal > 0 ? Math.min(vlmDone / vlmTotal, 1) : 0
+          const clusteringComplete = total > 0 && proc >= total
+          const vlmComplete = vlmTotal === 0 || vlmDone >= vlmTotal
+          const phaseLabel = !clusteringComplete
+            ? '建簇中（CLIP + 双阈值）'
+            : !vlmComplete
+              ? 'VLM 标注中（与建簇并行，收尾等待）'
+              : '收尾中'
           return (
-            <div key={`${item.queueId}-${idx}`} className="mb-4">
-              <p className="text-xs text-gray-600 dark:text-gray-400 mb-1">
-                运行中 <code className="bg-gray-100 px-1 rounded">{item.queueId}</code>：
-                已处理 {proc} / 已收集 {total}，失败 {lj?.failed_so_far || 0}
+            <div key={`${item.queueId}-${idx}`} className="mb-4 space-y-2">
+              <p className="text-xs text-gray-600 dark:text-gray-400">
+                运行中 <code className="bg-gray-100 px-1 rounded">{item.queueId}</code>
+                · <span className="font-medium text-blue-700 dark:text-blue-300">{phaseLabel}</span>
+                · 失败 {lj?.failed_so_far || 0}
               </p>
-              <div className="w-full bg-gray-200 rounded-full h-2">
-                <div className="bg-blue-500 h-2 rounded-full transition-all" style={{ width: `${pct * 100}%` }} />
+              <div>
+                <div className="flex justify-between text-xs text-gray-500 mb-0.5">
+                  <span>建簇</span>
+                  <span>{proc} / {total || '—'}</span>
+                </div>
+                <div className="w-full bg-gray-200 rounded-full h-2">
+                  <div
+                    className={`h-2 rounded-full transition-all ${clusteringComplete ? 'bg-green-500' : 'bg-blue-500'}`}
+                    style={{ width: `${clusterPct * 100}%` }}
+                  />
+                </div>
               </div>
+              {(vlmTotal > 0 || vlmDone > 0) && (
+                <div>
+                  <div className="flex justify-between text-xs text-gray-500 mb-0.5">
+                    <span>VLM 标注（簇中心）</span>
+                    <span>{vlmDone} / {vlmTotal || '—'}</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-2">
+                    <div
+                      className={`h-2 rounded-full transition-all ${vlmComplete ? 'bg-green-500' : 'bg-amber-500'}`}
+                      style={{ width: `${vlmPct * 100}%` }}
+                    />
+                  </div>
+                </div>
+              )}
             </div>
           )
         })}

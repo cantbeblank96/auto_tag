@@ -14,10 +14,11 @@
 │   ├── linux/              # Linux/macOS 脚本（bash）
 │   └── windows/            # Windows 脚本（PowerShell）
 ├── notes/                  # 文档（Release_Record、for_developer、for_test）
+├── temp/                   # 本地导出/临时文件（gitignore，勿提交）
 └── LICENSE                 # MIT
 ```
 
-当前版本见 [notes/Release_Record.md](./notes/Release_Record.md)（**v0.0.2**）。Web 控制台：http://localhost:5020
+当前版本见 [notes/Release_Record.md](./notes/Release_Record.md)（**v0.0.3**）。Web 控制台：http://localhost:5020
 
 ## 快速开始
 

@@ -40,10 +40,14 @@
             "step": 0.1
         }
     },
-    "vlm_strategy": "priority",
+    "vlm_strategy": "round_robin",
+    "vlm_concurrency": 10,
+    "vlm_http_timeout": 60,
+    "vlm_validation_max_corrections": 2,
     "circuit_breaker": {
         "time_window_seconds": 300,
         "failure_rate_threshold": 0.5,
         "cooldown_seconds": 600
-    }
+    },
+    "pipeline_debug": false
 }

@@ -1,7 +1,7 @@
 """
 models router: 管理 VLM 模型配置 + 熔断状态。
 
-注意：模型配置持久化到 config.json，熔断状态存在于内存（circuit_breaker 单例）。
+注意：模型配置持久化到 config.json；熔断累计统计持久化到 work_dir/log/vlm_endpoint_stats.json。
 同名 provider 模型可配置多条（不同 base_url / API key）；以 endpoint ``id`` 区分。
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from auto_tag.core.config import settings, _AUTO_TAG_DIR
 from auto_tag.core.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
 from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
+from auto_tag.core.vlm_endpoint_stats_store import merge_endpoint_stats_for_api
 
 router = APIRouter(prefix="/models", tags=["models"])
 
@@ -118,6 +119,7 @@ def list_models() -> Dict[str, Any]:
     """获取当前配置的模型列表 + 各端点的熔断状态。"""
     cb = get_circuit_breaker()
     states = cb.get_all_states()
+    states = merge_endpoint_stats_for_api(states, getattr(settings, "work_dir", None))
     models_list = []
     for idx, m in enumerate(_configured_models()):
         if not isinstance(m, dict):
@@ -143,7 +145,9 @@ def list_models() -> Dict[str, Any]:
     return {
         "models": models_list,
         "circuit_breaker_config": cb.get_config_dict(),
-        "vlm_strategy": getattr(settings, "vlm_strategy", "priority"),
+        "vlm_strategy": getattr(settings, "vlm_strategy", "round_robin"),
+        "vlm_concurrency": getattr(settings, "vlm_concurrency", 3),
+        "vlm_http_timeout": getattr(settings, "vlm_http_timeout", 60),
     }
 
 

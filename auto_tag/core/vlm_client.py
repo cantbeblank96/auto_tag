@@ -11,15 +11,22 @@ import base64
 import io
 import json
 import logging
-from typing import Any, Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from PIL import Image
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from auto_tag.core.vlm_timing_collector import record as timing_record
+from auto_tag.core.vlm_timing_collector import is_enabled as timing_enabled
+
 from auto_tag.core.circuit_breaker import CircuitBreaker, get_circuit_breaker
 from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
+
+if TYPE_CHECKING:
+    from auto_tag.core.pipeline_profile import PipelineProfile
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +42,11 @@ class AllModelsFailedError(Exception):
     pass
 
 
+class EmptyVLMResponseError(Exception):
+    """VLM HTTP 200 但 content 为空。"""
+    pass
+
+
 def openai_chat_completion(
     model: str,
     messages: List[Dict[str, Any]],
@@ -42,7 +54,7 @@ def openai_chat_completion(
     base_url: Optional[str] = None,
     response_format: Optional[Dict[str, str]] = None,
     max_tokens: int = 4096,
-    timeout: float = 120.0,
+    timeout: float = 60.0,
 ) -> Dict[str, Any]:
     """
     直接调用 OpenAI 兼容的 Chat Completions API，替代 litellm。
@@ -133,6 +145,7 @@ class VLMClient:
             self._model_name = self.models[0]["name"] if self.models else "None"
             self._strategy = "priority"
             self._round_robin_index = 0
+            self._rr_lock = threading.Lock()
             logger.info(f"Initialized multi-model VLMClient with {len(self.models)} models: "
                         f"{[m['name'] for m in self.models]}")
             return
@@ -163,16 +176,29 @@ class VLMClient:
         else:
             logger.info(f"Initialized API VLM Client with model: {mn}")
 
-    def annotate_image(self, image: Image.Image) -> Dict[str, Any]:
+        self._strategy = "priority"
+        self._round_robin_index = 0
+        self._rr_lock = threading.Lock()
+
+    def annotate_image(
+        self,
+        image: Image.Image,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         if self.is_local:
             return self._annotate_local(image)
         from auto_tag.core.config import settings as s
-        self._strategy = getattr(s, "vlm_strategy", "priority") or "priority"
+        self._strategy = getattr(s, "vlm_strategy", "round_robin") or "round_robin"
         if self._strategy == "round_robin":
-            return self._annotate_with_round_robin(image)
-        return self._annotate_with_failover(image)
+            return self._annotate_with_round_robin(image, profile=profile)
+        return self._annotate_with_failover(image, profile=profile)
 
-    def annotate_image_incremental(self, image: Image.Image, existing_labels: Dict[str, Any]) -> Dict[str, Any]:
+    def annotate_image_incremental(
+        self,
+        image: Image.Image,
+        existing_labels: Dict[str, Any],
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         from auto_tag.core.config import settings
         keys = [
             k for k in (settings.questions or {}).keys()
@@ -184,11 +210,11 @@ class VLMClient:
             part = self._annotate_subset_local(image, keys)
         else:
             from auto_tag.core.config import settings as s
-            self._strategy = getattr(s, "vlm_strategy", "priority") or "priority"
+            self._strategy = getattr(s, "vlm_strategy", "round_robin") or "round_robin"
             if self._strategy == "round_robin":
-                part = self._annotate_subset_with_round_robin(image, keys)
+                part = self._annotate_subset_with_round_robin(image, keys, profile=profile)
             else:
-                part = self._annotate_subset_with_failover(image, keys)
+                part = self._annotate_subset_with_failover(image, keys, profile=profile)
         out = dict(existing_labels or {})
         if isinstance(part, dict):
             out.update(part)
@@ -196,7 +222,11 @@ class VLMClient:
 
     # ── Failover 核心逻辑 ──────────────────────────────
 
-    def _annotate_with_failover(self, image: Image.Image) -> Dict[str, Any]:
+    def _annotate_with_failover(
+        self,
+        image: Image.Image,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         last_error = ""
         for idx, model in enumerate(self.models):
             if not self._is_enabled(model):
@@ -205,7 +235,7 @@ class VLMClient:
             if self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
-                result = self._call_single_model(model, image)
+                result = self._call_single_model(model, image, profile=profile)
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
             except Exception as e:
@@ -216,7 +246,12 @@ class VLMClient:
                 )
         raise AllModelsFailedError(f"All models failed. Last error: {last_error}")
 
-    def _annotate_subset_with_failover(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
+    def _annotate_subset_with_failover(
+        self,
+        image: Image.Image,
+        keys: List[str],
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         last_error = ""
         for idx, model in enumerate(self.models):
             if not self._is_enabled(model):
@@ -225,7 +260,9 @@ class VLMClient:
             if self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
-                result = self._call_single_model_subset(model, image, keys)
+                result = self._call_single_model_subset(
+                    model, image, keys, profile=profile
+                )
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
             except Exception as e:
@@ -248,16 +285,21 @@ class VLMClient:
                 available.append((idx, model))
         return available
 
-    def _annotate_with_round_robin(self, image: Image.Image) -> Dict[str, Any]:
+    def _annotate_with_round_robin(
+        self,
+        image: Image.Image,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         available = self._get_available_models()
         if not available:
             raise AllModelsFailedError("All models are currently tripped (round_robin).")
-        pick = available[self._round_robin_index % len(available)]
-        self._round_robin_index += 1
+        with self._rr_lock:
+            pick = available[self._round_robin_index % len(available)]
+            self._round_robin_index += 1
         model_idx, model = pick
         endpoint_id = vlm_model_endpoint_id(model, model_idx)
         try:
-            result = self._call_single_model(model, image)
+            result = self._call_single_model(model, image, profile=profile)
             self.circuit_breaker.record_success(endpoint_id)
             return result
         except Exception as e:
@@ -265,18 +307,26 @@ class VLMClient:
             logger.warning(
                 f"Endpoint '{endpoint_id}' (model={model.get('name')}) round_robin failed: {e}, falling back..."
             )
-            return self._annotate_with_failover(image)
+            return self._annotate_with_failover(image, profile=profile)
 
-    def _annotate_subset_with_round_robin(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
+    def _annotate_subset_with_round_robin(
+        self,
+        image: Image.Image,
+        keys: List[str],
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         available = self._get_available_models()
         if not available:
             raise AllModelsFailedError("All models are currently tripped (round_robin).")
-        pick = available[self._round_robin_index % len(available)]
-        self._round_robin_index += 1
+        with self._rr_lock:
+            pick = available[self._round_robin_index % len(available)]
+            self._round_robin_index += 1
         model_idx, model = pick
         endpoint_id = vlm_model_endpoint_id(model, model_idx)
         try:
-            result = self._call_single_model_subset(model, image, keys)
+            result = self._call_single_model_subset(
+                model, image, keys, profile=profile
+            )
             self.circuit_breaker.record_success(endpoint_id)
             return result
         except Exception as e:
@@ -284,249 +334,524 @@ class VLMClient:
             logger.warning(
                 f"Endpoint '{endpoint_id}' (model={model.get('name')}) round_robin subset failed: {e}, falling back..."
             )
-            return self._annotate_subset_with_failover(image, keys)
+            return self._annotate_subset_with_failover(image, keys, profile=profile)
 
-    # ── 实际的 API 调用（含 tenacity 重试） ─────────────
+    # ── 多轮对话式 API 调用 ─────────────────────────────
+
+    def _messages_with_image(self, image: Image.Image, text: str) -> List[Dict[str, Any]]:
+        base64_image = encode_pil_image_to_base64(image)
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            }
+        ]
+
+    @staticmethod
+    def _parse_json_content(content: str) -> Dict[str, Any]:
+        cleaned = _clean_json(content or "")
+        if not cleaned:
+            raise json.JSONDecodeError("Empty response", content or "", 0)
+        parsed = json.loads(cleaned)
+        if not isinstance(parsed, dict):
+            raise json.JSONDecodeError(
+                "Top-level JSON must be an object", cleaned, 0
+            )
+        return parsed
 
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError, KeyError)),
-        before_sleep=lambda rs: logger.warning(f"VLM API call retrying in {rs.next_action.sleep}s..."),
+        retry=retry_if_exception_type(httpx.HTTPError),
+        before_sleep=lambda rs: logger.warning(
+            f"VLM API network error, retrying in {rs.next_action.sleep}s..."
+        ),
     )
-    def _call_single_model(self, model: Dict[str, Any], image: Image.Image) -> Dict[str, Any]:
-        prompt = self._generate_prompt()
-        base64_image = encode_pil_image_to_base64(image)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ],
-            }
-        ]
-        resp = openai_chat_completion(
-            model=model["name"],
-            messages=messages,
-            api_key=model.get("api_key"),
-            base_url=model.get("base_url"),
-            response_format={"type": "json_object"},
-        )
-        content = _extract_content(resp)
-        content = _clean_json(content)
-        return json.loads(content)
+    def _chat_raw(
+        self,
+        model: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        *,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> str:
+        """单次 HTTP 往返，仅在网络错误时重试；不在此处解析 JSON。"""
+        import time as _time
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.HTTPError, json.JSONDecodeError, KeyError)),
-        before_sleep=lambda rs: logger.warning(f"VLM API subset retrying in {rs.next_action.sleep}s..."),
-    )
-    def _call_single_model_subset(self, model: Dict[str, Any], image: Image.Image, keys: List[str]) -> Dict[str, Any]:
-        prompt = self._generate_prompt_for_keys(keys)
-        base64_image = encode_pil_image_to_base64(image)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ],
-            }
-        ]
-        resp = openai_chat_completion(
-            model=model["name"],
-            messages=messages,
-            api_key=model.get("api_key"),
-            base_url=model.get("base_url"),
-            response_format={"type": "json_object"},
-        )
+        if timing_enabled():
+            timing_record(
+                "http_start",
+                thread=__import__("threading").current_thread().name,
+                msg_count=len(messages),
+            )
+        from auto_tag.core.config import settings as _settings
+
+        http_timeout = float(getattr(_settings, "vlm_http_timeout", 60) or 60)
+        http_timeout = max(5.0, min(600.0, http_timeout))
+        t0 = _time.perf_counter()
+        thread_name = __import__("threading").current_thread().name
+        try:
+            resp = openai_chat_completion(
+                model=model["name"],
+                messages=messages,
+                api_key=model.get("api_key"),
+                base_url=model.get("base_url"),
+                response_format={"type": "json_object"},
+                timeout=http_timeout,
+            )
+        except Exception as e:
+            elapsed = round(_time.perf_counter() - t0, 3)
+            if timing_enabled():
+                timing_record(
+                    "http_failed",
+                    thread=thread_name,
+                    elapsed_s=elapsed,
+                    error_type=type(e).__name__,
+                    error=str(e)[:300],
+                    msg_count=len(messages),
+                )
+            raise
+        elapsed = round(_time.perf_counter() - t0, 3)
         content = _extract_content(resp)
-        content = _clean_json(content)
-        return json.loads(content)
+        if timing_enabled():
+            timing_record(
+                "http_done",
+                thread=thread_name,
+                elapsed_s=elapsed,
+                resp_chars=len(content),
+            )
+        if profile is not None:
+            profile.increment("vlm_http_calls")
+        return content
+
+    def _annotate_via_conversation(
+        self,
+        model: Dict[str, Any],
+        image: Image.Image,
+        initial_prompt: str,
+        *,
+        keys: Optional[List[str]] = None,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
+        """首轮带图提问；JSON/校验失败则在同一会话中文字追问改正（不再重传图片）。"""
+        from auto_tag.core.config import settings
+
+        max_corr = max(
+            0, int(getattr(settings, "vlm_validation_max_corrections", 2) or 2)
+        )
+        max_turns = 1 + max_corr
+        messages: List[Dict[str, Any]] = self._messages_with_image(
+            image, initial_prompt
+        )
+        last_raw = ""
+        last_parsed: Optional[Dict[str, Any]] = None
+
+        for turn in range(max_turns):
+            last_raw = self._chat_raw(model, messages, profile=profile)
+
+            if not (last_raw or "").strip():
+                logger.warning("VLM returned empty content at turn %d", turn)
+                if turn == 0:
+                    if timing_enabled():
+                        timing_record(
+                            "http_empty_failover",
+                            thread=__import__("threading").current_thread().name,
+                            turn=turn,
+                            msg_count=len(messages),
+                        )
+                    raise EmptyVLMResponseError("VLM returned empty content")
+                return last_parsed or {}
+
+            parse_error: Optional[str] = None
+            last_parsed = None
+            try:
+                last_parsed = self._parse_json_content(last_raw)
+            except json.JSONDecodeError as e:
+                parse_error = str(e)
+
+            if last_parsed is not None:
+                validation = self.validate_against_questions(last_parsed, keys=keys)
+                if validation["valid"]:
+                    if turn > 0:
+                        logger.info(
+                            "VLM output valid after %d follow-up turn(s)", turn
+                        )
+                    return last_parsed
+                if turn >= max_turns - 1:
+                    logger.warning(
+                        "VLM still invalid after %d follow-up turn(s): %s",
+                        max_corr,
+                        "; ".join(validation["errors"]),
+                    )
+                    return last_parsed
+                follow_up = self._generate_correction_prompt(
+                    last_parsed, validation["errors"], keys=keys
+                )
+                logger.info(
+                    "VLM validation failed (follow-up %d/%d)",
+                    turn + 1,
+                    max_corr,
+                )
+            else:
+                if turn >= max_turns - 1:
+                    logger.warning(
+                        "VLM JSON still unparseable after %d follow-up turn(s): %s",
+                        max_corr,
+                        parse_error,
+                    )
+                    return {}
+                follow_up = self._generate_json_parse_correction_prompt(
+                    last_raw, parse_error or "invalid JSON", keys=keys
+                )
+                logger.info(
+                    "VLM JSON parse failed (follow-up %d/%d)",
+                    turn + 1,
+                    max_corr,
+                )
+
+            messages.append({"role": "assistant", "content": last_raw})
+            messages.append({"role": "user", "content": follow_up})
+
+        return last_parsed or {}
+
+    def _call_single_model(
+        self,
+        model: Dict[str, Any],
+        image: Image.Image,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
+        return self._annotate_via_conversation(
+            model,
+            image,
+            self._generate_prompt(),
+            keys=None,
+            profile=profile,
+        )
+
+    def _call_single_model_subset(
+        self,
+        model: Dict[str, Any],
+        image: Image.Image,
+        keys: List[str],
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
+        return self._annotate_via_conversation(
+            model,
+            image,
+            self._generate_prompt_for_keys(keys),
+            keys=keys,
+            profile=profile,
+        )
 
     # ── 旧单模型 API 调用（保留向后兼容） ──────────────
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(Exception),
-        before_sleep=lambda rs: logger.warning(f"VLM API call failed, retrying in {rs.next_action.sleep}s..."),
-    )
-    def _annotate_api(self, image: Image.Image) -> Dict[str, Any]:
-        prompt = self._generate_prompt()
-        base64_image = encode_pil_image_to_base64(image)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ],
-            }
-        ]
+    def _annotate_api(
+        self,
+        image: Image.Image,
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
-        resp = openai_chat_completion(
-            model=self._model_name,
-            messages=messages,
-            api_key=model.get("api_key"),
-            base_url=model.get("base_url"),
-            response_format={"type": "json_object"},
+        return self._annotate_via_conversation(
+            model,
+            image,
+            self._generate_prompt(),
+            keys=None,
+            profile=profile,
         )
-        content = _extract_content(resp)
-        content = _clean_json(content)
-        return json.loads(content)
 
-    @retry(
-        stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type(Exception),
-        before_sleep=lambda rs: logger.warning(f"VLM API subset call failed, retrying in {rs.next_action.sleep}s..."),
-    )
-    def _annotate_subset_api(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
-        prompt = self._generate_prompt_for_keys(keys)
-        base64_image = encode_pil_image_to_base64(image)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
-                ],
-            }
-        ]
+    def _annotate_subset_api(
+        self,
+        image: Image.Image,
+        keys: List[str],
+        profile: Optional["PipelineProfile"] = None,
+    ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
-        resp = openai_chat_completion(
-            model=self._model_name,
-            messages=messages,
-            api_key=model.get("api_key"),
-            base_url=model.get("base_url"),
-            response_format={"type": "json_object"},
+        return self._annotate_via_conversation(
+            model,
+            image,
+            self._generate_prompt_for_keys(keys),
+            keys=keys,
+            profile=profile,
         )
-        content = _extract_content(resp)
-        content = _clean_json(content)
-        return json.loads(content)
 
     # ── Prompt 生成 ────────────────────────────────────
 
-    def _generate_prompt(self) -> str:
+    @staticmethod
+    def _schema_dict_for_keys(keys: Optional[List[str]] = None) -> Dict[str, Any]:
         from auto_tag.core.config import settings
-        schema_dict = dict(settings.questions)  # 全字段序列化
-        schema_json = json.dumps(schema_dict, indent=4)
+
+        qs = dict(settings.questions or {})
+        if keys is None:
+            return qs
+        return {k: qs.get(k, {}) for k in keys if k in qs}
+
+    @staticmethod
+    def _example_value_for_question(details: Dict[str, Any]) -> Any:
+        """根据 question 定义生成 one-shot 示例值（未知 type 亦给出占位）。"""
+        typ = str(details.get("type", "string") or "string")
+        choices = details.get("choices") or []
+
+        if typ in ("category", "enum") and choices:
+            return choices[0]
+        if typ == "enum":
+            return "example_value"
+        if typ == "int":
+            try:
+                return int(details.get("min", 0))
+            except (TypeError, ValueError):
+                return 0
+        if typ == "float":
+            try:
+                return float(details.get("min", 0.0))
+            except (TypeError, ValueError):
+                return 0.0
+        if typ == "string":
+            desc = str(details.get("description", "") or "").strip()
+            return desc[:48] if desc else "example text"
+        return "example"
+
+    @classmethod
+    def build_example_json(cls, keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """从 questions 生成完整示例 JSON（用于 one-shot prompt）。"""
+        schema = cls._schema_dict_for_keys(keys)
+        return {
+            key: cls._example_value_for_question(details if isinstance(details, dict) else {})
+            for key, details in schema.items()
+        }
+
+    def _generate_prompt(self) -> str:
+        schema_dict = self._schema_dict_for_keys()
+        schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
+        example_json = json.dumps(
+            self.build_example_json(), indent=4, ensure_ascii=False
+        )
         return f"""Please analyze this image and provide a structured JSON output describing it.
-You must strictly follow this JSON schema:
+
+You must strictly follow this JSON schema (field definitions):
 {schema_json}
-Return ONLY valid JSON format. Do not include any explanations or markdown formatting outside of the JSON block."""
+
+Example of a valid response (match this structure — scalar values at top level, no nested objects for numbers):
+{example_json}
+
+Return ONLY valid JSON. Do not include explanations or markdown fences."""
 
     def _generate_prompt_for_keys(self, keys: List[str]) -> str:
-        from auto_tag.core.config import settings
-        qs = settings.questions or {}
-        schema_dict = {k: qs.get(k, {}) for k in keys}  # 全字段序列化（仅含指定 keys）
-        schema_json = json.dumps(schema_dict, indent=4)
+        schema_dict = self._schema_dict_for_keys(keys)
+        schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
+        example_json = json.dumps(
+            self.build_example_json(keys), indent=4, ensure_ascii=False
+        )
         return f"""Please analyze this image and provide a structured JSON output.
+
 You must strictly follow this JSON schema (only these keys):
 {schema_json}
+
+Example of a valid response:
+{example_json}
+
 Return ONLY valid JSON. Do not include markdown fences."""
+
+    def _generate_correction_prompt(
+        self,
+        current_result: Dict[str, Any],
+        errors: List[str],
+        *,
+        keys: Optional[List[str]] = None,
+    ) -> str:
+        schema_dict = self._schema_dict_for_keys(keys)
+        schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
+        example_json = json.dumps(
+            self.build_example_json(keys), indent=4, ensure_ascii=False
+        )
+        prev_json = json.dumps(current_result, indent=4, ensure_ascii=False)
+        err_lines = "\n".join(f"- {e}" for e in errors)
+        return f"""Your previous JSON response did not pass validation against the required schema.
+
+Required schema:
+{schema_json}
+
+Example of a valid response:
+{example_json}
+
+Your previous output:
+{prev_json}
+
+Validation errors:
+{err_lines}
+
+Look at our conversation above (the image was in the first message). Fix every error and return ONLY a corrected JSON object.
+Use the same top-level keys. Put scalar values directly (e.g. "num_of_person": 2, not nested objects).
+Do not include markdown or explanations."""
+
+    def _generate_json_parse_correction_prompt(
+        self,
+        raw_content: str,
+        parse_error: str,
+        *,
+        keys: Optional[List[str]] = None,
+    ) -> str:
+        schema_dict = self._schema_dict_for_keys(keys)
+        schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
+        example_json = json.dumps(
+            self.build_example_json(keys), indent=4, ensure_ascii=False
+        )
+        preview = (raw_content or "")[:4000]
+        return f"""Your previous response could not be parsed as valid JSON.
+
+Parse error: {parse_error}
+
+Required schema:
+{schema_json}
+
+Example of a valid response:
+{example_json}
+
+Your previous response:
+{preview}
+
+Return ONLY a corrected JSON object. No markdown fences or explanations."""
 
     # ── 结果校验 ────────────────────────────────────
 
     @staticmethod
-    def validate_against_questions(result: Dict[str, Any]) -> Dict[str, Any]:
+    def validate_against_questions(
+        result: Dict[str, Any],
+        *,
+        keys: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
         """校验 VLM 返回结果是否符合 questions schema。
 
         对每个 question 字段，若该 question 有已知类型约束则做校验；
-        无类型定义（自由形式）的 question 不做校验。
+        无 choices 的 enum / 未知 type 仅要求 key 存在（便于测试非规范 schema）。
         返回：{"valid": bool, "errors": List[str]}
         """
         from auto_tag.core.config import settings
 
         errors: List[str] = []
         qs = settings.questions or {}
+        check_keys = list(keys) if keys is not None else list(qs.keys())
 
-        for key, details in qs.items():
+        for key in check_keys:
+            details = qs.get(key)
+            if not isinstance(details, dict):
+                continue
+
             if key not in result:
                 errors.append(f"Missing key: {key}")
                 continue
 
             val = result[key]
-            typ = details.get("type", "")
+            typ = str(details.get("type", "") or "")
 
-            if typ == "category":
-                choices = details.get("choices", [])
+            if typ in ("category", "enum"):
+                choices = details.get("choices") or []
                 if choices and val not in choices:
                     errors.append(
                         f"Key '{key}': value '{val}' not in choices {choices}"
                     )
 
             elif typ == "int":
-                if not isinstance(val, int):
+                if isinstance(val, bool) or not isinstance(val, int):
                     errors.append(
                         f"Key '{key}': expected int, got {type(val).__name__} ('{val}')"
                     )
 
             elif typ == "float":
-                if not isinstance(val, (int, float)):
+                if isinstance(val, bool) or not isinstance(val, (int, float)):
                     errors.append(
                         f"Key '{key}': expected number, got {type(val).__name__} ('{val}')"
                     )
 
-            # string / 未知 type → 不做形式校验，跳过
+            # string / enum 无 choices / 未知 type → 仅要求 key 存在
 
         return {"valid": len(errors) == 0, "errors": errors}
 
 
     # ── 本地模型 ────────────────────────────────────────
 
+    def _local_infer_json(self, image: Image.Image, prompt: str) -> Dict[str, Any]:
+        import torch
+
+        image = image.convert("RGB")
+        inputs = self.tokenizer.apply_chat_template(
+            [{"role": "user", "image": image, "content": prompt}],
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+        inputs = inputs.to(self.device)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs, max_new_tokens=1024, do_sample=True, temperature=0.8
+            )
+            outputs = outputs[:, inputs["input_ids"].shape[1] :]
+            content = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+        content = _clean_json(content)
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise json.JSONDecodeError("Top-level JSON must be an object", content, 0)
+        return parsed
+
+    def _correct_until_valid_local(
+        self,
+        image: Image.Image,
+        result: Dict[str, Any],
+        *,
+        keys: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        from auto_tag.core.config import settings
+
+        max_corr = max(
+            0, int(getattr(settings, "vlm_validation_max_corrections", 2) or 2)
+        )
+        current = dict(result) if isinstance(result, dict) else {}
+
+        for attempt in range(max_corr + 1):
+            validation = self.validate_against_questions(current, keys=keys)
+            if validation["valid"]:
+                return current
+            if attempt >= max_corr:
+                logger.warning(
+                    "Local VLM output still invalid after %d correction(s): %s",
+                    max_corr,
+                    "; ".join(validation["errors"]),
+                )
+                return current
+            prompt = self._generate_correction_prompt(
+                current, validation["errors"], keys=keys
+            )
+            try:
+                current = self._local_infer_json(image, prompt)
+            except Exception as e:
+                logger.warning("Local VLM correction failed: %s", e)
+                return current
+        return current
+
     def _annotate_local(self, image: Image.Image) -> Dict[str, Any]:
         logger.debug("Requesting local VLM annotation...")
-        prompt = self._generate_prompt()
         try:
-            import torch
-            image = image.convert('RGB')
-            inputs = self.tokenizer.apply_chat_template(
-                [{"role": "user", "image": image, "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-            inputs = inputs.to(self.device)
-            with torch.no_grad():
-                outputs = self.model.generate(**inputs, max_new_tokens=1024, do_sample=True, temperature=0.8)
-                outputs = outputs[:, inputs['input_ids'].shape[1]:]
-                content = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            content = _clean_json(content)
-            result_json = json.loads(content)
+            result = self._local_infer_json(image, self._generate_prompt())
+            result = self._correct_until_valid_local(image, result, keys=None)
             logger.info("Successfully generated local annotation")
-            return result_json
+            return result
         except json.JSONDecodeError as e:
-            logger.error(f"Local VLM returned invalid JSON. Content: {content}")
-            raise Exception(f"Invalid JSON from Local VLM: {e}")
+            logger.error("Local VLM returned invalid JSON: %s", e)
+            raise Exception(f"Invalid JSON from Local VLM: {e}") from e
         except Exception as e:
             logger.error(f"Local VLM inference error: {e}")
             raise
 
     def _annotate_subset_local(self, image: Image.Image, keys: List[str]) -> Dict[str, Any]:
         logger.debug("Requesting local VLM incremental annotation...")
-        prompt = self._generate_prompt_for_keys(keys)
         try:
-            import torch
-            image = image.convert("RGB")
-            inputs = self.tokenizer.apply_chat_template(
-                [{"role": "user", "image": image, "content": prompt}],
-                add_generation_prompt=True,
-                tokenize=True,
-                return_tensors="pt",
-                return_dict=True,
-            )
-            inputs = inputs.to(self.device)
-            with torch.no_grad():
-                outputs = self.model.generate(**inputs, max_new_tokens=1024, do_sample=True, temperature=0.8)
-                outputs = outputs[:, inputs["input_ids"].shape[1]:]
-                content = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            content = _clean_json(content)
-            return json.loads(content)
+            result = self._local_infer_json(image, self._generate_prompt_for_keys(keys))
+            return self._correct_until_valid_local(image, result, keys=keys)
         except Exception as e:
             logger.error(f"Local VLM subset inference error: {e}")
             raise

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -14,7 +16,14 @@ from kevin_toolbox.computer_science.algorithm.for_seq import chunk_generator
 
 from auto_tag.core.config import settings
 from auto_tag.core.duplicate_store import DuplicateLinkWriter
+from auto_tag.core.image_load_context import ImageLoadContext
 from auto_tag.core.path_prefix_registry import PathPrefixRegistry
+from auto_tag.core.pipeline_profile import PipelineProfile, resolve_pipeline_debug
+from auto_tag.core.vlm_timing_collector import configure as timing_configure
+from auto_tag.core.vlm_timing_collector import resolve_enabled as timing_resolve_enabled
+from auto_tag.core.vlm_timing_collector import record as timing_record
+from auto_tag.core.vlm_timing_collector import save_json as timing_save_json
+from auto_tag.core.vlm_timing_report import write_debug_artifacts
 from auto_tag.core.utils.load_image import load_image_for_job
 
 logger = logging.getLogger(__name__)
@@ -124,6 +133,8 @@ class PipelineConfig:
     """None 表示使用 settings.record_stage1_duplicates。"""
     skip_if_in_db: bool = False
     """为 True 时若向量索引中已有同 image_path 则跳过；为 False 时先删旧记录再重跑（覆盖）。"""
+    pipeline_debug: Optional[bool] = None
+    """为 True 时输出各阶段耗时；None 时使用 settings.pipeline_debug / 环境变量。"""
 
 
 @dataclass
@@ -131,6 +142,7 @@ class PipelineResult:
     total_images: int
     failed_paths: List[str]
     processed_ok: int
+    profile_summary: Optional[Dict[str, Any]] = None
 
 
 def collect_image_paths(
@@ -207,10 +219,13 @@ def run_annotation_pipeline(
         cfg: 任务配置
         on_progress: 回调，签名为
           ``(done: int, total: int, failed_n: int, *, skip_in_db: int, vlm_calls: int,
-          stage1_skips: int, stage2_joins: int) -> None``（后四个为累计值）。
+          new_centers: int, stage1_skips: int, stage2_joins: int) -> None``
+          （``done`` 为建簇阶段已处理张数；``vlm_calls/new_centers`` 为 VLM 完成/待标簇中心数）。
         should_cancel: 若返回 True 则尽快结束循环（当前 batch 仍会跑完）
     """
     cfg = replace(cfg, work_dir=normalize_work_dir(cfg.work_dir))
+    profile = PipelineProfile(resolve_pipeline_debug(cfg.pipeline_debug))
+    profile.mark_wall_start()
 
     image_list, _ = collect_image_paths(cfg.input_dirs, cfg.image_ls_files)
     if not image_list:
@@ -232,6 +247,18 @@ def run_annotation_pipeline(
             path_registry.register_abs_dir(os.path.dirname(os.path.abspath(lf)))
 
     batch_size = cfg.batch_size if cfg.batch_size is not None else settings.batch_size
+    timing_on = timing_resolve_enabled(cfg.pipeline_debug)
+    timing_configure(
+        enabled=timing_on,
+        meta={
+            "vlm_concurrency": int(getattr(settings, "vlm_concurrency", 1) or 1),
+            "vlm_http_timeout": float(getattr(settings, "vlm_http_timeout", 60) or 60),
+            "batch_size": int(batch_size),
+            "total_images": len(image_list),
+        },
+    )
+    if timing_on:
+        timing_record("pipeline_start")
     record_dup = (
         cfg.record_stage1_duplicates
         if cfg.record_stage1_duplicates is not None
@@ -245,19 +272,32 @@ def run_annotation_pipeline(
 
     from auto_tag.core.annotator import ImageAutoAnnotator
 
-    annotator = ImageAutoAnnotator(
-        duplicate_link_writer=dup_writer,
-        db_path=emb_d,
-        path_prefix_registry=path_registry,
-    )
+    with profile.span("annotator_init"):
+        load_ctx = ImageLoadContext(
+            b_yuv_image=cfg.b_yuv_image,
+            mixed_yuv=cfg.mixed_yuv,
+            yuv_type=cfg.yuv_type,
+            image_height=cfg.image_height,
+            image_width=cfg.image_width,
+            rotate_angle=cfg.rotate_angle,
+        )
+        annotator = ImageAutoAnnotator(
+            duplicate_link_writer=dup_writer,
+            db_path=emb_d,
+            path_prefix_registry=path_registry,
+            load_context=load_ctx,
+        )
+
     failed_images: List[str] = []
     processed_ok = 0
     total = len(image_list)
     images_seen = 0
     skip_in_db_n = 0
     vlm_total = 0
+    new_centers_total = 0
     stage1_total = 0
     stage2_total = 0
+    pipeline_cancelled = False
 
     def _emit_progress() -> None:
         if on_progress:
@@ -267,80 +307,132 @@ def run_annotation_pipeline(
                 len(failed_images),
                 skip_in_db=skip_in_db_n,
                 vlm_calls=vlm_total,
+                new_centers=new_centers_total,
                 stage1_skips=stage1_total,
                 stage2_joins=stage2_total,
             )
 
-    logger.info("Total images to process: %d", total)
+    vlm_progress_lock = threading.Lock()
 
-    for batch_paths in chunk_generator(
-        inputs=image_list,
-        chunk_size=batch_size,
-        b_drop_last=False,
-        b_display_progress=True,
-    ):
-        valid_paths_in_batch: List[str] = []
-        loaded_images = []
-        batch_cancelled = False
+    def _on_vlm_done() -> None:
+        nonlocal vlm_total
+        with vlm_progress_lock:
+            vlm_total += 1
+        _emit_progress()
 
-        for path in batch_paths:
-            if should_cancel and should_cancel():
-                logger.info("Pipeline cancelled by request.")
-                batch_cancelled = True
+    annotator.start_vlm_pool(profile=profile, on_vlm_done=_on_vlm_done)
+
+    try:
+        logger.info("Total images to process: %d", total)
+
+        for batch_paths in chunk_generator(
+            inputs=image_list,
+            chunk_size=batch_size,
+            b_drop_last=False,
+            b_display_progress=True,
+        ):
+            valid_paths_in_batch: List[str] = []
+            loaded_images = []
+            batch_cancelled = False
+
+            for path in batch_paths:
+                if should_cancel and should_cancel():
+                    logger.info("Pipeline cancelled by request.")
+                    batch_cancelled = True
+                    pipeline_cancelled = True
+                    break
+
+                if cfg.skip_if_in_db and annotator.db.has_image_path(
+                    path, registry=path_registry
+                ):
+                    skip_in_db_n += 1
+                    images_seen += 1
+                    _emit_progress()
+                    continue
+
+                if not cfg.skip_if_in_db:
+                    try:
+                        t0 = time.perf_counter() if profile.enabled else 0.0
+                        annotator.db.delete_by_image_path(path, registry=path_registry)
+                        if profile.enabled:
+                            profile.add("db_delete_path", time.perf_counter() - t0)
+                    except Exception as e:
+                        logger.warning("delete_by_image_path %s: %s", path, e)
+
+                try:
+                    t0 = time.perf_counter() if profile.enabled else 0.0
+                    img = load_image_for_job(
+                        path,
+                        b_yuv_image=cfg.b_yuv_image,
+                        mixed_yuv=cfg.mixed_yuv,
+                        yuv_type=cfg.yuv_type,
+                        image_height=cfg.image_height,
+                        image_width=cfg.image_width,
+                        rotate_angle=cfg.rotate_angle,
+                    )
+                    if profile.enabled:
+                        profile.add("load_image", time.perf_counter() - t0)
+                    valid_paths_in_batch.append(path)
+                    loaded_images.append(img)
+                except Exception as e:
+                    logger.error("Failed to load image %s: %s", path, e)
+                    failed_images.append(path)
+                    images_seen += 1
+                    _emit_progress()
+
+            if batch_cancelled:
                 break
 
-            if cfg.skip_if_in_db and annotator.db.has_image_path(
-                path, registry=path_registry
-            ):
-                skip_in_db_n += 1
-                images_seen += 1
-                _emit_progress()
-                continue
+            if valid_paths_in_batch:
+                batch_items_done = 0
 
-            if not cfg.skip_if_in_db:
+                def _on_item_done(delta: Dict[str, int]) -> None:
+                    nonlocal images_seen, new_centers_total, stage1_total, stage2_total, batch_items_done
+                    images_seen += 1
+                    batch_items_done += 1
+                    new_centers_total += int(delta.get("new_centers", 0))
+                    stage1_total += int(delta.get("stage1_skips", 0))
+                    stage2_total += int(delta.get("stage2_joins", 0))
+                    _emit_progress()
+
                 try:
-                    annotator.db.delete_by_image_path(path, registry=path_registry)
+                    decode_metas = [
+                        decode_meta_for_path(p, cfg) for p in valid_paths_in_batch
+                    ]
+                    annotator.process_batch(
+                        valid_paths_in_batch,
+                        loaded_images,
+                        decode_metas=decode_metas,
+                        profile=profile,
+                        on_item_done=_on_item_done,
+                    )
+                    processed_ok += len(valid_paths_in_batch)
+                    timing_record(
+                        "cluster_batch_done",
+                        batch_n=len(valid_paths_in_batch),
+                        images_seen=images_seen,
+                        new_centers=new_centers_total,
+                    )
+                    remaining = len(valid_paths_in_batch) - batch_items_done
+                    if remaining > 0:
+                        images_seen += remaining
+                        _emit_progress()
                 except Exception as e:
-                    logger.warning("delete_by_image_path %s: %s", path, e)
+                    logger.error("Batch processing error: %s", e)
+                    failed_images.extend(valid_paths_in_batch)
+                    remaining = len(valid_paths_in_batch) - batch_items_done
+                    if remaining > 0:
+                        images_seen += remaining
+                        _emit_progress()
 
-            try:
-                img = load_image_for_job(
-                    path,
-                    b_yuv_image=cfg.b_yuv_image,
-                    mixed_yuv=cfg.mixed_yuv,
-                    yuv_type=cfg.yuv_type,
-                    image_height=cfg.image_height,
-                    image_width=cfg.image_width,
-                    rotate_angle=cfg.rotate_angle,
-                )
-                valid_paths_in_batch.append(path)
-                loaded_images.append(img)
-            except Exception as e:
-                logger.error("Failed to load image %s: %s", path, e)
-                failed_images.append(path)
-            images_seen += 1
-            _emit_progress()
-
-        if batch_cancelled:
-            break
-
-        if valid_paths_in_batch:
-            try:
-                decode_metas = [
-                    decode_meta_for_path(p, cfg) for p in valid_paths_in_batch
-                ]
-                bstat = annotator.process_batch(
-                    valid_paths_in_batch, loaded_images, decode_metas=decode_metas
-                )
-                vlm_total += int(bstat.get("vlm_calls", 0))
-                stage1_total += int(bstat.get("stage1_skips", 0))
-                stage2_total += int(bstat.get("stage2_joins", 0))
-                processed_ok += len(valid_paths_in_batch)
-            except Exception as e:
-                logger.error("Batch processing error: %s", e)
-                failed_images.extend(valid_paths_in_batch)
-
-        _emit_progress()
+    finally:
+        timing_record("vlm_pool_drain_start")
+        with profile.span("vlm_pool_drain"):
+            annotator.shutdown_vlm_pool(
+                wait=True,
+                cancel_pending=pipeline_cancelled,
+            )
+        timing_record("vlm_pool_drain_done")
 
     if failed_images:
         failed_file = os.path.join(log_d, "failed_images.json")
@@ -355,9 +447,39 @@ def run_annotation_pipeline(
             failed_file,
         )
 
+    profile.mark_wall_end()
+    profile.log_summary()
+    profile_summary = profile.summary() if profile.enabled else None
+    if timing_on:
+        timing_record("pipeline_end", pipeline_wall=profile_summary.get("pipeline_wall_seconds") if profile_summary else None)
+        timing_json_path = os.path.join(log_d, "vlm_timing.json")
+        timing_save_json(timing_json_path)
+        artifacts = write_debug_artifacts(
+            log_d,
+            title=f"VLM timing | images={total} ok={processed_ok}",
+        )
+        written = [f"{k}={v}" for k, v in artifacts.items() if v]
+        if written:
+            logger.info("Debug timing artifacts: %s", "; ".join(written))
+    if profile.enabled and profile_summary:
+        profile_path = os.path.join(log_d, "pipeline_profile.json")
+        json_.write(
+            content=profile_summary,
+            file_path=profile_path,
+            b_use_suggested_converter=True,
+        )
+        logger.info("Pipeline profile written to %s", profile_path)
+
     logger.info("Pipeline finished. processed_ok=%s failed=%s", processed_ok, len(failed_images))
+    try:
+        from auto_tag.core.vlm_endpoint_stats_store import persist_circuit_breaker_states
+
+        persist_circuit_breaker_states(cfg.work_dir)
+    except Exception:
+        logger.exception("persist VLM endpoint stats failed at pipeline end")
     return PipelineResult(
         total_images=total,
         failed_paths=failed_images,
         processed_ok=processed_ok,
+        profile_summary=profile_summary,
     )

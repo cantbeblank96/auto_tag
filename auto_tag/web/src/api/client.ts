@@ -131,8 +131,12 @@ export interface JobStatusResponse {
   failed_so_far: number
   skip_in_db: number
   vlm_calls: number
+  new_centers: number
   stage1_skips: number
   stage2_joins: number
+  created_at?: number
+  started_at?: number | null
+  finished_at?: number | null
 }
 
 export interface RecordsResponse {
@@ -183,11 +187,14 @@ export interface JobSummary {
   failed_so_far: number
   skip_in_db: number
   vlm_calls: number
+  new_centers: number
   stage1_skips: number
   stage2_joins: number
   work_dir: string
   log_dir: string
   created_at: number
+  started_at?: number | null
+  finished_at?: number | null
 }
 
 export interface BackendStatusResponse {

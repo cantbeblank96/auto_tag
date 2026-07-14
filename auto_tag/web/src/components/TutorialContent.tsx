@@ -74,7 +74,7 @@ export default function TutorialContent() {
               <li>启动后端与前端脚本，浏览器打开控制台</li>
               <li>在「设置」中配置 VLM 模型（API Key、Base URL），可点「测试连接」</li>
               <li>在「任务」中填写输入目录，确认后提交任务</li>
-              <li>等待流水线完成（页面约 2 秒轮询进度，可查看 <code className={codeCls}>vlm_calls</code> 等统计）</li>
+              <li>等待流水线完成（约 2 秒轮询；运行中任务显示<strong>建簇</strong>与<strong>VLM 标注</strong>两条进度）</li>
               <li>在「图片查询」中按路径检索标注；在「数据库」中查看统计、比对参数、导出数据</li>
             </ol>
             <p className="text-xs text-gray-400">
@@ -158,8 +158,10 @@ export default function TutorialContent() {
               </li>
             </ol>
             <p className="text-xs text-gray-400">
-              任务 API 返回 <code className={codeCls}>skip_in_db</code>、<code className={codeCls}>vlm_calls</code>、
-              <code className={codeCls}>stage1_skips</code>、<code className={codeCls}>stage2_joins</code>{' '}
+              任务 API 返回 <code className={codeCls}>processed/total</code>（建簇）、
+              <code className={codeCls}>vlm_calls/new_centers</code>（VLM）、
+              <code className={codeCls}>skip_in_db</code>、<code className={codeCls}>stage1_skips</code>、
+              <code className={codeCls}>stage2_joins</code>{' '}
               等字段，便于在「任务」页查看各阶段占比。
             </p>
           </div>

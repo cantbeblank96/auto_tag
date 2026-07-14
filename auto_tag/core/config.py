@@ -106,7 +106,10 @@ class Settings(BaseSettings):
 
     # Model settings
     clip_model_name: str = Field(default="openai/clip-vit-base-patch32", description="HuggingFace model name for CLIP")
-    device: str = Field(default="cuda", description="Device to run CLIP on (cuda/cpu)")
+    device: str = Field(
+        default=str(cfg.get("device", "cuda") or "cuda"),
+        description="Device to run CLIP on (cuda/cpu)",
+    )
     batch_size: int = Field(default=cfg.get("batch_size", 32), description="Batch size for feature extraction")
 
     # Clustering thresholds
@@ -141,8 +144,20 @@ class Settings(BaseSettings):
 
     # VLM strategy: "priority" or "round_robin"
     vlm_strategy: str = Field(
-        default=cfg.get("vlm_strategy", "priority"),
+        default=cfg.get("vlm_strategy", "round_robin"),
         description="VLM calling strategy: priority (failover) or round_robin (load balance)",
+    )
+    vlm_concurrency: int = Field(
+        default=max(1, min(32, int(cfg.get("vlm_concurrency", 3) or 3))),
+        description="Max parallel VLM annotate workers for the global annotation pool (1=sequential)",
+    )
+    vlm_http_timeout: float = Field(
+        default=max(5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))),
+        description="VLM HTTP read timeout in seconds (httpx)",
+    )
+    vlm_validation_max_corrections: int = Field(
+        default=max(0, min(8, int(cfg.get("vlm_validation_max_corrections", 2) or 2))),
+        description="Max model-based correction rounds when validate_against_questions fails",
     )
 
     # Dynamic Questions
@@ -156,6 +171,11 @@ class Settings(BaseSettings):
     duplicate_links_filename: str = Field(
         default=cfg.get("duplicate_links_filename", "duplicate_links.sqlite"),
         description="Filename under work_dir/log (.sqlite / .db 或 .jsonl)",
+    )
+
+    pipeline_debug: bool = Field(
+        default=bool(cfg.get("pipeline_debug", False)),
+        description="为 True 时统计流水线各阶段耗时并写入 work_dir/log/pipeline_profile.json",
     )
 
     class Config:
@@ -185,12 +205,21 @@ def reload_settings_from_disk() -> None:
         "tau_dup": float(cfg.get("tau_dup", 0.05)),
         "tau_cls": float(cfg.get("tau_cls", 0.25)),
         "vlm_models": _cfg_vlm_models(),
-        "vlm_strategy": str(cfg.get("vlm_strategy", "priority")),
+        "vlm_strategy": str(cfg.get("vlm_strategy", "round_robin")),
+        "vlm_concurrency": max(1, min(32, int(cfg.get("vlm_concurrency", 3) or 3))),
+        "vlm_http_timeout": max(
+            5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))
+        ),
+        "vlm_validation_max_corrections": max(
+            0, min(8, int(cfg.get("vlm_validation_max_corrections", 2) or 2))
+        ),
+        "device": str(cfg.get("device", settings.device)),
         "questions": dict(cfg.get("questions") or {}),
         "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),
         "duplicate_links_filename": str(
             cfg.get("duplicate_links_filename", "duplicate_links.sqlite")
         ),
+        "pipeline_debug": bool(cfg.get("pipeline_debug", False)),
         "circuit_breaker_time_window": cb["time_window_seconds"],
         "circuit_breaker_failure_threshold": cb["failure_rate_threshold"],
         "circuit_breaker_cooldown": cb["cooldown_seconds"],

@@ -26,10 +26,13 @@ graph TB
 
     subgraph Core ["核心引擎"]
         Pipeline["pipeline.py<br/>流水线编排"]
-        Annotator["annotator.py<br/>双阈值标注引擎"]
+        Annotator["annotator.py<br/>CLIP/VLM 门面"]
+        ClusterEngine["cluster_engine.py<br/>双阈值建簇（生产者）"]
+        VlmPool["vlm_annotation_pool.py<br/>全局 VLM 池（消费者）"]
         Extractor["feature_extractor.py<br/>CLIP 特征提取"]
         VectorDB["vector_db.py<br/>ChromaDB 封装"]
         VLM["vlm_client.py<br/>VLM 多模型调用"]
+        ImageLoadCtx["image_load_context.py<br/>解码参数共用"]
         Config["config.py<br/>配置管理"]
         CircuitBreaker["circuit_breaker.py<br/>熔断器"]
         DuplicateStore["duplicate_store.py<br/>近重复侧车"]
@@ -60,12 +63,16 @@ graph TB
     Routes --> JobRunner
     JobRunner --> Pipeline
     Pipeline --> Annotator
+    Annotator --> ClusterEngine
+    Annotator --> VlmPool
     Annotator --> Extractor --> CLIP
-    Annotator --> VectorDB --> ChromaDB
-    Annotator --> VLM --> VLMModels
-    Annotator --> DuplicateStore --> SQLite
+    ClusterEngine --> VectorDB --> ChromaDB
+    VlmPool --> VLM --> VLMModels
+    VlmPool --> VectorDB
+    VlmPool --> ImageLoadCtx
+    ClusterEngine --> DuplicateStore --> SQLite
     Annotator --> PathRegistry --> JSON
-    Annotator --> Snapshot --> JSON
+    Pipeline --> Snapshot --> JSON
     Pipeline --> Config --> ConfigFile
     Core --> CircuitBreaker
     Routes --> Maintenance
@@ -75,42 +82,63 @@ graph TB
 
 ---
 
-## 2. 核心算法：双阈值聚类标注
+## 2. 核心算法：双阈值建簇 + 异步 VLM 标注
+
+CLIP 建簇与 VLM 打标已**解耦**为生产者–消费者模型：`ClusterEngine` 只写向量与簇关系，新簇中心以空 `labels_json` 入库并异步入队；`VlmAnnotationPool` 在全局 worker 池中并行打标并回写中心、传播成员标签。
 
 ```mermaid
-flowchart TD
+flowchart TB
     START(["输入图片列表"]) --> LOAD["分批加载<br/>batch_size=32"]
-    LOAD --> EXTRACT["CLIP 批量提特征<br/>extract_features_batch()"]
-    EXTRACT --> COUNT{"数据库<br/>为空？"}
-    COUNT -->|是| FIRST["第一张图作为<br/>初始新簇入库"]
-    FIRST --> VLM_CALL["VLM 打标"]
-    VLM_CALL --> INSERT_CHROMA["写入 ChromaDB<br/>cluster_id + labels"}
-    INSERT_CHROMA --> NEXT_BATCH
+    LOAD --> POOL_START["启动 VlmAnnotationPool<br/>vlm_concurrency 个 worker"]
+    POOL_START --> EXTRACT["CLIP 批量提特征<br/>extract_features_batch()"]
 
-    COUNT -->|否| QUERY["ChromaDB Top-1 最近邻查询<br/>query_batch(n_results=1)"]
-    QUERY --> LOOP["逐图判定<br/>(for each image)"]
+    EXTRACT --> BOOT{"数据库<br/>为空？"}
+    BOOT -->|是| BOOT_INSERT["首图立刻建簇中心<br/>labels=空 · status=pending<br/>submit → VLM 队列"]
+    BOOT_INSERT --> QUERY
+
+    BOOT -->|否| QUERY["ChromaDB Top-1 最近邻<br/>query_batch()"]
+    QUERY --> LOOP["逐图双阈值判定"]
 
     LOOP --> DUP{"dist ≤ tau_dup?"}
-    DUP -->|"是 Stage 1<br/>近重复"| SKIP["跳过入库<br/>侧车登记"]
-    SKIP --> RECORD_DUP["DuplicateLinkWriter.append()<br/>写入 duplicate_links.sqlite"]
-    RECORD_DUP --> NEXT
+    DUP -->|Stage 1| SKIP["跳过入库 · 侧车登记"]
+    SKIP --> NEXT
 
-    DUP -->|"否"| CLUSTER{"dist ≤ tau_cls?"}
-    CLUSTER -->|"是 Stage 2<br/>同簇"| MERGE["继承簇标签<br/>写入 ChromaDB<br/>（不调 VLM）"]
+    DUP -->|否| CLUSTER{"dist ≤ tau_cls?"}
+    CLUSTER -->|Stage 2| MERGE["继承 cluster_id/labels<br/>写入 ChromaDB（不调 VLM）"]
     MERGE --> NEXT
 
-    CLUSTER -->|"否 Stage 3<br/>新簇"| NEW_CLUSTER["创建新簇<br/>VLM 打标<br/>写入 ChromaDB"]
-    NEW_CLUSTER --> VLM_CALL2["VLM 调用"]
-    VLM_CALL2 --> INSERT_CHROMA2["写入 ChromaDB<br/>is_cluster_center=True"]
-    INSERT_CHROMA2 --> NEXT
+    CLUSTER -->|Stage 3| NEW["新簇中心立刻入库<br/>labels=空 · pending<br/>submit → VLM 队列"]
+    NEW --> NEXT
 
-    NEXT["继续下一张"] --> LOOP
-    NEXT_BATCH["继续下一批"] --> LOAD
+    NEXT["下一张 / 下一批"] --> LOOP
+    NEXT --> LOAD
 
-    subgraph 统计返回
-        STATS["返回: vlm_calls,<br/>stage1_skips,<br/>stage2_joins"]
+    subgraph VLM_POOL ["VlmAnnotationPool（与建簇并行）"]
+        Q["任务队列"] --> W["Worker × N"]
+        W --> VLM_CALL["VLM annotate_image"]
+        VLM_CALL --> UPDATE["更新中心 labels<br/>传播同簇成员"]
     end
+
+    BOOT_INSERT --> Q
+    NEW --> Q
+
+    LOAD --> DRAIN["全部批次结束后<br/>wait_idle · shutdown pool"]
+    DRAIN --> DONE(["PipelineResult"])
 ```
+
+### 进度 API 字段（Web 双进度条）
+
+| 字段 | 含义 |
+|------|------|
+| `processed` / `total` | **建簇阶段**：已完成双阈值判定的图片数 |
+| `new_centers` | 已入队的待 VLM 标注簇中心数 |
+| `vlm_calls` | 已完成 VLM 标注的簇中心数 |
+| `stage1_skips` | Stage 1 近重复跳过 |
+| `stage2_joins` | Stage 2 并入已有簇 |
+
+建簇与 VLM 可**重叠**：`processed < total` 时 VLM 可能已在跑；`processed == total` 且 `vlm_calls < new_centers` 时为 VLM 收尾阶段。
+
+**批内可见性**：同一 batch 内 Chroma 只查一次，故 `ClusterEngine` 维护本批内存索引——近重复（Stage1）对任意已处理向量比距；聚类（Stage2/3）仅对本批**簇中心**比距，避免 Stage2 成员误拉低距离。
 
 ### 阈值含义
 
@@ -118,7 +146,7 @@ flowchart TD
 |---|---|---|
 | `tau_dup` | 0.05 | **近重复阈值**。cosine 距离 ≤ tau_dup 判定为重复/冗余帧，不入库 |
 | `tau_cls` | 0.25 | **聚类阈值**。tau_dup < dist ≤ tau_cls 判定为同簇成员，继承簇标签 |
-| `dist > tau_cls` | — | **新簇阈值**。启动 VLM 标注并创建新簇中心 |
+| `dist > tau_cls` | — | **新簇阈值**。立刻创建簇中心（labels 待标），异步入 VLM 队列 |
 
 ---
 
@@ -128,17 +156,28 @@ flowchart TD
 graph LR
     %% 核心层依赖
     pipeline --> annotator
+    pipeline --> image_load_context
     pipeline --> feature_extractor
     pipeline --> vector_db
     pipeline --> duplicate_store
     pipeline --> path_prefix_registry
     pipeline --> config
 
+    annotator --> cluster_engine
+    annotator --> vlm_annotation_pool
     annotator --> feature_extractor
     annotator --> vector_db
     annotator --> vlm_client
-    annotator --> duplicate_store
-    annotator --> path_prefix_registry
+    annotator --> image_load_context
+
+    cluster_engine --> vector_db
+    cluster_engine --> duplicate_store
+    cluster_engine --> path_prefix_registry
+    cluster_engine --> vlm_annotation_pool
+
+    vlm_annotation_pool --> vlm_client
+    vlm_annotation_pool --> vector_db
+    vlm_annotation_pool --> image_load_context
 
     database_maintenance --> annotator
     database_maintenance --> vector_db
@@ -239,6 +278,8 @@ sequenceDiagram
     participant Runner as job_runner
     participant Pipeline as pipeline.py
     participant Annotator as annotator.py
+    participant Cluster as cluster_engine.py
+    participant Pool as vlm_annotation_pool.py
 
     User->>Tasks: 填写输入目录 + 参数
     Tasks->>API: POST /jobs { input_dirs, work_dir }
@@ -246,16 +287,19 @@ sequenceDiagram
     Runner->>Runner: 后台线程启动
     Runner->>Pipeline: run_annotation_pipeline(cfg)
     Pipeline->>Pipeline: collect_image_paths()
-    Pipeline->>Pipeline: save_verify_samples()
-    Pipeline->>Annotator: process_batch(paths, images)
-    Note over Annotator: 双阈值聚类 + VLM
+    Pipeline->>Annotator: start_vlm_pool()
+    loop 每批图片
+        Pipeline->>Annotator: process_batch(paths, images)
+        Annotator->>Cluster: 双阈值建簇 + submit VLM 任务
+        Note over Cluster,Pool: CLIP 与 VLM worker 并行
+    end
+    Pipeline->>Annotator: shutdown_vlm_pool(wait_idle)
 
     loop 每 2 秒
         Tasks->>API: GET /jobs/{id}
-        API->>Tasks: { status, processed, total, ... }
+        API->>Tasks: processed/total + vlm_calls/new_centers
     end
 
-    Annotator-->>Pipeline: stats
     Pipeline-->>Runner: PipelineResult
     Runner-->>API: 状态更新
 ```

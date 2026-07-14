@@ -1,5 +1,46 @@
 # Release Record
 
+## v0.0.3 (2026-07-14)
+
+CLIP 建簇与 VLM 打标解耦、VLM 并发/超时可配、任务耗时与模型调用统计持久化的迭代版本。
+
+### Added
+
+- **CLIP / VLM 解耦** — `cluster_engine.py` 只做双阈值建簇；`vlm_annotation_pool.py` 全局 worker 池异步打标并回写中心标签；`annotator.py` 降为门面。
+- **VLM 对话式改正** — 校验失败时可多轮改正（`vlm_validation_max_corrections`）；空 content 走 `EmptyVLMResponseError`，避免无效改正轮。
+- **流水线 Debug 时序** — `pipeline_debug=true`（或 `AUTO_TAG_VLM_TIMING=1`）时写入 `work_dir/log/`：`vlm_timing.json` / `.png`、`vlm_http_trace.txt`、`vlm_timing_summary.json`、`pipeline_profile.json`。
+- **辅助脚本** — `auto_tag/scripts/`：`plot_vlm_timing.py`、`print_vlm_http_trace.py`、`capture_vlm_http_trace.py`、`bench_vlm_timing_compare.py`。
+- **模型调用统计持久化** — 任务结束后写入 `work_dir/log/vlm_endpoint_stats.json`；后端启动时恢复；设置页按端点展示「调用 / 失败」次数并定时刷新。
+- **任务耗时** — 任务记录 `started_at` / `finished_at`；任务列表与查询表增加「耗时」列（运行中每秒刷新）。
+
+### Changed
+
+- Version bumped to `0.0.3`（`auto_tag/constant.py`、`pyproject.toml`）。
+- **VLM HTTP** — 可配置 `vlm_http_timeout`（默认 60s）；`vlm_concurrency` 控制打标池并发。
+- **进度语义** — `processed` 表示建簇进度；`vlm_calls` / `new_centers` 表示 VLM 完成 / 待标簇中心。
+- **config.example.json** — 增加 `vlm_concurrency`、`vlm_http_timeout`、`vlm_validation_max_corrections`、`pipeline_debug`；默认策略示例改为 `round_robin`。
+- **架构文档** — `notes/for_developer/ARCHITECTURE.md` 同步生产者–消费者模型。
+
+### Fixed
+
+- **设置页调用次数常为 0** — 此前熔断统计仅在内存中，CLI 跑任务或重启后端后丢失；现已持久化并在 API / 前端合并展示。
+- **批内近邻不可见** — 同批尚未入库的簇中心通过批内内存索引参与 Stage1/2 距离判定，避免重复建簇。
+
+### Configuration
+
+新增 / 强化键（详见 `auto_tag/config.example.json`）：
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `vlm_concurrency` | `10` | VLM 池并发 worker 数 |
+| `vlm_http_timeout` | `60` | 单次 HTTP 读超时（秒） |
+| `vlm_validation_max_corrections` | `2` | 校验失败改正轮数（0=仅首轮） |
+| `pipeline_debug` | `false` | 写出 VLM 时序图与 profile |
+
+本地导出目录请使用仓库根目录 `temp/`（已在 `.gitignore`）；勿提交含真实密钥的 `config.json`。
+
+---
+
 ## v0.0.2 (2026-07-02)
 
 Web 控制台体验、版本管理、uv 环境与 VLM 端点区分的迭代版本。

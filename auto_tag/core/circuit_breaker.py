@@ -1,7 +1,8 @@
 """
 Circuit Breaker 熔断器。
 
-内存状态，后端重启后重置。线程安全。
+运行时状态在内存中；累计调用/失败次数会在任务结束后写入
+``work_dir/log/vlm_endpoint_stats.json``，后端启动时自动恢复。
 """
 from __future__ import annotations
 
@@ -143,6 +144,39 @@ class CircuitBreaker:
             "failure_rate_threshold": self._config.failure_rate_threshold,
             "cooldown_seconds": self._config.cooldown_seconds,
         }
+
+    def export_persistent_snapshot(self) -> dict:
+        """导出可持久化的端点统计快照。"""
+        with self._lock:
+            endpoints: Dict[str, dict] = {}
+            for name, state in self._states.items():
+                self._prune_old(state)
+                endpoints[name] = {
+                    "total_calls": state.total_calls,
+                    "failure_timestamps": list(state.failures),
+                    "tripped": state.tripped,
+                    "tripped_until": state.tripped_until,
+                    "last_error": state.last_error,
+                }
+            return {"version": 1, "updated_at": time.time(), "endpoints": endpoints}
+
+    def import_persistent_snapshot(self, endpoints: Dict[str, dict]) -> None:
+        """从磁盘快照恢复端点统计（启动时调用）。"""
+        with self._lock:
+            for name, snap in endpoints.items():
+                if not isinstance(snap, dict):
+                    continue
+                state = self._ensure_state(name)
+                state.total_calls = max(state.total_calls, int(snap.get("total_calls") or 0))
+                raw_failures = snap.get("failure_timestamps") or []
+                if isinstance(raw_failures, list):
+                    merged = list(state.failures) + [float(t) for t in raw_failures]
+                    state.failures = sorted(set(merged))
+                state.tripped = bool(snap.get("tripped", state.tripped))
+                state.tripped_until = float(snap.get("tripped_until") or state.tripped_until)
+                if snap.get("last_error"):
+                    state.last_error = str(snap.get("last_error"))[:200]
+                self._prune_old(state)
 
 
 # 全局单例
