@@ -1,4 +1,4 @@
-# 由 scripts/windows/*.ps1 点源；解析仓库根目录与 .venv Python。
+﻿# 由 scripts/windows/*.ps1 点源；解析仓库根目录与 .venv Python。
 # 可覆盖：$env:PYTHON_EXECUTABLE、$env:VENV_DIR
 
 $ErrorActionPreference = "Stop"
@@ -18,4 +18,10 @@ if (-not $env:PYTHONPATH) {
     $env:PYTHONPATH = $RepoRoot
 } elseif ($env:PYTHONPATH -notlike "*$RepoRoot*") {
     $env:PYTHONPATH = "$RepoRoot;$env:PYTHONPATH"
+}
+
+# 确保本机 uv 安装目录在 PATH（供其它脚本复用）
+$localBin = Join-Path $env:USERPROFILE ".local\bin"
+if ((Test-Path -LiteralPath $localBin) -and ($env:PATH -notlike "*$localBin*")) {
+    $env:PATH = "$localBin;$env:PATH"
 }

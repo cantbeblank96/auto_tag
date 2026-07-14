@@ -1,4 +1,4 @@
-# 试采 Front 目录（请按本机路径修改 INPUT_DIR）
+﻿# 试采 Front 目录（请按本机路径修改 INPUT_DIR）
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/run_trial_front.ps1
 
 $ErrorActionPreference = "Stop"

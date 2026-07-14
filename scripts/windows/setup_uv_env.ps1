@@ -1,5 +1,6 @@
-# 使用 uv 创建 .venv 并安装 Python 依赖。
+﻿# 使用 uv 创建 .venv 并安装 Python 依赖。
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/setup_uv_env.ps1
+# 可选环境变量：VENV_DIR / PYTHON_VERSION / INSTALL_WEB=0 / WITH_NPM=1 / UV_LINK_MODE
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -12,6 +13,11 @@ Set-Location $RepoRoot
 & (Join-Path $ScriptDir "ensure_uv.ps1")
 
 Set-Location $RepoRoot
+
+# Windows 上项目与 uv cache 常跨盘符，hardlink 会失败；默认用 copy（可用 UV_LINK_MODE 覆盖）
+if (-not $env:UV_LINK_MODE) {
+    $env:UV_LINK_MODE = "copy"
+}
 
 $syncArgs = @("sync", "--python", $PythonVersion)
 if ($env:INSTALL_WEB -ne "0") {

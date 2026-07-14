@@ -12,6 +12,22 @@ ROTATION_MAP = {
 }
 
 
+def _imread_bgr(path: str) -> Optional[np.ndarray]:
+    """
+    读取 BGR 图像。
+
+    Windows 下 ``cv2.imread`` 对含非 ASCII（如中文）路径常返回 None；
+    使用 ``np.fromfile`` + ``cv2.imdecode`` 可正确处理 Unicode 路径。
+    """
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+    except OSError:
+        return None
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, cv2.IMREAD_COLOR)
+
+
 def load_image(
         path: str,
         b_yuv: bool = False,
@@ -40,8 +56,8 @@ def load_image(
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     else:
-        # 普通图片读取
-        img_bgr = cv2.imread(path)
+        # 普通图片：优先 imdecode，避免 Windows 上 cv2.imread 对非 ASCII 路径失败
+        img_bgr = _imread_bgr(path)
         if img_bgr is None:
             raise ValueError(f"Failed to read image: {path}")
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

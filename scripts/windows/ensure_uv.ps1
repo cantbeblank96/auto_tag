@@ -1,4 +1,4 @@
-# 检查系统是否已安装 uv；未安装时可选自动安装（官方 install.ps1）。
+﻿# 检查系统是否已安装 uv；未安装时可选自动安装（官方 install.ps1）。
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/ensure_uv.ps1
 # 环境变量：$env:AUTO_INSTALL_UV = "0" 仅检查不安装
 
@@ -30,7 +30,7 @@ Add-UserLocalBinToPath
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if ($uv) {
     Write-Host "uv 已安装：$(& uv --version)"
-    exit 0
+    return
 }
 
 if ($env:AUTO_INSTALL_UV -eq "0") {

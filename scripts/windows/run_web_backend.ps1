@@ -1,4 +1,4 @@
-# 启动 FastAPI 后端
+﻿# 启动 FastAPI 后端
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_backend.ps1
 
 $ErrorActionPreference = "Stop"

@@ -1,4 +1,4 @@
-# 由 API /utils/restart_backend 调用：释放端口后拉起后端。
+﻿# 由 API /utils/restart_backend 调用：释放端口后拉起后端。
 
 $ErrorActionPreference = "SilentlyContinue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
