@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -11,7 +12,6 @@ import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from kevin_toolbox.data_flow.file import json_
 from kevin_toolbox.computer_science.algorithm.for_seq import chunk_generator
 
 from auto_tag.core.config import settings
@@ -145,6 +145,22 @@ class PipelineResult:
     profile_summary: Optional[Dict[str, Any]] = None
 
 
+def _read_image_list_json(path: str) -> List[str]:
+    """读取图片路径列表 JSON；强制 UTF-8，避免 Windows 默认 GBK 解码中文路径失败。"""
+    with open(path, "r", encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f"image list JSON must be a list, got {type(data).__name__}")
+    return [str(x) for x in data if str(x).strip()]
+
+
+def _write_image_list_json(path: str, paths: List[str]) -> None:
+    """写入图片路径列表 JSON（UTF-8）。"""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(paths, f, ensure_ascii=False, indent=4)
+
+
 def collect_image_paths(
     input_dirs: List[str],
     image_ls_files: List[str],
@@ -168,8 +184,8 @@ def collect_image_paths(
     for f_path in image_ls_files:
         if os.path.exists(f_path):
             try:
-                imgs = json_.read(file_path=f_path, b_use_suggested_converter=True)
-                if isinstance(imgs, list) and imgs:
+                imgs = _read_image_list_json(f_path)
+                if imgs:
                     all_sources.append({"name": os.path.basename(f_path), "sample_path": imgs[0]})
                     image_list.extend(imgs)
             except Exception as e:
@@ -436,11 +452,7 @@ def run_annotation_pipeline(
 
     if failed_images:
         failed_file = os.path.join(log_d, "failed_images.json")
-        json_.write(
-            content=failed_images,
-            file_path=failed_file,
-            b_use_suggested_converter=True,
-        )
+        _write_image_list_json(failed_file, failed_images)
         logger.warning(
             "%d images failed to process. List saved to %s",
             len(failed_images),
