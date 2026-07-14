@@ -29,6 +29,9 @@ if ($env:VENV_DIR -and $env:VENV_DIR -ne (Join-Path $RepoRoot ".venv")) {
     $env:UV_PROJECT_ENVIRONMENT = $env:VENV_DIR
 }
 uv @syncArgs
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "uv sync 失败，退出码：$LASTEXITCODE（若提示拒绝访问，请先关闭占用 .venv 的后端/Python 进程后重试）"
+}
 $VenvDir = if ($env:VENV_DIR) { $env:VENV_DIR } else { Join-Path $RepoRoot ".venv" }
 
 $env:PYTHONPATH = $RepoRoot
