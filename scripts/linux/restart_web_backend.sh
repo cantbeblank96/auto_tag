@@ -5,7 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PORT="${PORT:-8000}"
-LOG_FILE="${AUTO_TAG_BACKEND_LOG:-/tmp/auto_tag_backend.log}"
+LOG_DIR="${REPO_ROOT}/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${AUTO_TAG_BACKEND_LOG:-${LOG_DIR}/auto_tag_backend.log}"
 
 sleep 1.0
 fuser -k "${PORT}/tcp" 2>/dev/null || true

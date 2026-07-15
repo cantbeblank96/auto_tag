@@ -355,6 +355,27 @@ export const api = {
     method: 'POST',
     body: JSON.stringify(body),
   }),
+  clearEmbeddings: (body?: { work_dir?: string }) =>
+    fetchJSON<{
+      ok: boolean
+      removed_count: number
+      embedding_record_count: number
+      chroma_path: string
+    }>('/database/clear_embeddings', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, ...body }),
+    }),
+  clearDuplicates: (body?: { work_dir?: string }) =>
+    fetchJSON<{
+      ok: boolean
+      removed: boolean
+      existed: boolean
+      file: string
+      duplicate_link_rows: number
+    }>('/database/clear_duplicates', {
+      method: 'POST',
+      body: JSON.stringify({ confirm: true, ...body }),
+    }),
 
   // Models
   getModels: () => fetchJSON<any>('/models'),

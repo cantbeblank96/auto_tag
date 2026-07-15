@@ -4,4 +4,4 @@
 后端与其它 Python 模块请 ``from auto_tag.constant import VERSION``。
 """
 
-VERSION = "0.0.3"
+VERSION = "0.0.4"

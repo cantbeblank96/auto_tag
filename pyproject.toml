@@ -1,6 +1,6 @@
 [project]
 name = "kevin-auto-tag"
-version = "0.0.3"
+version = "0.0.4"
 description = "Image auto annotation pipeline (CLIP + ChromaDB + VLM)"
 readme = "README.md"
 license = { text = "MIT" }

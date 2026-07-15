@@ -24,6 +24,7 @@ ENV/
 # ============================================================
 # Runtime data (work_dir, logs, databases, outputs)
 # ============================================================
+logs/
 work_dir/
 run_work/
 auto_tag/work_dir/
@@ -84,6 +85,7 @@ plan.md
 promt.md
 git_push.sh
 plans/
+skills/
 
 # ============================================================
 # SpecStory

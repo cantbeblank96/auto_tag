@@ -1,4 +1,4 @@
-﻿# 使用 uv 创建 .venv 并安装 Python 依赖。
+# 使用 uv 创建 .venv 并安装 Python 依赖。
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/setup_uv_env.ps1
 # 可选环境变量：VENV_DIR / PYTHON_VERSION / INSTALL_WEB=0 / WITH_NPM=1 / UV_LINK_MODE
 

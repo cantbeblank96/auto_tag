@@ -98,6 +98,10 @@ export default function Tasks() {
 
   const skipIfInDbRef = useRef(skipIfInDb)
   skipIfInDbRef.current = skipIfInDb
+  const queueRef = useRef<QueueItem[]>([])
+  queueRef.current = queue
+  /** 防止 Strict Mode / 并发 tick 对同一排队项重复 createJob */
+  const createInFlightRef = useRef<string | null>(null)
 
   // 运行中任务时长每秒刷新
   const [nowSec, setNowSec] = useState(() => Date.now() / 1000)
@@ -173,73 +177,90 @@ export default function Tasks() {
     showMsg('已隐藏此时间之前的任务记录（可在下方「查询」章节查看全部）')
   }
 
-  // Poll running jobs
+  // 轮询运行中任务；空闲时提交下一个排队项（副作用不得放在 setState updater 内）
   useEffect(() => {
     if (!queueArmed) return
-    const interval = setInterval(() => {
-      setQueue(prev => {
-        const next = [...prev]
-        let hasWork = false
+    let cancelled = false
 
-        for (let i = 0; i < next.length; i++) {
-          const item = next[i]
-          if (item.status === 'running' && item.serverJobId) {
-            hasWork = true
-            api.getJob(item.serverJobId).then(job => {
-              setQueue(prev2 => {
-                const n2 = [...prev2]
-                n2[i] = { ...n2[i], lastJob: job }
-                if (job.status === 'done') {
-                  n2[i].status = 'completed'
-                } else if (job.status === 'failed') {
-                  n2[i].status = 'failed'
-                  n2[i].error = job.error || 'failed'
-                }
-                return n2
-              })
-            }).catch(() => { })
-          }
-        }
+    const tick = () => {
+      const snapshot = queueRef.current
+      const running = snapshot.filter(q => q.status === 'running' && q.serverJobId)
 
-        if (!hasWork) {
-          const sid = skipIfInDbRef.current
-          for (let i = 0; i < next.length; i++) {
-            if (next[i].status === 'queued') {
-              const item = next[i]
-              api.createJob({
-                input_dirs: item.inputDirs,
-                rotate_angle: item.rotateAngle || null,
-                b_yuv_image: item.bYuv,
-                mixed_yuv: item.mixedYuv,
-                yuv_type: item.yuvType,
-                image_width: item.yuvW,
-                image_height: item.yuvH,
-                skip_if_in_db: sid,
-              }).then(res => {
-                setQueue(prev2 => {
-                  const n2 = [...prev2]
-                  n2[i] = { ...n2[i], serverJobId: res.job_id, status: 'running' }
-                  return n2
-                })
-              }).catch(e => {
-                setQueue(prev2 => {
-                  const n2 = [...prev2]
-                  n2[i] = { ...n2[i], status: 'failed', error: e.message }
-                  return n2
-                })
-              })
-              hasWork = true
-              break
+      for (const item of running) {
+        const jobId = item.serverJobId!
+        api.getJob(jobId).then(job => {
+          if (cancelled) return
+          setQueue(prev => prev.map(q => {
+            if (q.queueId !== item.queueId) return q
+            const next: QueueItem = { ...q, lastJob: job }
+            if (job.status === 'done') {
+              next.status = 'completed'
+            } else if (job.status === 'failed') {
+              next.status = 'failed'
+              next.error = job.error || 'failed'
             }
-          }
+            return next
+          }))
+        }).catch(() => { })
+      }
+
+      if (running.length > 0 || createInFlightRef.current) return
+
+      const nextItem = snapshot.find(q => q.status === 'queued')
+      if (!nextItem) {
+        setQueueArmed(false)
+        return
+      }
+
+      createInFlightRef.current = nextItem.queueId
+      api.createJob({
+        input_dirs: nextItem.inputDirs,
+        rotate_angle: nextItem.rotateAngle || null,
+        b_yuv_image: nextItem.bYuv,
+        mixed_yuv: nextItem.mixedYuv,
+        yuv_type: nextItem.yuvType,
+        image_width: nextItem.yuvW,
+        image_height: nextItem.yuvH,
+        skip_if_in_db: skipIfInDbRef.current,
+      }).then(res => {
+        if (cancelled) return
+        setQueue(prev => prev.map(q =>
+          q.queueId === nextItem.queueId
+            ? {
+                ...q,
+                serverJobId: res.job_id,
+                status: 'running' as const,
+                error: null,
+                summary: `${res.job_id.slice(0, 8)} (${q.summary})`,
+              }
+            : q,
+        ))
+      }).catch(e => {
+        if (cancelled) return
+        const msg = String(e?.message || e)
+        const busy = /already running|已有任务在运行/i.test(msg)
+        if (busy) {
+          // 后端忙碌时保持排队，下一轮 tick 再试（不标失败）
+          return
         }
-        if (!hasWork) {
-          setQueueArmed(false)
+        setQueue(prev => prev.map(q =>
+          q.queueId === nextItem.queueId
+            ? { ...q, status: 'failed' as const, error: msg }
+            : q,
+        ))
+      }).finally(() => {
+        if (createInFlightRef.current === nextItem.queueId) {
+          createInFlightRef.current = null
         }
-        return next
       })
-    }, 2000)
-    return () => clearInterval(interval)
+    }
+
+    tick()
+    const interval = setInterval(tick, 2000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
   }, [queueArmed])
 
   const confirmTask = async () => {
@@ -415,7 +436,7 @@ export default function Tasks() {
             跳过库中已有路径（队列中所有任务统一生效）
           </label>
           <p className="text-xs text-gray-400 mt-1 ml-6">
-            勾选后若索引中已有相同路径则跳过；不勾选则先删旧记录再重新处理。
+            勾选后若向量库或近重复侧车中已有相同路径则跳过；不勾选则先删旧记录再重新处理。
           </p>
         </div>
 
@@ -474,6 +495,11 @@ export default function Tasks() {
                               item.status === 'failed' ? 'bg-red-100 text-red-700' :
                                 'bg-gray-100 text-gray-600 dark:text-gray-400'
                           }`}>{STATUS_LABEL[item.status]}</span>
+                        {item.status === 'failed' && item.error && (
+                          <p className="mt-1 text-[11px] text-red-500 max-w-56 break-words" title={item.error}>
+                            {item.error}
+                          </p>
+                        )}
                       </td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400 text-xs whitespace-nowrap">
                         {formatJobRuntime(

@@ -1,5 +1,30 @@
 # Release Record
 
+## v0.0.4 (2026-07-15)
+
+Windows 一键启停、跨平台重启日志、`skip_if_in_db` 侧车跳过、设置页路径解析与数据库「高级」清空的维护版本。
+
+### Added
+
+- **一键启停脚本** — Windows：`scripts/windows/start_web|stop_web|restart_web(.bat/.ps1)`；Linux/macOS：`scripts/linux/start_web|stop_web|restart_web.sh`（后台启动前后端，日志写入仓库 `logs/`）。
+- **数据库高级操作** — `POST /api/database/clear_embeddings`、`clear_duplicates`（需 `confirm=true`）；前端「数据库 → 高级」确认后清空向量索引或近重复侧车。
+- **项目路径 API** — `GET /api/utils/paths`；设置页用后端实际路径解析 `{PROJECT_PATH}`，修复 Windows 上硬编码 Linux 根路径导致读配置 403 / 模型列表为空。
+
+### Changed
+
+- Version bumped to `0.0.4`（`auto_tag/constant.py`、`pyproject.toml`）。
+- **后端重启日志** — 默认改为仓库根目录 `logs/auto_tag_backend.log`（不再依赖 `/tmp` 或易被占用的系统 TEMP）；Windows 重启 API 不再预开日志文件，避免「Permission denied」。
+- **README** — 补充 Windows 非技术向启停说明与 Linux 一键脚本用法。
+
+### Fixed
+
+- **`skip_if_in_db` 重复处理近重复图** — Stage1 近重复默认不入向量库，此前仅跳过 Chroma 路径；现同时跳过侧车已登记路径，并在侧车 append 时去重。
+- **任务页误报失败** — 排队提交不再在 `setState` updater 内调用 `createJob`；增加 in-flight 护栏，避免 React Strict Mode 双提交导致 409 busy。
+- **Windows 前端启动参数** — `run_web_frontend_v2.ps1` 直接调用 `vite.js`，避免 `npm` 吞掉 `--host` / `--port`。
+- **Windows 后端重启脚本** — 修正 stdout/stderr 同文件重定向问题；用 wmic/cmd 脱离会话拉起新进程。
+
+---
+
 ## v0.0.3 (2026-07-14)
 
 CLIP 建簇与 VLM 打标解耦、VLM 并发/超时可配、任务耗时与模型调用统计持久化的迭代版本。

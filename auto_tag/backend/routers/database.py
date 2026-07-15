@@ -505,6 +505,86 @@ def export_compact_chunk(
     )
 
 
+class ClearStoreBody(BaseModel):
+    work_dir: Optional[str] = None
+    confirm: bool = Field(
+        default=False,
+        description="必须为 true，防止误触清空接口",
+    )
+
+
+@router.post("/clear_embeddings")
+def clear_embeddings(body: ClearStoreBody = ClearStoreBody()) -> Dict[str, Any]:
+    """清空向量索引集合（保留目录与侧车文件）。"""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="请设置 confirm=true 以确认清空向量索引")
+    from auto_tag.backend.job_runner import run_exclusive_task
+
+    wr, emb_path, _ = _resolve_paths(body.work_dir)
+
+    def _clear() -> Dict[str, Any]:
+        db = VectorDB(emb_path, settings.collection_name)
+        before = db.count()
+        db.recreate_empty_collection()
+        after = db.count()
+        return {
+            "ok": True,
+            "work_dir": wr,
+            "chroma_path": emb_path,
+            "collection": settings.collection_name,
+            "removed_count": before,
+            "embedding_record_count": after,
+        }
+
+    try:
+        return run_exclusive_task(_clear)
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("clear_embeddings failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/clear_duplicates")
+def clear_duplicates(body: ClearStoreBody = ClearStoreBody()) -> Dict[str, Any]:
+    """删除近重复侧车文件（duplicate_links），不影响向量索引。"""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="请设置 confirm=true 以确认清空近重复侧车")
+    from auto_tag.backend.job_runner import run_exclusive_task
+
+    wr, _, log_dir = _resolve_paths(body.work_dir)
+    dup_file = os.path.join(log_dir, settings.duplicate_links_filename)
+
+    def _clear() -> Dict[str, Any]:
+        existed = os.path.isfile(dup_file)
+        removed = False
+        if existed:
+            try:
+                os.remove(dup_file)
+                removed = True
+            except OSError as e:
+                raise RuntimeError(f"删除侧车文件失败: {e}") from e
+        return {
+            "ok": True,
+            "work_dir": wr,
+            "log_dir": log_dir,
+            "file": dup_file,
+            "existed": existed,
+            "removed": removed,
+            "duplicate_link_rows": 0,
+        }
+
+    try:
+        return run_exclusive_task(_clear)
+    except RuntimeError as e:
+        msg = str(e)
+        code = 409 if "已有任务" in msg or "already running" in msg.lower() else 500
+        raise HTTPException(status_code=code, detail=msg) from e
+    except Exception as e:
+        logger.exception("clear_duplicates failed")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @router.post("/recompute_relations")
 def recompute_relations(body: OptionalWorkDirBody = OptionalWorkDirBody()) -> Dict[str, Any]:
     """复用索引中已有向量与 labels，仅按当前 τ_dup/τ_cls 重算簇与侧车（不调用 VLM/CLIP）。"""

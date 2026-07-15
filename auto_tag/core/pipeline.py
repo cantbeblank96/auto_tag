@@ -16,7 +16,7 @@ from kevin_toolbox.data_flow.file import json_
 from kevin_toolbox.computer_science.algorithm.for_seq import chunk_generator
 
 from auto_tag.core.config import settings
-from auto_tag.core.duplicate_store import DuplicateLinkWriter
+from auto_tag.core.duplicate_store import DuplicateLinkWriter, load_sidecar_known_paths
 from auto_tag.core.image_load_context import ImageLoadContext
 from auto_tag.core.path_prefix_registry import PathPrefixRegistry
 from auto_tag.core.pipeline_profile import PipelineProfile, resolve_pipeline_debug
@@ -282,10 +282,20 @@ def run_annotation_pipeline(
         else settings.record_stage1_duplicates
     )
     dup_writer: Optional[DuplicateLinkWriter] = None
+    dup_store_path = os.path.join(log_d, settings.duplicate_links_filename)
     if record_dup:
         dup_writer = DuplicateLinkWriter(
             log_d, path_registry, filename=settings.duplicate_links_filename
         )
+    # skip_if_in_db：除向量库路径外，侧车已登记的近重复路径也应跳过（近重复默认不入库）
+    sidecar_known_paths = set()
+    if cfg.skip_if_in_db:
+        sidecar_known_paths = load_sidecar_known_paths(dup_store_path, log_dir=log_d)
+        if sidecar_known_paths:
+            logger.info(
+                "skip_if_in_db: loaded %d paths from duplicate sidecar",
+                len(sidecar_known_paths),
+            )
 
     from auto_tag.core.annotator import ImageAutoAnnotator
 
@@ -359,13 +369,19 @@ def run_annotation_pipeline(
                     pipeline_cancelled = True
                     break
 
-                if cfg.skip_if_in_db and annotator.db.has_image_path(
-                    path, registry=path_registry
-                ):
-                    skip_in_db_n += 1
-                    images_seen += 1
-                    _emit_progress()
-                    continue
+                if cfg.skip_if_in_db:
+                    norm = os.path.realpath(
+                        os.path.abspath(os.path.expanduser(str(path).strip()))
+                    )
+                    in_chroma = annotator.db.has_image_path(
+                        path, registry=path_registry
+                    )
+                    in_sidecar = norm in sidecar_known_paths
+                    if in_chroma or in_sidecar:
+                        skip_in_db_n += 1
+                        images_seen += 1
+                        _emit_progress()
+                        continue
 
                 if not cfg.skip_if_in_db:
                     try:

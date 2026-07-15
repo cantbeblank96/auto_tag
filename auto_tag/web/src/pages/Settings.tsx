@@ -1,6 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api/client'
-import { DEFAULT_CONFIG_PATH, fromMacroPath, PROJECT_PATH_MACRO, PROJECT_ROOT } from '../constants/config'
+import {
+  DEFAULT_CONFIG_PATH,
+  getProjectRoot,
+  PROJECT_PATH_MACRO,
+  resolveMacroPath,
+} from '../constants/config'
 import { waitForBackendHealthy } from '../utils/backendHealth'
 
 // ── Types ──────────────────────────────────────────────
@@ -126,6 +131,7 @@ export default function Settings() {
   const markDirty = () => setIsDirty(true)
 
   // General settings (from config.json)
+  const [projectRoot, setProjectRoot] = useState('')
   const [batchSize, setBatchSize] = useState(32)
   const [clipDevice, setClipDevice] = useState('cuda')
   const [tauDup, setTauDup] = useState(0.05)
@@ -220,7 +226,8 @@ export default function Settings() {
   const loadEverything = async () => {
     // Load config.json
     try {
-      const p = fromMacroPath(configPath)
+      const p = await resolveMacroPath(configPath)
+      setProjectRoot(getProjectRoot())
       const res = await fetch(`/api/utils/read_file?path=${encodeURIComponent(p)}`)
       if (res.ok) {
         const data = await res.json()
@@ -299,7 +306,7 @@ export default function Settings() {
   }
 
   const writeConfigToDisk = async (cfg: Record<string, any>) => {
-    const p = fromMacroPath(configPath)
+    const p = await resolveMacroPath(configPath)
     const res = await fetch('/api/utils/write_file', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: p, content: JSON.stringify(cfg, null, 4) }),
@@ -541,7 +548,7 @@ export default function Settings() {
             <div className="col-span-2"><label className={labelCls}>work_dir（工作根目录）</label>
               <input type="text" value={workDir} onChange={e => { setWorkDir(e.target.value); markDirty() }} className={inputCls} />
               <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                支持绝对路径或 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_PATH_MACRO}</code> 宏（指向 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_ROOT}</code>）。如 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_PATH_MACRO}/work_dir</code> 表示 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_ROOT}/work_dir</code>。
+                支持绝对路径或 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_PATH_MACRO}</code> 宏（指向 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{projectRoot || '（加载中…）'}</code>）。如 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{PROJECT_PATH_MACRO}/work_dir</code> 表示 <code className="bg-gray-100 dark:bg-gray-700 px-1 rounded">{projectRoot ? `${projectRoot}/work_dir` : '（加载中…）'}</code>。
               </p>
             </div>
             <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={recDup} onChange={e => { setRecDup(e.target.checked); markDirty() }} className="rounded" /> record_stage1_duplicates（记录近重复对到侧车）</label></div>

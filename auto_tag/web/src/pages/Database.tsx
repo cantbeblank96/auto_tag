@@ -4,7 +4,7 @@ import { api, type StatsResponse } from '../api/client'
 import DatabaseUpdateFlow from '../components/DatabaseUpdateFlow'
 import DatabaseExportPanel from '../components/DatabaseExportPanel'
 import ExportDeliveryBox, { type ExportDeliveryConfig } from '../components/ExportDeliveryBox'
-import { DEFAULT_CONFIG_PATH, fromMacroPath } from '../constants/config'
+import { DEFAULT_CONFIG_PATH, fromMacroPath, getProjectRoot, resolveMacroPath } from '../constants/config'
 
 const preCls =
   'text-xs bg-gray-50 dark:bg-gray-900 p-3 rounded border border-gray-200 dark:border-gray-600 overflow-x-auto dark:text-gray-300'
@@ -17,9 +17,11 @@ const sectionTitleCls =
 function DatabasePageHelp({
   stats,
   loading,
+  resolvedConfigPath,
 }: {
   stats: StatsResponse | null
   loading: boolean
+  resolvedConfigPath: string
 }) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -67,7 +69,7 @@ function DatabasePageHelp({
               <p className="mt-1">
                 配置比对：
                 <code className="ml-1 font-mono text-[10px] break-all">
-                  {fromMacroPath(DEFAULT_CONFIG_PATH)}
+                  {resolvedConfigPath || fromMacroPath(DEFAULT_CONFIG_PATH) || DEFAULT_CONFIG_PATH}
                 </code>
               </p>
             </>
@@ -81,14 +83,23 @@ function DatabasePageHelp({
 function ChapterSection({
   title,
   children,
+  defaultCollapsed = false,
 }: {
   title: string
   children: ReactNode
+  defaultCollapsed?: boolean
 }) {
+  const [open, setOpen] = useState(!defaultCollapsed)
   return (
     <section className="mb-10 last:mb-0">
-      <h3 className={sectionTitleCls}>{title}</h3>
-      {children}
+      <h3
+        className={`${sectionTitleCls} cursor-pointer select-none flex items-center gap-2`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="text-xs text-blue-500 shrink-0">{open ? '▼' : '▶'}</span>
+        {title}
+      </h3>
+      {open && children}
     </section>
   )
 }
@@ -98,6 +109,7 @@ export default function Database() {
   const [stats, setStats] = useState<StatsResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [msg, setMsg] = useState('')
+  const [resolvedConfigPath, setResolvedConfigPath] = useState('')
 
   const [recOffset, setRecOffset] = useState(0)
   const [recLimit, setRecLimit] = useState(30)
@@ -116,14 +128,18 @@ export default function Database() {
     validated: false,
     validatedPath: null,
   })
+  const [clearDialog, setClearDialog] = useState<null | 'embeddings' | 'duplicates'>(null)
+  const [clearBusy, setClearBusy] = useState(false)
 
   const showMsg = (text: string) => { setMsg(text); setTimeout(() => setMsg(''), 5000) }
 
   const loadStats = useCallback(async () => {
     setLoading(true)
     try {
+      const configPath = await resolveMacroPath(DEFAULT_CONFIG_PATH)
+      setResolvedConfigPath(configPath || getProjectRoot())
       const res = await api.databaseStats({
-        config_path: fromMacroPath(DEFAULT_CONFIG_PATH),
+        config_path: configPath,
       })
       setStats(res)
     } catch (e: any) {
@@ -149,6 +165,32 @@ export default function Database() {
       showMsg(`${label}失败: ${e.message}`)
     } finally {
       setMaintBusy(false)
+    }
+  }
+
+  const handleConfirmClear = async () => {
+    if (!clearDialog) return
+    setClearBusy(true)
+    try {
+      if (clearDialog === 'embeddings') {
+        const res = await api.clearEmbeddings({})
+        showMsg(`已清空向量索引（移除 ${res.removed_count ?? 0} 条）`)
+        setRecResult(null)
+      } else {
+        const res = await api.clearDuplicates({})
+        showMsg(
+          res.removed
+            ? `已清空近重复侧车：${res.file}`
+            : '近重复侧车文件本就不存在，无需删除',
+        )
+        setDupResult(null)
+      }
+      setClearDialog(null)
+      await loadStats()
+    } catch (e: any) {
+      showMsg(`清空失败: ${e.message}`)
+    } finally {
+      setClearBusy(false)
     }
   }
 
@@ -184,7 +226,7 @@ export default function Database() {
     <div>
       <div className="mb-6 flex items-center gap-2">
         <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100">数据库</h2>
-        <DatabasePageHelp stats={stats} loading={loading} />
+        <DatabasePageHelp stats={stats} loading={loading} resolvedConfigPath={resolvedConfigPath} />
       </div>
 
       {loading && !stats && (
@@ -331,7 +373,96 @@ export default function Database() {
               </div>
             </div>
           </ChapterSection>
+
+          {/* 第四章：高级 */}
+          <ChapterSection title="高级" defaultCollapsed>
+            <div className="bg-white dark:bg-gray-800 rounded-lg border border-red-200 dark:border-red-900/50 p-4">
+              <p className="text-sm text-gray-600 dark:text-gray-300 mb-1">危险操作</p>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mb-4">
+                以下操作不可撤销。清空前请确认已不需要当前索引/侧车数据，或已完成导出备份。
+                若有标注或维护任务正在运行，清空会被拒绝。
+              </p>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  disabled={maintBusy || clearBusy}
+                  onClick={() => setClearDialog('embeddings')}
+                  className="px-4 py-2 text-sm rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:bg-red-950/40 dark:hover:bg-red-950/70"
+                >
+                  清空向量索引数据库
+                </button>
+                <button
+                  type="button"
+                  disabled={maintBusy || clearBusy}
+                  onClick={() => setClearDialog('duplicates')}
+                  className="px-4 py-2 text-sm rounded border border-red-300 text-red-700 bg-red-50 hover:bg-red-100 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:bg-red-950/40 dark:hover:bg-red-950/70"
+                >
+                  清空近重复侧车库
+                </button>
+              </div>
+              <p className="mt-3 text-xs text-gray-400 dark:text-gray-500">
+                当前：索引 {stats.embedding_record_count || stats.chroma_document_count || 0} 条
+                · 侧车 {stats.duplicate_link_rows || 0} 条
+              </p>
+            </div>
+          </ChapterSection>
         </>
+      )}
+
+      {clearDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="clear-store-dialog-title"
+            className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-600 dark:bg-gray-800"
+          >
+            <h3
+              id="clear-store-dialog-title"
+              className="text-base font-semibold text-gray-900 dark:text-gray-100"
+            >
+              {clearDialog === 'embeddings' ? '确认清空向量索引？' : '确认清空近重复侧车？'}
+            </h3>
+            <div className="mt-3 space-y-2 text-sm leading-relaxed text-gray-600 dark:text-gray-300">
+              {clearDialog === 'embeddings' ? (
+                <>
+                  <p>
+                    将删除 work_dir 下向量索引集合中的<strong className="font-medium text-gray-800 dark:text-gray-100">全部记录</strong>
+                    （约 {stats?.embedding_record_count || stats?.chroma_document_count || 0} 条），
+                    标注与簇关系一并清除。
+                  </p>
+                  <p>近重复侧车文件不会被删除。此操作不可撤销。</p>
+                </>
+              ) : (
+                <>
+                  <p>
+                    将删除 log 目录下的近重复侧车文件
+                    （当前约 {stats?.duplicate_link_rows || 0} 条记录）。
+                  </p>
+                  <p>向量索引不会被改动。此操作不可撤销。</p>
+                </>
+              )}
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={clearBusy}
+                onClick={() => setClearDialog(null)}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={clearBusy}
+                onClick={() => void handleConfirmClear()}
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+              >
+                {clearBusy ? '正在清空…' : '确认清空'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )

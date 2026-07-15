@@ -18,9 +18,23 @@ Image auto-annotation pipeline built on **ChromaDB** + **CLIP** + **VLM**, extra
 └── LICENSE                 # MIT
 ```
 
-Current version: [notes/Release_Record.md](./notes/Release_Record.md) (**v0.0.3**). Web console: http://localhost:5020
+Current version: [notes/Release_Record.md](./notes/Release_Record.md) (**v0.0.4**). Web console: http://localhost:5020
 
-## Quick start
+## Daily use (Windows, non-technical)
+
+After a maintainer finishes the first-time install:
+
+| Action | What to do |
+|--------|------------|
+| Start | Double-click `scripts\windows\start_web.bat`, then open http://localhost:5020 |
+| Stop | Double-click `scripts\windows\stop_web.bat` |
+| Restart | Double-click `scripts\windows\restart_web.bat` |
+
+Only one annotation job can run at a time—avoid clicking Submit repeatedly while a job is running.
+
+See the Chinese README for a longer walkthrough: [README.md](./README.md).
+
+## Quick start (developers / first install)
 
 Copy the config templates first (**never commit a real `config.json` with API keys**):
 
@@ -43,6 +57,18 @@ source .venv/bin/activate
 export PYTHONPATH=$PYTHONPATH:.
 
 python -m auto_tag.main --input_dir /path/to/images --work_dir ./work
+
+# Web console daily start/stop (background)
+bash scripts/linux/start_web.sh     # start backend + frontend
+bash scripts/linux/stop_web.sh      # stop both
+bash scripts/linux/restart_web.sh   # restart both
+# Open: http://localhost:5020
+# Logs: logs/auto_tag_web_backend.log / logs/auto_tag_web_frontend.log
+```
+
+Foreground (stops when the terminal closes):
+
+```bash
 bash scripts/linux/run_web_backend.sh
 bash scripts/linux/run_web_frontend_v2.sh
 ```
@@ -60,6 +86,19 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/setup_uv_env.ps1
 $env:PYTHONPATH = "$PWD"
 
 python -m auto_tag.main --input_dir D:\images --work_dir .\work
+```
+
+Daily start/stop (recommended):
+
+| Script | Purpose |
+|--------|---------|
+| `scripts\windows\start_web.bat` | Start backend + frontend in background |
+| `scripts\windows\stop_web.bat` | Stop both |
+| `scripts\windows\restart_web.bat` | Restart both |
+
+Or run in the foreground (closing the window stops the process):
+
+```powershell
 powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_backend.ps1
 powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_frontend_v2.ps1
 ```

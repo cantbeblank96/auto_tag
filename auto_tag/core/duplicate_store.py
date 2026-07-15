@@ -7,11 +7,18 @@ import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from auto_tag.core.path_prefix_registry import PathPrefixRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_path(p: str) -> str:
+    s = str(p or "").strip()
+    if not s:
+        return ""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(s)))
 
 
 def _is_sqlite_path(file_path: str) -> bool:
@@ -88,6 +95,54 @@ class DuplicateLinkWriter:
     def path(self) -> str:
         return self._path
 
+    def has_dup_path(self, dup_path: str) -> bool:
+        """侧车中是否已记录过该近重复路径（用于 skip_if_in_db）。"""
+        full = _norm_path(dup_path)
+        if not full or not os.path.isfile(self._path):
+            return False
+        dp_id, dp_rel = self._registry.split(full)
+        if self._use_sqlite:
+            try:
+                with self._lock:
+                    with sqlite3.connect(self._path) as conn:
+                        cols = _duplicate_links_table_columns(conn)
+                        if "dup_rel_path" in cols:
+                            cur = conn.execute(
+                                """
+                                SELECT 1 FROM duplicate_links
+                                WHERE dup_prefix_id = ? AND dup_rel_path = ?
+                                LIMIT 1
+                                """,
+                                (str(dp_id), dp_rel),
+                            )
+                        elif "dup_path" in cols:
+                            cur = conn.execute(
+                                "SELECT 1 FROM duplicate_links WHERE dup_path = ? LIMIT 1",
+                                (full,),
+                            )
+                        else:
+                            return False
+                        return cur.fetchone() is not None
+            except (OSError, sqlite3.Error) as e:
+                logger.error("has_dup_path failed: %s", e)
+                return False
+        try:
+            with open(self._path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    cr = _compose_row(self._registry, row)
+                    if _norm_path(str(cr.get("dup_path") or "")) == full:
+                        return True
+        except OSError as e:
+            logger.error("has_dup_path jsonl failed: %s", e)
+        return False
+
     def append(
         self,
         anchor_id: str,
@@ -102,6 +157,26 @@ class DuplicateLinkWriter:
             try:
                 with self._lock:
                     with sqlite3.connect(self._path) as conn:
+                        # 同一 dup 已存在则不再追加，避免重复跑任务时侧车膨胀
+                        cols = _duplicate_links_table_columns(conn)
+                        if "dup_rel_path" in cols:
+                            exists = conn.execute(
+                                """
+                                SELECT 1 FROM duplicate_links
+                                WHERE dup_prefix_id = ? AND dup_rel_path = ?
+                                LIMIT 1
+                                """,
+                                (str(dp_id), dp_rel),
+                            ).fetchone()
+                        elif "dup_path" in cols:
+                            exists = conn.execute(
+                                "SELECT 1 FROM duplicate_links WHERE dup_path = ? LIMIT 1",
+                                (_norm_path(dup_path),),
+                            ).fetchone()
+                        else:
+                            exists = None
+                        if exists:
+                            return
                         conn.execute(
                             """
                             INSERT INTO duplicate_links
@@ -124,6 +199,8 @@ class DuplicateLinkWriter:
                 logger.error("Failed to append duplicate link (sqlite): %s", e)
             return
 
+        if self.has_dup_path(dup_path):
+            return
         record: Dict[str, Any] = {
             "anchor_id": anchor_id,
             "anchor_prefix_id": str(ap_id),
@@ -140,6 +217,21 @@ class DuplicateLinkWriter:
                     f.write(line)
         except OSError as e:
             logger.error("Failed to append duplicate link record: %s", e)
+
+
+def load_sidecar_known_paths(
+    file_path: str, *, log_dir: Optional[str] = None
+) -> Set[str]:
+    """读取侧车中出现过的全部绝对路径（锚点 + 近重复），供 skip_if_in_db 使用。"""
+    out: Set[str] = set()
+    if not file_path or not os.path.isfile(file_path):
+        return out
+    for row in load_all_duplicate_rows(file_path, log_dir=log_dir):
+        for key in ("anchor_path", "dup_path"):
+            n = _norm_path(str(row.get(key) or ""))
+            if n:
+                out.add(n)
+    return out
 
 
 def find_duplicate_links_for_paths(

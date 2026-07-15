@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List
@@ -10,7 +11,12 @@ from pydantic import BaseModel, Field
 from auto_tag.backend.export_path_utils import validate_export_directory
 from auto_tag.backend.job_runner import is_busy, list_jobs
 from auto_tag.constant import VERSION
-from auto_tag.core.config import reload_settings_from_disk, settings
+from auto_tag.core.config import _AUTO_TAG_DIR, reload_settings_from_disk, settings
+
+
+def _default_backend_log_path(repo_root: str) -> str:
+    """默认写到仓库 logs/，避免系统 TEMP 被其它进程锁住导致 Permission denied。"""
+    return os.path.join(os.path.abspath(repo_root), "logs", "auto_tag_backend.log")
 
 router = APIRouter(tags=["health"])
 
@@ -25,6 +31,17 @@ def health():
         "embedding_parent_exists": os.path.isdir(parent),
         "chroma_parent_exists": os.path.isdir(parent),
         "collection": settings.collection_name,
+    }
+
+
+@router.get("/utils/paths")
+def utils_paths() -> Dict[str, Any]:
+    """返回后端所在机器上的 auto_tag 包路径与默认 config.json 绝对路径。"""
+    project_path = os.path.realpath(_AUTO_TAG_DIR)
+    return {
+        "project_path": project_path,
+        "config_path": os.path.join(project_path, "config.json"),
+        "project_path_macro": "{PROJECT_PATH}",
     }
 
 
@@ -131,19 +148,24 @@ def restart_backend() -> Dict[str, Any]:
     routers_dir = os.path.dirname(os.path.abspath(__file__))
     auto_tag_pkg = os.path.dirname(os.path.dirname(routers_dir))
     repo_root = os.path.dirname(auto_tag_pkg)
-    log_file = os.environ.get("AUTO_TAG_BACKEND_LOG", "/tmp/auto_tag_backend.log")
+    log_file = (os.environ.get("AUTO_TAG_BACKEND_LOG") or "").strip() or _default_backend_log_path(
+        repo_root
+    )
 
-    import sys
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(log_file)) or ".", exist_ok=True)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Cannot create backend log dir: {e}") from e
+
+    child_env = os.environ.copy()
+    child_env["AUTO_TAG_BACKEND_LOG"] = log_file
 
     if sys.platform == "win32":
         script = os.path.join(repo_root, "scripts", "windows", "restart_web_backend.ps1")
         if not os.path.isfile(script):
             raise HTTPException(status_code=500, detail=f"Restart script not found: {script}")
-        try:
-            log_fp = open(log_file, "a", encoding="utf-8")
-        except OSError as e:
-            raise HTTPException(status_code=500, detail=f"Cannot open backend log: {e}") from e
-        log_fp.close()
+        # Windows：stdout/stderr 由重启脚本自行重定向；勿预开日志文件，
+        # 否则易撞上被旧进程占用的日志（Errno 13 Permission denied）。
         try:
             subprocess.Popen(
                 [
@@ -155,6 +177,7 @@ def restart_backend() -> Dict[str, Any]:
                     script,
                 ],
                 cwd=repo_root,
+                env=child_env,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -176,6 +199,7 @@ def restart_backend() -> Dict[str, Any]:
             subprocess.Popen(
                 ["bash", script],
                 cwd=repo_root,
+                env=child_env,
                 start_new_session=True,
                 stdin=subprocess.DEVNULL,
                 stdout=log_fp,
