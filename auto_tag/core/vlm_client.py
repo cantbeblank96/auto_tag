@@ -850,6 +850,7 @@ class VLMClient:
             last_parsed = None
             try:
                 last_parsed = self._parse_json_content(last_raw)
+                last_parsed = self.normalize_label_types(last_parsed, keys=keys)
             except json.JSONDecodeError as e:
                 parse_error = str(e)
 
@@ -1133,6 +1134,12 @@ class VLMClient:
         if typ in ("category", "enum") and choices:
             return choices[0]
         if typ == "enum":
+            # 无 choices 的 enum 多为整数码（描述形如 "xx。0: xxx; 1: yyy"），
+            # 示例值用数字 0，避免字符串占位诱导模型输出字符串
+            desc = str(details.get("description", "") or "").strip()
+            head = desc[:40]
+            if "0:" in head or "0：" in head:
+                return 0
             return "example_value"
         if typ == "int":
             try:
@@ -1192,7 +1199,7 @@ class VLMClient:
 You must strictly follow this JSON schema (field definitions):
 {schema_json}
 
-Example of a valid response (match this structure — scalar values at top level, no nested objects for numbers):
+Example of a valid response (match this structure — scalar values at top level, no nested objects for numbers; integer-coded values like 0/1/2 must be JSON numbers, never quoted strings):
 {example_json}{examples_note}{tools_note}
 
 Return ONLY valid JSON. Do not include explanations or markdown fences."""
@@ -1232,7 +1239,7 @@ Return ONLY valid JSON. Do not include explanations or markdown fences."""
 You must strictly follow this JSON schema (only these keys):
 {schema_json}
 
-Example of a valid response:
+Example of a valid response (integer-coded values like 0/1/2 must be JSON numbers, never quoted strings):
 {example_json}{examples_note}{tools_note}
 
 Return ONLY valid JSON. Do not include markdown fences."""
@@ -1297,7 +1304,66 @@ Your previous response:
 
 Return ONLY a corrected JSON object. No markdown fences or explanations."""
 
-    # ── 结果校验 ────────────────────────────────────
+    # ── 结果校验 ────────────────────────────────
+
+    @staticmethod
+    def normalize_label_types(
+        result: Dict[str, Any],
+        *,
+        keys: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """按 questions schema 对 VLM 输出做 JSON 类型归一化。
+
+        VLM 偶尔把数字型 enum/int 值写成字符串（"0"/"1.5"），直接落库会
+        污染簇继承与下游统计/导出。此处在校验前做无损还原：数字字符串
+        还原为 int/float；值不在 choices 中时尝试匹配同值的数字候选。
+        无法归一化的值保持原样，交由校验/纠错环节处理。
+        """
+        from auto_tag.core.config import settings
+
+        def _num(s: str):
+            s = s.strip()
+            try:
+                return int(s)
+            except ValueError:
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
+        qs = settings.questions or {}
+        check_keys = list(keys) if keys is not None else list(qs.keys())
+        out = dict(result) if isinstance(result, dict) else {}
+        for key in check_keys:
+            details = qs.get(key)
+            if not isinstance(details, dict) or key not in out:
+                continue
+            val = out[key]
+            if isinstance(val, bool) or not isinstance(val, str):
+                continue
+            typ = str(details.get("type", "") or "")
+            if typ == "int":
+                n = _num(val)
+                if isinstance(n, int):
+                    out[key] = n
+            elif typ == "float":
+                n = _num(val)
+                if n is not None:
+                    out[key] = float(n)
+            elif typ in ("category", "enum"):
+                choices = details.get("choices") or []
+                if choices:
+                    if val not in choices:
+                        n = _num(val)
+                        if n is not None and n in choices:
+                            out[key] = n
+                elif typ == "enum":
+                    # 无 choices 的 enum 通常为整数码（描述形如 "0: xxx; 1: yyy"），
+                    # 数字字符串还原为 int，保证入库类型一致
+                    n = _num(val)
+                    if isinstance(n, int):
+                        out[key] = n
+        return out
 
     @staticmethod
     def validate_against_questions(
@@ -1377,7 +1443,7 @@ Return ONLY a corrected JSON object. No markdown fences or explanations."""
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             raise json.JSONDecodeError("Top-level JSON must be an object", content, 0)
-        return parsed
+        return self.normalize_label_types(parsed)
 
     def _correct_until_valid_local(
         self,
