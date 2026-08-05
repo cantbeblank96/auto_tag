@@ -13,9 +13,9 @@ export function formatDurationSeconds(seconds: number | null | undefined): strin
 }
 
 export interface JobTimingFields {
-  created_at?: number
-  started_at?: number
-  finished_at?: number
+  created_at?: number | null
+  started_at?: number | null
+  finished_at?: number | null
   status?: string
 }
 

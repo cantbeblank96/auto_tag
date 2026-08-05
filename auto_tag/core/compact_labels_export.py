@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from auto_tag.core.config import settings
 from auto_tag.core.duplicate_store import load_all_duplicate_rows

@@ -232,7 +232,74 @@ def test_model_connectivity_legacy(model_name: str) -> Dict[str, Any]:
     return {"ok": False, "error": f"Model '{model_name}' not found in configuration"}
 
 
-# ── 熔断重置 ──────────────────────────────────────────
+# ── 模型最大输出长度解析 ──────────────────────
+
+
+class ResolveMaxOutputBody(BaseModel):
+    """按请求体中的模型信息查询其支持的最大输出长度（表单未保存时也能查）。"""
+
+    name: str = Field(..., description="Provider 模型名")
+    base_url: Optional[str] = None
+    api_key: Optional[str] = ""
+
+
+@router.post("/resolve_max_output")
+def resolve_model_max_output(body: ResolveMaxOutputBody) -> Dict[str, Any]:
+    """查询模型支持的最大输出长度，供设置页「自动」模式展示实际取值。
+
+    source=auto 表示从供应商 /models 接口查到；source=fallback 表示查询失败，
+    回退默认值。
+    """
+    from auto_tag.core.vlm_client import (
+        _lookup_model_max_output_tokens,
+        _MAX_OUTPUT_CACHE,
+        _MAX_OUTPUT_CACHE_LOCK,
+        _MAX_OUTPUT_FALLBACK,
+    )
+
+    if not str(body.name or "").strip():
+        return {"ok": False, "error": "模型名称不能为空"}
+    model_cfg: Dict[str, Any] = {
+        "name": body.name,
+        "base_url": body.base_url,
+        "api_key": body.api_key or "",
+    }
+    base_url = (body.base_url or "https://api.openai.com/v1").rstrip("/")
+    key = (base_url, str(body.name))
+    with _MAX_OUTPUT_CACHE_LOCK:
+        hit = _MAX_OUTPUT_CACHE.get(key)
+    if hit is not None and hit[0] is not None:
+        return {"ok": True, "value": hit[0], "source": "auto"}
+    try:
+        resolved = _lookup_model_max_output_tokens(model_cfg)
+    except Exception as e:
+        return {
+            "ok": True,
+            "value": _MAX_OUTPUT_FALLBACK,
+            "source": "fallback",
+            "error": str(e)[:300],
+        }
+    if resolved is None:
+        return {
+            "ok": True,
+            "value": _MAX_OUTPUT_FALLBACK,
+            "source": "fallback",
+            "error": "model entry has no max output field",
+        }
+    return {"ok": True, "value": resolved, "source": "auto"}
+
+
+# ── 熔断重置 ──────────────────────────────
+
+
+def _persist_stats_after_reset() -> None:
+    """重置后立即落盘，避免下次重启从旧快照恢复出已清除的 last_error。"""
+    try:
+        from auto_tag.core.vlm_endpoint_stats_store import persist_circuit_breaker_states
+
+        persist_circuit_breaker_states(getattr(settings, "work_dir", None) or "")
+    except Exception:  # 落盘失败不影响重置本身
+        pass
 
 
 @router.post("/reset")
@@ -240,6 +307,7 @@ def reset_all_circuit_breakers() -> Dict[str, Any]:
     """重置所有端点的熔断状态。"""
     cb = get_circuit_breaker()
     cb.reset_all()
+    _persist_stats_after_reset()
     return {"ok": True}
 
 
@@ -248,4 +316,5 @@ def reset_model_circuit_breaker(endpoint_id: str) -> Dict[str, Any]:
     """重置指定端点的熔断状态。"""
     cb = get_circuit_breaker()
     cb.reset(endpoint_id)
+    _persist_stats_after_reset()
     return {"ok": True, "endpoint_id": endpoint_id}

@@ -119,6 +119,12 @@ export interface JobCreatePayload {
   image_height?: number
   image_width?: number
   skip_if_in_db?: boolean
+  /** 后缀过滤（仅作用于 input_dirs 扫描）；留空 = 不过滤 */
+  image_suffixes?: string[] | null
+  /** 文件名正则过滤；非空时优先于 image_suffixes */
+  image_name_regex?: string | null
+  filter_ignore_case?: boolean
+  filter_match_full_path?: boolean
 }
 
 export interface JobStatusResponse {
@@ -131,6 +137,7 @@ export interface JobStatusResponse {
   failed_so_far: number
   skip_in_db: number
   vlm_calls: number
+  vlm_failed?: number
   new_centers: number
   stage1_skips: number
   stage2_joins: number
@@ -165,7 +172,7 @@ export interface ByPathResponse {
 }
 
 export interface UpdateLabelsPayload {
-  work_dir: string
+  work_dir?: string
   image_path: string
   labels: Record<string, any>
   mode: 'image_only' | 'with_cluster'
@@ -187,6 +194,7 @@ export interface JobSummary {
   failed_so_far: number
   skip_in_db: number
   vlm_calls: number
+  vlm_failed?: number
   new_centers: number
   stage1_skips: number
   stage2_joins: number
@@ -263,6 +271,21 @@ export const api = {
   getJob: (jobId: string) => fetchJSON<JobStatusResponse>(`/jobs/${jobId}`),
   getJobLogs: (jobId: string, tail: number = 200) =>
     fetchJSON<{ job_id: string; lines: string[] }>(`/jobs/${jobId}/logs?tail=${tail}`),
+  /** 下载任务完整日志文件（job_xxxxxxxx.log） */
+  downloadJobLog: (jobId: string) =>
+    downloadJSON(`/jobs/${jobId}/logs/download`, undefined, `job_${jobId.slice(0, 8)}.log`),
+  /** 仅重跑该任务的失败图片（新建任务） */
+  rerunFailedJob: (jobId: string) =>
+    fetchJSON<{ job_id: string; source_job_id: string; failed_count: number }>(
+      `/jobs/${jobId}/rerun_failed`,
+      { method: 'POST' },
+    ),
+  /** 批量删除任务记录（仅后端记录，不删 work_dir 产物） */
+  deleteJobs: (jobIds: string[]) =>
+    fetchJSON<{ deleted: string[]; rejected: string[]; missing: string[] }>('/jobs', {
+      method: 'DELETE',
+      body: JSON.stringify({ job_ids: jobIds }),
+    }),
   listJobs: () => fetchJSON<ListJobsResponse>('/jobs'),
 
   // Utils
@@ -370,7 +393,10 @@ export const api = {
       ok: boolean
       removed: boolean
       existed: boolean
+      truncated?: boolean
       file: string
+      before_rows?: number
+      after_rows?: number
       duplicate_link_rows: number
     }>('/database/clear_duplicates', {
       method: 'POST',
@@ -389,6 +415,11 @@ export const api = {
     api_key?: string
     priority?: number
   }) => fetchJSON<any>('/models/test', { method: 'POST', body: JSON.stringify(body) }),
+  resolveMaxOutput: (body: {
+    name: string
+    base_url?: string | null
+    api_key?: string
+  }) => fetchJSON<any>('/models/resolve_max_output', { method: 'POST', body: JSON.stringify(body) }),
   updateCircuitBreaker: (body: {
     time_window_seconds: number; failure_rate_threshold: number; cooldown_seconds: number
   }) => fetchJSON<any>('/models/circuit-breaker', {

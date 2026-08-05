@@ -11,8 +11,10 @@ import base64
 import io
 import json
 import logging
+import os
 import threading
-from typing import Any, Dict, List, Optional, TYPE_CHECKING
+import time
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from PIL import Image
 
@@ -44,6 +46,11 @@ class AllModelsFailedError(Exception):
 
 class EmptyVLMResponseError(Exception):
     """VLM HTTP 200 但 content 为空。"""
+    pass
+
+
+class VLMValidationError(Exception):
+    """VLM 输出经多轮纠正后仍非法（校验不通过或 JSON 无法解析）。"""
     pass
 
 
@@ -89,8 +96,28 @@ def openai_chat_completion(
     logger.debug(f"POST {url} model={model}")
     with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
         resp = client.post(url, headers=headers, json=body)
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # 附带状态码与服务端错误信息片段，便于任务日志定位
+            try:
+                body_snippet = (resp.text or "")[:300]
+            except Exception:
+                body_snippet = ""
+            e.args = (
+                f"HTTP {resp.status_code} from {url}: {body_snippet}",
+                e.response,
+            )
+            raise
         return resp.json()
+
+
+def _extract_finish_reason(response_json: Dict[str, Any]) -> str:
+    """从 OpenAI 响应中提取 finish_reason（截断检测用）。"""
+    try:
+        return str(response_json["choices"][0].get("finish_reason") or "")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return ""
 
 
 def _build_chat_url(base_url: Optional[str]) -> str:
@@ -102,6 +129,78 @@ def _build_chat_url(base_url: Optional[str]) -> str:
     if not url.endswith("/chat/completions"):
         return f"{url}/chat/completions"
     return url
+
+
+# 模型最大输出长度解析结果缓存：(base_url, model_name) -> (值或None, 时间戳)
+_MAX_OUTPUT_CACHE: Dict[Tuple[str, str], Tuple[Optional[int], float]] = {}
+_MAX_OUTPUT_CACHE_LOCK = threading.Lock()
+_MAX_OUTPUT_FALLBACK = 8192
+
+
+def _lookup_model_max_output_tokens(model: Dict[str, Any]) -> Optional[int]:
+    """查询模型条目声明的最大输出长度；失败或未声明时返回 None（不写缓存）。"""
+    base_url = (model.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    name = str(model.get("name") or "")
+    if not name:
+        return None
+    headers = {}
+    if model.get("api_key"):
+        headers["Authorization"] = f"Bearer {model['api_key']}"
+    resp = httpx.get(f"{base_url}/models", headers=headers, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    data = payload.get("data") if isinstance(payload, dict) else payload
+    for item in data or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("id") != name and item.get("name") != name:
+            continue
+        for field in ("max_output_length", "max_output_tokens", "max_tokens"):
+            v = item.get(field)
+            if isinstance(v, (int, float)) and v > 0:
+                return max(1, min(131072, int(v)))
+        break
+    return None
+
+
+def resolve_model_max_output_tokens(
+    model: Dict[str, Any], *, fallback: int = _MAX_OUTPUT_FALLBACK
+) -> int:
+    """查询模型支持的最大输出长度（GET {base_url}/models），失败时回退 fallback。
+
+    依次尝试读取条目中的 max_output_length / max_output_tokens / max_tokens 字段；
+    成功结果常驻缓存，失败结果缓存 5 分钟避免频繁请求。
+    """
+    base_url = (model.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+    name = str(model.get("name") or "")
+    if not name:
+        return fallback
+    key = (base_url, name)
+    now = time.time()
+    with _MAX_OUTPUT_CACHE_LOCK:
+        hit = _MAX_OUTPUT_CACHE.get(key)
+        if hit is not None:
+            val, ts = hit
+            if val is not None or now - ts < 300:
+                return val if val is not None else fallback
+    try:
+        resolved = _lookup_model_max_output_tokens(model)
+        if resolved is None:
+            raise LookupError(f"model '{name}' entry has no max output field")
+        with _MAX_OUTPUT_CACHE_LOCK:
+            _MAX_OUTPUT_CACHE[key] = (resolved, now)
+        logger.info("Resolved max output tokens for %s: %d", name, resolved)
+        return resolved
+    except Exception as e:
+        logger.warning(
+            "Failed to resolve max output tokens for %s (%s); fallback to %d",
+            name,
+            e,
+            fallback,
+        )
+        with _MAX_OUTPUT_CACHE_LOCK:
+            _MAX_OUTPUT_CACHE[key] = (None, now)
+        return fallback
 
 
 def _extract_content(response_json: Dict[str, Any]) -> str:
@@ -365,9 +464,67 @@ class VLMClient:
             )
         return parsed
 
+    @staticmethod
+    def _dump_validation_chain(
+        model: Dict[str, Any],
+        errors: List[str],
+        messages: List[Dict[str, Any]],
+        last_parsed: Optional[Dict[str, Any]],
+        reason: str,
+        finish_reason: str = "",
+    ) -> None:
+        """校验链路最终失败时，将完整对话链（去除图片 base64）追写到 JSONL。
+
+        正式配置项 vlm_chain_dump 控制开关（默认关）；环境变量 VLM_CHAIN_DUMP
+        存在时视为开启并覆盖转储路径（兼容旧用法）。
+        """
+        try:
+            from auto_tag.core.config import settings as _dump_settings
+
+            env_path = os.environ.get("VLM_CHAIN_DUMP", "")
+            enabled = bool(getattr(_dump_settings, "vlm_chain_dump", False)) or bool(env_path)
+            if not enabled:
+                return
+            slim = []
+            for m in messages:
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = [
+                        {"type": "image_url", "image_url": "<base64 omitted>"}
+                        if isinstance(p, dict) and p.get("type") == "image_url"
+                        else p
+                        for p in c
+                    ]
+                slim.append({"role": m.get("role"), "content": c})
+            rec = {
+                "ts": __import__("time").time(),
+                "reason": reason,
+                "finish_reason": finish_reason,
+                "model": model.get("name"),
+                "endpoint_id": model.get("id") or model.get("endpoint_id"),
+                "errors": errors,
+                "last_parsed": last_parsed,
+                "messages": slim,
+            }
+            path = env_path or str(
+                getattr(
+                    _dump_settings,
+                    "vlm_chain_dump_path",
+                    "",
+                )
+                or "logs/vlm_validation_chain.jsonl"
+            )
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            logger.warning("VLM validation chain dumped to %s", path)
+        except Exception as e:
+            logger.debug("validation chain dump failed: %s", e)
+
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(4),
+        # 指数退让：2s → 4s → 8s（上限 60s），避免等间隔重试加剧服务端压力
+        wait=wait_exponential(multiplier=2, min=2, max=60),
         retry=retry_if_exception_type(httpx.HTTPError),
         before_sleep=lambda rs: logger.warning(
             f"VLM API network error, retrying in {rs.next_action.sleep}s..."
@@ -379,8 +536,8 @@ class VLMClient:
         messages: List[Dict[str, Any]],
         *,
         profile: Optional["PipelineProfile"] = None,
-    ) -> str:
-        """单次 HTTP 往返，仅在网络错误时重试；不在此处解析 JSON。"""
+    ) -> Tuple[str, str]:
+        """单次 HTTP 往返，仅在网络错误时重试；不在此处解析 JSON。返回 (content, finish_reason)。"""
         import time as _time
 
         if timing_enabled():
@@ -393,6 +550,22 @@ class VLMClient:
 
         http_timeout = float(getattr(_settings, "vlm_http_timeout", 60) or 60)
         http_timeout = max(5.0, min(600.0, http_timeout))
+        # thinking 模型的 reasoning 与 content 共用 max_tokens 预算，给足余量防截断；
+        # 优先级：模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限
+        model_max_tokens = model.get("max_tokens")
+        if model_max_tokens not in (None, ""):
+            try:
+                model_max_tokens = max(1, min(131072, int(model_max_tokens)))
+            except (TypeError, ValueError):
+                model_max_tokens = None
+        if model_max_tokens:
+            max_tokens = model_max_tokens
+        else:
+            cfg_max_tokens = getattr(_settings, "vlm_max_tokens", None)
+            if cfg_max_tokens:
+                max_tokens = max(1, min(131072, int(cfg_max_tokens)))
+            else:
+                max_tokens = resolve_model_max_output_tokens(model)
         t0 = _time.perf_counter()
         thread_name = __import__("threading").current_thread().name
         try:
@@ -402,10 +575,17 @@ class VLMClient:
                 api_key=model.get("api_key"),
                 base_url=model.get("base_url"),
                 response_format={"type": "json_object"},
+                max_tokens=max_tokens,
                 timeout=http_timeout,
             )
         except Exception as e:
             elapsed = round(_time.perf_counter() - t0, 3)
+            logger.warning(
+                "VLM HTTP call failed after %.1fs: %s: %s",
+                elapsed,
+                type(e).__name__,
+                str(e)[:300],
+            )
             if timing_enabled():
                 timing_record(
                     "http_failed",
@@ -418,6 +598,7 @@ class VLMClient:
             raise
         elapsed = round(_time.perf_counter() - t0, 3)
         content = _extract_content(resp)
+        finish_reason = _extract_finish_reason(resp)
         if timing_enabled():
             timing_record(
                 "http_done",
@@ -427,7 +608,7 @@ class VLMClient:
             )
         if profile is not None:
             profile.increment("vlm_http_calls")
-        return content
+        return content, finish_reason
 
     def _annotate_via_conversation(
         self,
@@ -452,7 +633,7 @@ class VLMClient:
         last_parsed: Optional[Dict[str, Any]] = None
 
         for turn in range(max_turns):
-            last_raw = self._chat_raw(model, messages, profile=profile)
+            last_raw, finish_reason = self._chat_raw(model, messages, profile=profile)
 
             if not (last_raw or "").strip():
                 logger.warning("VLM returned empty content at turn %d", turn)
@@ -465,7 +646,10 @@ class VLMClient:
                             msg_count=len(messages),
                         )
                     raise EmptyVLMResponseError("VLM returned empty content")
-                return last_parsed or {}
+                # turn>0 时空响应：上一轮输出已知非法，不能放行，触发 failover
+                raise EmptyVLMResponseError(
+                    f"VLM returned empty content at turn {turn}"
+                )
 
             parse_error: Optional[str] = None
             last_parsed = None
@@ -474,6 +658,7 @@ class VLMClient:
             except json.JSONDecodeError as e:
                 parse_error = str(e)
 
+            echo_prev = True
             if last_parsed is not None:
                 validation = self.validate_against_questions(last_parsed, keys=keys)
                 if validation["valid"]:
@@ -483,38 +668,82 @@ class VLMClient:
                         )
                     return last_parsed
                 if turn >= max_turns - 1:
+                    # 纠正轮数用尽仍非法：抛异常触发 failover/标记失败，绝不落盘非法值
                     logger.warning(
                         "VLM still invalid after %d follow-up turn(s): %s",
                         max_corr,
                         "; ".join(validation["errors"]),
                     )
-                    return last_parsed
+                    self._dump_validation_chain(
+                        model,
+                        validation["errors"],
+                        messages + [{"role": "assistant", "content": last_raw}],
+                        last_parsed,
+                        reason="invalid_after_corrections",
+                        finish_reason=finish_reason,
+                    )
+                    raise VLMValidationError(
+                        "VLM output still invalid after "
+                        f"{max_corr} correction(s): " + "; ".join(validation["errors"])
+                    )
                 follow_up = self._generate_correction_prompt(
                     last_parsed, validation["errors"], keys=keys
                 )
                 logger.info(
-                    "VLM validation failed (follow-up %d/%d)",
+                    "VLM validation failed (follow-up %d/%d): %s",
                     turn + 1,
                     max_corr,
+                    "; ".join(validation["errors"]),
                 )
             else:
+                truncated = finish_reason == "length"
+                if truncated:
+                    logger.warning(
+                        "VLM response truncated (finish_reason=length, %d chars) at turn %d",
+                        len(last_raw or ""),
+                        turn,
+                    )
                 if turn >= max_turns - 1:
+                    # 纠正轮数用尽仍无法解析：抛异常触发 failover/标记失败，不返回空 dict
                     logger.warning(
                         "VLM JSON still unparseable after %d follow-up turn(s): %s",
                         max_corr,
                         parse_error,
                     )
-                    return {}
-                follow_up = self._generate_json_parse_correction_prompt(
-                    last_raw, parse_error or "invalid JSON", keys=keys
-                )
+                    self._dump_validation_chain(
+                        model,
+                        [parse_error or "invalid JSON"],
+                        messages + [{"role": "assistant", "content": last_raw}],
+                        None,
+                        reason=(
+                            "truncated_after_corrections"
+                            if truncated
+                            else "unparseable_after_corrections"
+                        ),
+                        finish_reason=finish_reason,
+                    )
+                    raise VLMValidationError(
+                        f"VLM JSON unparseable after {max_corr} correction(s): "
+                        f"{parse_error}"
+                    )
+                if truncated:
+                    # 截断场景：不回显残缺输出，避免模型从断点续写再次被截断；
+                    # 改要求紧凑单行 JSON 以降低输出长度
+                    follow_up = self._generate_truncation_correction_prompt(keys=keys)
+                    echo_prev = False
+                else:
+                    follow_up = self._generate_json_parse_correction_prompt(
+                        last_raw, parse_error or "invalid JSON", keys=keys
+                    )
                 logger.info(
-                    "VLM JSON parse failed (follow-up %d/%d)",
+                    "VLM JSON parse failed (follow-up %d/%d)%s",
                     turn + 1,
                     max_corr,
+                    " [truncated]" if truncated else "",
                 )
 
-            messages.append({"role": "assistant", "content": last_raw})
+            if echo_prev:
+                messages.append({"role": "assistant", "content": last_raw})
             messages.append({"role": "user", "content": follow_up})
 
         return last_parsed or {}
@@ -822,7 +1051,10 @@ Return ONLY a corrected JSON object. No markdown fences or explanations."""
                     max_corr,
                     "; ".join(validation["errors"]),
                 )
-                return current
+                raise VLMValidationError(
+                    "Local VLM output still invalid after "
+                    f"{max_corr} correction(s): " + "; ".join(validation["errors"])
+                )
             prompt = self._generate_correction_prompt(
                 current, validation["errors"], keys=keys
             )

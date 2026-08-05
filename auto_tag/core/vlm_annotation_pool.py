@@ -54,6 +54,53 @@ class AnnotationJob:
     decode_meta: Dict[str, Any]
 
 
+def backfill_pending_labels(db: VectorDB, db_lock: threading.Lock) -> int:
+    """将簇中心的已定 labels 回填给同簇仍缺标签的成员，返回回填条数。
+
+    场景：Stage2 成员入簇时中心 VLM 尚未标完（继承空标签/pending），
+    而 _apply_labels 已先于其入簇执行，导致其标签永久缺失（B2 竞态）。
+    应在标注池排空后调用一次。
+    """
+    with db_lock:
+        try:
+            rows = db.iter_id_metas(batch_size=500)
+        except Exception as e:
+            logger.error("backfill_pending_labels: iter failed: %s", e)
+            return 0
+
+        center_labels: Dict[str, str] = {}
+        for _doc_id, m in rows:
+            if m.get("is_cluster_center"):
+                cid = str(m.get("cluster_id") or "")
+                lj = str(m.get("labels_json") or "{}")
+                if cid and lj != "{}":
+                    center_labels[cid] = lj
+        if not center_labels:
+            return 0
+
+        fixed = 0
+        for doc_id, m in rows:
+            if m.get("is_cluster_center"):
+                continue
+            lj = str(m.get("labels_json") or "{}")
+            if lj != "{}" and str(m.get("annotation_status") or "") == "done":
+                continue
+            target = center_labels.get(str(m.get("cluster_id") or ""))
+            if not target:
+                continue  # 中心也未标成/已失败，不回填
+            new_m = dict(m)
+            new_m["labels_json"] = target
+            new_m["annotation_status"] = "done"
+            try:
+                db.update_document_metadata(doc_id, new_m)
+                fixed += 1
+            except Exception as e:
+                logger.warning("backfill update failed for %s: %s", doc_id, e)
+        if fixed:
+            logger.info("Backfilled labels for %d pending member(s)", fixed)
+        return fixed
+
+
 class VlmAnnotationPool:
     """
     全局 VLM 消费者池：与 CLIP 建簇流水线并行运行。
@@ -72,6 +119,7 @@ class VlmAnnotationPool:
         load_context: ImageLoadContext,
         profile: Optional[PipelineProfile] = None,
         on_vlm_done: Optional[Callable[[], None]] = None,
+        on_vlm_failed: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.vlm = vlm
         self.db = db
@@ -79,6 +127,7 @@ class VlmAnnotationPool:
         self.load_context = load_context
         self.profile = profile or PipelineProfile(False)
         self.on_vlm_done = on_vlm_done
+        self.on_vlm_failed = on_vlm_failed
 
         self._queue: queue.Queue[Any] = queue.Queue()
         self._executor: Optional[ThreadPoolExecutor] = None
@@ -196,6 +245,11 @@ class VlmAnnotationPool:
                 logger.error("VLM worker failed to load %s: %s", job.image_path, e)
                 self._mark_center_failed(job)
                 timing_record("job_failed", cluster_id=job.cluster_id, phase="load")
+                if self.on_vlm_failed:
+                    try:
+                        self.on_vlm_failed(job.image_path)
+                    except Exception as cb_e:
+                        logger.warning("on_vlm_failed callback error: %s", cb_e)
                 return
 
             try:
@@ -217,17 +271,33 @@ class VlmAnnotationPool:
                 )
                 if not isinstance(labels_dict, dict):
                     labels_dict = {}
+                if not labels_dict:
+                    # 空标签不得以 done 落盘（B2）：标记失败，等待重标
+                    logger.error(
+                        "VLM returned empty labels for %s; marking center failed",
+                        job.image_path,
+                    )
+                    raise ValueError("VLM returned empty labels")
                 v = VLMClient.validate_against_questions(labels_dict)
                 if not v["valid"]:
-                    logger.warning(
-                        "VLM result still invalid after correction for %s: %s",
+                    # 非法值不得落盘（B3）：标记失败，等待重标
+                    logger.error(
+                        "VLM result invalid for %s: %s; marking center failed",
                         job.image_path,
                         "; ".join(v["errors"]),
+                    )
+                    raise ValueError(
+                        "VLM result invalid: " + "; ".join(v["errors"])
                     )
             except Exception as e:
                 logger.error("VLM annotate failed for %s: %s", job.image_path, e)
                 self._mark_center_failed(job)
                 timing_record("job_failed", cluster_id=job.cluster_id, phase="vlm")
+                if self.on_vlm_failed:
+                    try:
+                        self.on_vlm_failed(job.image_path)
+                    except Exception as cb_e:
+                        logger.warning("on_vlm_failed callback error: %s", cb_e)
                 return
 
             labels_json = json.dumps(labels_dict, ensure_ascii=False)

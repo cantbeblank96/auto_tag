@@ -547,31 +547,28 @@ def clear_embeddings(body: ClearStoreBody = ClearStoreBody()) -> Dict[str, Any]:
 
 @router.post("/clear_duplicates")
 def clear_duplicates(body: ClearStoreBody = ClearStoreBody()) -> Dict[str, Any]:
-    """删除近重复侧车文件（duplicate_links），不影响向量索引。"""
+    """清空近重复侧车（先 DELETE/截断，再尽量删除文件），不影响向量索引。"""
     if not body.confirm:
         raise HTTPException(status_code=400, detail="请设置 confirm=true 以确认清空近重复侧车")
     from auto_tag.backend.job_runner import run_exclusive_task
+    from auto_tag.core.duplicate_store import clear_duplicate_store
 
     wr, _, log_dir = _resolve_paths(body.work_dir)
     dup_file = os.path.join(log_dir, settings.duplicate_links_filename)
 
     def _clear() -> Dict[str, Any]:
-        existed = os.path.isfile(dup_file)
-        removed = False
-        if existed:
-            try:
-                os.remove(dup_file)
-                removed = True
-            except OSError as e:
-                raise RuntimeError(f"删除侧车文件失败: {e}") from e
+        info = clear_duplicate_store(dup_file)
         return {
             "ok": True,
             "work_dir": wr,
             "log_dir": log_dir,
-            "file": dup_file,
-            "existed": existed,
-            "removed": removed,
-            "duplicate_link_rows": 0,
+            "file": info["file"],
+            "existed": bool(info["existed"]),
+            "removed": bool(info["removed"]),
+            "truncated": bool(info.get("truncated")),
+            "before_rows": int(info.get("before_rows") or 0),
+            "after_rows": int(info.get("after_rows") or 0),
+            "duplicate_link_rows": int(info.get("after_rows") or 0),
         }
 
     try:

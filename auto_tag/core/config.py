@@ -79,6 +79,30 @@ def _cfg_circuit_breaker() -> dict:
     }
 
 
+def _cfg_vlm_max_tokens() -> Optional[int]:
+    """解析 config.json 中的 vlm_max_tokens；缺失/空/非法时返回 None（运行时自动查询模型上限）。"""
+    v = cfg.get("vlm_max_tokens")
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        return max(1, min(131072, int(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _cfg_vlm_chain_dump() -> bool:
+    """VLM 校验链失败对话链转储开关（默认关，排查时开启）。"""
+    return bool(cfg.get("vlm_chain_dump", False))
+
+
+def _cfg_vlm_chain_dump_path() -> str:
+    """转储文件路径；环境变量 VLM_CHAIN_DUMP 优先。"""
+    v = cfg.get("vlm_chain_dump_path")
+    if v and str(v).strip():
+        return str(v).strip()
+    return "logs/vlm_validation_chain.jsonl"
+
+
 class VlmModelConfig(BaseSettings):
     name: str = ""
     base_url: Optional[str] = None
@@ -155,9 +179,27 @@ class Settings(BaseSettings):
         default=max(5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))),
         description="VLM HTTP read timeout in seconds (httpx)",
     )
+    vlm_max_tokens: Optional[int] = Field(
+        default_factory=_cfg_vlm_max_tokens,
+        description=(
+            "max_tokens for chat completions; thinking models share it between reasoning "
+            "and content. None = auto-resolve from the model provider's /models API"
+        ),
+    )
     vlm_validation_max_corrections: int = Field(
         default=max(0, min(8, int(cfg.get("vlm_validation_max_corrections", 2) or 2))),
         description="Max model-based correction rounds when validate_against_questions fails",
+    )
+    vlm_chain_dump: bool = Field(
+        default_factory=_cfg_vlm_chain_dump,
+        description=(
+            "校验链最终失败时把完整对话链追写到 vlm_chain_dump_path（JSONL，图片 "
+            "base64 已剔除），供排查使用；默认关"
+        ),
+    )
+    vlm_chain_dump_path: str = Field(
+        default_factory=_cfg_vlm_chain_dump_path,
+        description="校验链转储文件路径；环境变量 VLM_CHAIN_DUMP 优先",
     )
 
     # Dynamic Questions
@@ -210,9 +252,12 @@ def reload_settings_from_disk() -> None:
         "vlm_http_timeout": max(
             5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))
         ),
+        "vlm_max_tokens": _cfg_vlm_max_tokens(),
         "vlm_validation_max_corrections": max(
             0, min(8, int(cfg.get("vlm_validation_max_corrections", 2) or 2))
         ),
+        "vlm_chain_dump": _cfg_vlm_chain_dump(),
+        "vlm_chain_dump_path": _cfg_vlm_chain_dump_path(),
         "device": str(cfg.get("device", settings.device)),
         "questions": dict(cfg.get("questions") or {}),
         "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),

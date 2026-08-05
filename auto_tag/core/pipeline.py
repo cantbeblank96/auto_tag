@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -58,6 +59,94 @@ DEFAULT_IMAGE_SUFFIXES = [
 ]
 
 _YUV_SUFFIXES = (".yuv", ".nv21", ".nv12")
+
+
+def normalize_image_suffixes(
+    raw_suffixes: Optional[List[str]], lowercase: bool = True
+) -> List[str]:
+    """后缀过滤条件归一化：去空白、自动补前导点、去重；lowercase=False 时保留原大小写。"""
+    out: List[str] = []
+    seen = set()
+    for raw in raw_suffixes or []:
+        s = str(raw or "").strip()
+        if lowercase:
+            s = s.lower()
+        if not s:
+            continue
+        if not s.startswith("."):
+            s = "." + s
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+@dataclass
+class ImageFilterSpec:
+    """目录扫描阶段的文件名过滤条件（对 image_ls 显式列表不生效）。"""
+
+    suffixes: List[str] = field(default_factory=list)
+    """后缀模式：已归一化的后缀列表（如 [".jpg"]）；为空表示不按后缀过滤。"""
+    name_regex: Optional[str] = None
+    """正则模式：非空时优先于 suffixes，匹配文件名或完整路径。"""
+    ignore_case: bool = True
+    match_full_path: bool = False
+    """为 True 时正则匹配完整路径，否则仅匹配文件名。"""
+
+    def is_active(self) -> bool:
+        return bool(self.name_regex) or bool(self.suffixes)
+
+
+def build_image_filter_spec(
+    image_suffixes: Optional[List[str]] = None,
+    image_name_regex: Optional[str] = None,
+    filter_ignore_case: bool = True,
+    filter_match_full_path: bool = False,
+) -> ImageFilterSpec:
+    """由任务参数构造过滤条件；正则非法或后缀全部无效时抛 ValueError。"""
+    regex = (image_name_regex or "").strip() or None
+    if regex is not None:
+        flags = re.IGNORECASE if filter_ignore_case else 0
+        try:
+            re.compile(regex, flags)
+        except re.error as e:
+            raise ValueError(f"image_name_regex 非法：{e}")
+        return ImageFilterSpec(
+            name_regex=regex,
+            ignore_case=bool(filter_ignore_case),
+            match_full_path=bool(filter_match_full_path),
+        )
+    suffixes = normalize_image_suffixes(image_suffixes, lowercase=bool(filter_ignore_case))
+    if image_suffixes and not suffixes:
+        raise ValueError("image_suffixes 归一化后为空")
+    return ImageFilterSpec(suffixes=suffixes, ignore_case=bool(filter_ignore_case))
+
+
+def _apply_image_filter(paths: List[str], spec: Optional[ImageFilterSpec]) -> List[str]:
+    """按过滤条件筛选路径列表。
+
+    正则在此生效；后缀仅在区分大小写时在此二次筛选
+    （忽略大小写的后缀匹配已在目录扫描阶段完成）。
+    """
+    if spec is None or not spec.is_active():
+        return paths
+    if spec.name_regex:
+        flags = re.IGNORECASE if spec.ignore_case else 0
+        pattern = re.compile(spec.name_regex, flags)
+        out = []
+        for p in paths:
+            target = p if spec.match_full_path else os.path.basename(p)
+            if pattern.search(target):
+                out.append(p)
+        return out
+    if not spec.ignore_case:
+        out = []
+        for p in paths:
+            name = os.path.basename(p)
+            if any(name.endswith(s) for s in spec.suffixes):
+                out.append(p)
+        return out
+    return paths
 
 
 def decode_meta_for_path(path: str, cfg: "PipelineConfig") -> Dict[str, Any]:
@@ -119,6 +208,14 @@ class PipelineConfig:
 
     input_dirs: List[str] = field(default_factory=list)
     image_ls_files: List[str] = field(default_factory=list)
+    image_suffixes: Optional[List[str]] = None
+    """后缀过滤（仅作用于 input_dirs 扫描）；None/空 = 不过滤。"""
+    image_name_regex: Optional[str] = None
+    """文件名正则过滤；非空时优先于 image_suffixes。"""
+    filter_ignore_case: bool = True
+    """过滤时是否忽略大小写（默认忽略）。"""
+    filter_match_full_path: bool = False
+    """正则匹配完整路径还是仅文件名（默认仅文件名）。"""
     work_dir: str = ""
     """空字符串表示使用默认路径（normalize_work_dir 时会解析为 auto_tag/work_dir）。"""
     rotate_angle: Optional[str] = None
@@ -144,15 +241,71 @@ class PipelineResult:
     failed_paths: List[str]
     processed_ok: int
     profile_summary: Optional[Dict[str, Any]] = None
+    # 簇中心 VLM 标注失败的图片路径（供“重跑失败部分”使用）
+    vlm_failed_paths: List[str] = field(default_factory=list)
 
 
-def _read_image_list_json(path: str) -> List[str]:
-    """读取图片路径列表 JSON；强制 UTF-8，避免 Windows 默认 GBK 解码中文路径失败。"""
+def _read_image_list(path: str) -> List[str]:
+    """读取图片路径列表文件；强制 UTF-8，避免 Windows 默认 GBK 解码中文路径失败。
+
+    支持两种格式：
+    - 旧格式：整个文件为 JSON 数组（向后兼容）；
+    - v2 格式：首个非空行为 JSON 头部（含 prefix / image_num 等字段），
+      其余行每行一个路径；相对行与 prefix 拼接，绝对行原样使用。
+      image_num 与实际有效行数不一致时仅告警不中断。
+    """
     with open(path, "r", encoding="utf-8-sig") as f:
-        data = json.load(f)
-    if not isinstance(data, list):
-        raise ValueError(f"image list JSON must be a list, got {type(data).__name__}")
-    return [str(x) for x in data if str(x).strip()]
+        text = f.read()
+    stripped = text.strip()
+    if stripped.startswith("["):
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, list):
+            return [str(x) for x in data if str(x).strip()]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    prefix = ""
+    image_num: Optional[int] = None
+    start = 0
+    if lines and lines[0].startswith("{"):
+        try:
+            header = json.loads(lines[0])
+        except json.JSONDecodeError as e:
+            raise ValueError(f"image_ls 头部行 JSON 解析失败：{e}")
+        if not isinstance(header, dict):
+            raise ValueError("image_ls 头部行必须是 JSON 对象")
+        prefix = str(header.get("prefix") or "")
+        raw_num = header.get("image_num")
+        if raw_num is not None:
+            try:
+                image_num = int(raw_num)
+            except (TypeError, ValueError):
+                raise ValueError(f"image_ls 头部 image_num 非整数：{raw_num!r}")
+        start = 1
+    out: List[str] = []
+    skipped = 0
+    for ln in lines[start:]:
+        if os.path.isabs(ln):
+            out.append(ln)
+        elif prefix:
+            out.append(os.path.join(prefix, ln))
+        else:
+            skipped += 1
+    if skipped:
+        logger.warning(
+            "image_ls %s: 跳过 %d 行相对路径（无 prefix 可拼接）", path, skipped
+        )
+    if image_num is not None and len(out) != image_num:
+        logger.warning(
+            "image_ls %s: image_num=%d 与实际有效行数 %d 不一致，按实际行处理",
+            path, image_num, len(out),
+        )
+    return out
+
+
+# 旧名兼容
+_read_image_list_json = _read_image_list
 
 
 def _write_image_list_json(path: str, paths: List[str]) -> None:
@@ -165,17 +318,28 @@ def _write_image_list_json(path: str, paths: List[str]) -> None:
 def collect_image_paths(
     input_dirs: List[str],
     image_ls_files: List[str],
+    filter_spec: Optional[ImageFilterSpec] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
     返回 (全部图片路径列表, 用于校验样图的来源信息列表)。
     all_sources 每项: {"name": str, "sample_path": str}
+
+    filter_spec 仅作用于 input_dirs 目录扫描；image_ls 显式列表不参与过滤。
+    后缀模式下直接用过滤后缀扫描（可命中 .jpg 等默认后缀之外的类型）；
+    正则模式下先按默认后缀扫描再按正则筛选。
     """
     all_sources: List[Dict[str, Any]] = []
     image_list: List[str] = []
+    active = filter_spec is not None and filter_spec.is_active()
+    if active and filter_spec.suffixes and not filter_spec.name_regex:
+        scan_suffixes = filter_spec.suffixes
+    else:
+        scan_suffixes = DEFAULT_IMAGE_SUFFIXES
 
     for d in input_dirs:
         if os.path.isdir(d):
-            imgs = _walk_collect_images(d, DEFAULT_IMAGE_SUFFIXES)
+            imgs = _walk_collect_images(d, scan_suffixes)
+            imgs = _apply_image_filter(imgs, filter_spec)
             if imgs:
                 all_sources.append({"name": os.path.basename(d), "sample_path": imgs[0]})
                 image_list.extend(imgs)
@@ -185,7 +349,7 @@ def collect_image_paths(
     for f_path in image_ls_files:
         if os.path.exists(f_path):
             try:
-                imgs = _read_image_list_json(f_path)
+                imgs = _read_image_list(f_path)
                 if imgs:
                     all_sources.append({"name": os.path.basename(f_path), "sample_path": imgs[0]})
                     image_list.extend(imgs)
@@ -236,15 +400,25 @@ def run_annotation_pipeline(
         cfg: 任务配置
         on_progress: 回调，签名为
           ``(done: int, total: int, failed_n: int, *, skip_in_db: int, vlm_calls: int,
-          new_centers: int, stage1_skips: int, stage2_joins: int) -> None``
-          （``done`` 为建簇阶段已处理张数；``vlm_calls/new_centers`` 为 VLM 完成/待标簇中心数）。
+          vlm_failed: int, new_centers: int, stage1_skips: int, stage2_joins: int) -> None``
+          （``done`` 为建簇阶段已处理张数；``vlm_calls/new_centers`` 为 VLM 成功/待标簇中心数；
+          ``vlm_failed`` 为 VLM 失败次数）。
         should_cancel: 若返回 True 则尽快结束循环（当前 batch 仍会跑完）
     """
     cfg = replace(cfg, work_dir=normalize_work_dir(cfg.work_dir))
     profile = PipelineProfile(resolve_pipeline_debug(cfg.pipeline_debug))
     profile.mark_wall_start()
 
-    image_list, _ = collect_image_paths(cfg.input_dirs, cfg.image_ls_files)
+    image_list, _ = collect_image_paths(
+        cfg.input_dirs,
+        cfg.image_ls_files,
+        filter_spec=build_image_filter_spec(
+            image_suffixes=cfg.image_suffixes,
+            image_name_regex=cfg.image_name_regex,
+            filter_ignore_case=cfg.filter_ignore_case,
+            filter_match_full_path=cfg.filter_match_full_path,
+        ),
+    )
     if not image_list:
         logger.warning("No images found to process.")
         return PipelineResult(total_images=0, failed_paths=[], processed_ok=0)
@@ -316,11 +490,13 @@ def run_annotation_pipeline(
         )
 
     failed_images: List[str] = []
+    vlm_failed_paths: List[str] = []
     processed_ok = 0
     total = len(image_list)
     images_seen = 0
     skip_in_db_n = 0
     vlm_total = 0
+    vlm_failed_total = 0
     new_centers_total = 0
     stage1_total = 0
     stage2_total = 0
@@ -334,6 +510,7 @@ def run_annotation_pipeline(
                 len(failed_images),
                 skip_in_db=skip_in_db_n,
                 vlm_calls=vlm_total,
+                vlm_failed=vlm_failed_total,
                 new_centers=new_centers_total,
                 stage1_skips=stage1_total,
                 stage2_joins=stage2_total,
@@ -347,7 +524,32 @@ def run_annotation_pipeline(
             vlm_total += 1
         _emit_progress()
 
-    annotator.start_vlm_pool(profile=profile, on_vlm_done=_on_vlm_done)
+    def _on_vlm_failed(path: str) -> None:
+        nonlocal vlm_failed_total
+        with vlm_progress_lock:
+            vlm_failed_total += 1
+            if path and path not in vlm_failed_paths:
+                vlm_failed_paths.append(path)
+        _emit_progress()
+
+    # 启动前检查：占位/空 API Key 会导致打标全失败（打标数显示为 0）
+    _placeholder_keys = []
+    for _m in list(getattr(settings, "vlm_models", None) or []):
+        if not isinstance(_m, dict):
+            continue
+        _k = str(_m.get("api_key") or "").strip()
+        _name = str(_m.get("name") or "")
+        if (not _k) or (_k.lower() in {"your_api_key_here", "changeme", "xxx"}):
+            _placeholder_keys.append(_name or "(unnamed)")
+    if _placeholder_keys:
+        logger.error(
+            "VLM api_key 疑似未配置（占位符/空）: %s。任务会建簇但标注为 0。请到设置页填写真实 API Key 并重置熔断。",
+            ", ".join(_placeholder_keys),
+        )
+
+    annotator.start_vlm_pool(
+        profile=profile, on_vlm_done=_on_vlm_done, on_vlm_failed=_on_vlm_failed
+    )
 
     try:
         logger.info("Total images to process: %d", total)
@@ -466,6 +668,14 @@ def run_annotation_pipeline(
                 cancel_pending=pipeline_cancelled,
             )
         timing_record("vlm_pool_drain_done")
+        # 池排空后回填：修复成员在中心标完前入簇导致的空标签（B2 竞态）
+        try:
+            with profile.span("backfill_pending_labels"):
+                backfilled = annotator.backfill_pending_labels()
+            if backfilled:
+                timing_record("backfill_pending_labels", fixed=backfilled)
+        except Exception:
+            logger.exception("backfill_pending_labels failed at pipeline end")
 
     if failed_images:
         failed_file = os.path.join(log_d, "failed_images.json")
@@ -511,4 +721,5 @@ def run_annotation_pipeline(
         failed_paths=failed_images,
         processed_ok=processed_ok,
         profile_summary=profile_summary,
+        vlm_failed_paths=list(vlm_failed_paths),
     )

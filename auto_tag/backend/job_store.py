@@ -45,12 +45,15 @@ def _record_from_job(job_id: str, job: Dict[str, Any]) -> Dict[str, Any]:
         "failed_so_far": int(job.get("failed_so_far") or 0),
         "skip_in_db": int(job.get("skip_in_db") or 0),
         "vlm_calls": int(job.get("vlm_calls") or 0),
+        "vlm_failed": int(job.get("vlm_failed") or 0),
         "new_centers": int(job.get("new_centers") or 0),
         "stage1_skips": int(job.get("stage1_skips") or 0),
         "stage2_joins": int(job.get("stage2_joins") or 0),
         "created_at": float(job.get("created_at") or 0),
         "started_at": float(job["started_at"]) if job.get("started_at") else None,
         "finished_at": float(job["finished_at"]) if job.get("finished_at") else None,
+        # 任务提交时的 PipelineConfig 快照（供“重跑失败部分”重建配置）
+        "cfg_dict": job.get("cfg_dict") or {},
     }
 
 
@@ -106,6 +109,20 @@ def persist_job_record(job_id: str, job: Dict[str, Any]) -> None:
         _save_all_records(all_records)
 
 
+def delete_job_records(job_ids: List[str]) -> int:
+    """从磁盘历史中删除指定任务记录，返回实际删除数。"""
+    deleted = 0
+    with _lock:
+        all_records = _load_all_records()
+        for job_id in job_ids:
+            if job_id in all_records:
+                del all_records[job_id]
+                deleted += 1
+        if deleted:
+            _save_all_records(all_records)
+    return deleted
+
+
 def hydrate_jobs_from_disk(target: Dict[str, Dict[str, Any]]) -> int:
     """启动时从磁盘恢复任务；running/queued 标为 failed（中断）。"""
     loaded = 0
@@ -130,12 +147,14 @@ def hydrate_jobs_from_disk(target: Dict[str, Dict[str, Any]]) -> int:
             "failed_so_far": int(rec.get("failed_so_far") or 0),
             "skip_in_db": int(rec.get("skip_in_db") or 0),
             "vlm_calls": int(rec.get("vlm_calls") or 0),
+            "vlm_failed": int(rec.get("vlm_failed") or 0),
             "new_centers": int(rec.get("new_centers") or 0),
             "stage1_skips": int(rec.get("stage1_skips") or 0),
             "stage2_joins": int(rec.get("stage2_joins") or 0),
             "created_at": float(rec.get("created_at") or 0),
             "started_at": float(rec["started_at"]) if rec.get("started_at") else None,
             "finished_at": float(rec["finished_at"]) if rec.get("finished_at") else None,
+            "cfg_dict": rec.get("cfg_dict") or {},
         }
         loaded += 1
     return loaded

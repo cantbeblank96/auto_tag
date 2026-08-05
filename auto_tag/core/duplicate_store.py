@@ -36,6 +36,101 @@ def _duplicate_links_table_columns(conn: sqlite3.Connection) -> set[str]:
     return {r[1] for r in conn.execute("PRAGMA table_info(duplicate_links)")}
 
 
+def _count_sqlite_rows(file_path: str) -> int:
+    if not os.path.isfile(file_path):
+        return 0
+    try:
+        with sqlite3.connect(file_path, timeout=30) as conn:
+            cols = _duplicate_links_table_columns(conn)
+            if not cols:
+                return 0
+            cur = conn.execute("SELECT COUNT(*) FROM duplicate_links")
+            return int(cur.fetchone()[0])
+    except (OSError, sqlite3.Error) as e:
+        logger.warning("count duplicate sqlite failed: %s", e)
+        return 0
+
+
+def _unlink_quiet(path: str) -> bool:
+    """删除文件；失败返回 False（Windows 上常见于文件仍被占用）。"""
+    try:
+        if os.path.isfile(path):
+            os.remove(path)
+        return not os.path.isfile(path)
+    except OSError as e:
+        logger.warning("unlink failed %s: %s", path, e)
+        return False
+
+
+def clear_duplicate_store(file_path: str) -> Dict[str, Any]:
+    """清空近重复侧车：优先清空表/截断内容，再尽量删除文件（含 journal/wal/shm）。
+
+    Windows 上仅 ``os.remove`` 常因 SQLite 仍被其它请求占用而 Permission denied；
+    先 ``DELETE`` 可保证条数归零，即使文件暂时删不掉。
+    """
+    path = os.path.abspath(os.path.expanduser(str(file_path).strip()))
+    result: Dict[str, Any] = {
+        "file": path,
+        "existed": os.path.isfile(path),
+        "removed": False,
+        "before_rows": 0,
+        "after_rows": 0,
+        "truncated": False,
+    }
+    if not result["existed"]:
+        return result
+
+    if _is_sqlite_path(path):
+        result["before_rows"] = _count_sqlite_rows(path)
+        try:
+            with sqlite3.connect(path, timeout=60) as conn:
+                cols = _duplicate_links_table_columns(conn)
+                if cols:
+                    conn.execute("DELETE FROM duplicate_links")
+                    conn.commit()
+                    result["truncated"] = True
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
+        except (OSError, sqlite3.Error) as e:
+            raise RuntimeError(f"清空侧车 SQLite 失败: {e}") from e
+
+        # 主库 + SQLite 附属文件
+        removed_main = _unlink_quiet(path)
+        for suffix in ("-wal", "-shm", "-journal"):
+            _unlink_quiet(path + suffix)
+        result["removed"] = removed_main
+        result["after_rows"] = 0 if removed_main else _count_sqlite_rows(path)
+        if result["after_rows"] > 0:
+            raise RuntimeError(
+                f"侧车仍有 {result['after_rows']} 条记录且无法删除文件（可能被占用）: {path}"
+            )
+        return result
+
+    # JSONL：统计后截断或删除
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            result["before_rows"] = sum(1 for line in f if line.strip())
+    except OSError as e:
+        raise RuntimeError(f"读取侧车 JSONL 失败: {e}") from e
+
+    if _unlink_quiet(path):
+        result["removed"] = True
+        result["truncated"] = True
+        result["after_rows"] = 0
+        return result
+
+    try:
+        with open(path, "w", encoding="utf-8"):
+            pass
+        result["truncated"] = True
+        result["after_rows"] = 0
+    except OSError as e:
+        raise RuntimeError(f"截断侧车 JSONL 失败: {e}") from e
+    return result
+
+
 def _compose_row(registry: PathPrefixRegistry, row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
     if row.get("anchor_prefix_id") is not None:

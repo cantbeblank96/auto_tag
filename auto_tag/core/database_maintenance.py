@@ -539,6 +539,7 @@ def reannotate(
     vlm_calls = 0
     skipped = 0
     errs: List[str] = []
+    updated_center_clusters: List[str] = []
 
     while offset < n:
         r = db.collection.get(
@@ -599,17 +600,54 @@ def reannotate(
                 **meta,
                 "labels_json": json.dumps(new_labels, ensure_ascii=False),
             }
+            if new_labels:
+                # 重标成功后清除历史 failed/pending 状态
+                new_meta["annotation_status"] = "done"
             try:
                 db.update_document_metadata(doc_id, new_meta)
                 updated += 1
+                if new_labels and _is_cluster_center(meta):
+                    updated_center_clusters.append(str(meta.get("cluster_id") or ""))
             except Exception as e:
                 errs.append(f"{path}: update {e}")
+
+    # 中心重标成功后，把标签传播给同簇仍缺标签的成员（修复簇内标签不一致）
+    propagated = 0
+    for cid in set(c for c in updated_center_clusters if c):
+        try:
+            m_ids, m_metas = db.get_cluster_members(cid)
+        except Exception as e:
+            errs.append(f"cluster {cid}: members {e}")
+            continue
+        center_lj = None
+        for mm in m_metas:
+            if mm and _is_cluster_center(mm):
+                lj = str(mm.get("labels_json") or "{}")
+                if lj != "{}":
+                    center_lj = lj
+                break
+        if not center_lj:
+            continue
+        for mid, mm in zip(m_ids, m_metas):
+            if not mm or _is_cluster_center(mm):
+                continue
+            if str(mm.get("labels_json") or "{}") != "{}":
+                continue
+            new_m = dict(mm)
+            new_m["labels_json"] = center_lj
+            new_m["annotation_status"] = "done"
+            try:
+                db.update_document_metadata(mid, new_m)
+                propagated += 1
+            except Exception as e:
+                errs.append(f"cluster {cid}: propagate {mid} {e}")
 
     return {
         "ok": True,
         "message": "标注更新完成。",
         "documents_total": n,
         "updated": updated,
+        "propagated_to_members": propagated,
         "vlm_calls": vlm_calls,
         "skipped": skipped,
         "errors_sample": errs[:20],

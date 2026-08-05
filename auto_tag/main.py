@@ -18,6 +18,7 @@ _apply_config_file_env_early()
 
 from auto_tag.core.pipeline import (  # noqa: E402
     PipelineConfig,
+    build_image_filter_spec,
     collect_image_paths,
     work_log_dir,
     run_annotation_pipeline,
@@ -45,7 +46,28 @@ def setup_logging(log_dir: str):
 def main():
     parser = argparse.ArgumentParser(description="Image Auto Annotator System")
     parser.add_argument("--input_dir", action="append", default=[], help="Input directories.")
-    parser.add_argument("--image_ls_file", action="append", default=[], help="JSON files containing image list.")
+    parser.add_argument("--image_ls_file", action="append", default=[], help="Image list files (JSON array or v2 行式：首行 JSON 头部含 prefix/image_num，其余每行一个路径).")
+    parser.add_argument(
+        "--image_suffix",
+        action="append",
+        default=[],
+        help="后缀过滤（可重复，仅作用于目录扫描），如 --image_suffix .jpg；留空 = 默认全部常见后缀。",
+    )
+    parser.add_argument(
+        "--image_name_regex",
+        default=None,
+        help="文件名正则过滤（优先于 --image_suffix），如 '.*_front\\.jpg$'。",
+    )
+    parser.add_argument(
+        "--filter_case_sensitive",
+        action="store_true",
+        help="过滤时区分大小写（默认忽略）。",
+    )
+    parser.add_argument(
+        "--filter_match_full_path",
+        action="store_true",
+        help="正则匹配完整路径（默认仅匹配文件名）。",
+    )
     parser.add_argument(
         "--work_dir",
         default=None,
@@ -90,6 +112,10 @@ def main():
     cfg = PipelineConfig(
         input_dirs=args.input_dir,
         image_ls_files=args.image_ls_file,
+        image_suffixes=args.image_suffix or None,
+        image_name_regex=args.image_name_regex,
+        filter_ignore_case=not args.filter_case_sensitive,
+        filter_match_full_path=args.filter_match_full_path,
         work_dir=work_d,
         rotate_angle=args.rotate_angle,
         b_yuv_image=args.b_yuv_image,
@@ -99,7 +125,19 @@ def main():
         image_width=args.image_width,
     )
 
-    image_list, all_sources = collect_image_paths(cfg.input_dirs, cfg.image_ls_files)
+    try:
+        filter_spec = build_image_filter_spec(
+            image_suffixes=cfg.image_suffixes,
+            image_name_regex=cfg.image_name_regex,
+            filter_ignore_case=cfg.filter_ignore_case,
+            filter_match_full_path=cfg.filter_match_full_path,
+        )
+    except ValueError as e:
+        print(f"过滤参数非法：{e}", file=sys.stderr)
+        sys.exit(2)
+    image_list, all_sources = collect_image_paths(
+        cfg.input_dirs, cfg.image_ls_files, filter_spec=filter_spec
+    )
     if not image_list:
         logger.warning("No images found to process.")
         return

@@ -43,6 +43,13 @@ interface QueueItem {
   queueId: string
   summary: string
   inputDirs: string[]
+  /** 图片来源模式：目录扫描 / 列表指定 */
+  sourceMode: 'dir' | 'list'
+  imageLsFiles: string[]
+  imageSuffixes: string[]
+  imageNameRegex: string
+  filterIgnoreCase: boolean
+  filterMatchFullPath: boolean
   rotateAngle: string
   mixedYuv: boolean
   bYuv: boolean
@@ -80,20 +87,31 @@ export default function Tasks() {
   const [yuvW, setYuvW] = useState(640)
   const [yuvH, setYuvH] = useState(480)
   const [yuvType, setYuvType] = useState('nv21')
+  // F1：新建任务双模式（目录扫描 vs 列表指定）与过滤设置
+  const [sourceMode, setSourceMode] = useState<'dir' | 'list'>('dir')
+  const [imageLsFilesText, setImageLsFilesText] = useState('')
+  const [filterMode, setFilterMode] = useState<'suffix' | 'regex'>('suffix')
+  const [suffixInput, setSuffixInput] = useState('')
+  const [regexInput, setRegexInput] = useState('')
+  const [filterIgnoreCase, setFilterIgnoreCase] = useState(true)
+  const [filterMatchFullPath, setFilterMatchFullPath] = useState(false)
   const [skipIfInDb, setSkipIfInDb] = useState(true)
   // 本地队列（当前 session 提交的 + 从后端拉取的）
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [queueArmed, setQueueArmed] = useState(false)
   const [msg, setMsg] = useState('')
+  const [msgLevel, setMsgLevel] = useState<'info' | 'error'>('info')
   // 时间点过滤
   const [lastSeenAt, setLastSeenAt] = useState<number>(() => {
     const stored = localStorage.getItem(LS_LAST_SEEN)
     return stored ? Number(stored) : 0
   })
 
-  const showMsg = (text: string) => {
+  const showMsg = (text: string, level: 'info' | 'error' = 'info') => {
     setMsg(text)
-    setTimeout(() => setMsg(''), 5000)
+    setMsgLevel(level)
+    // 错误提示停留更久，避免用户误以为操作无响应
+    setTimeout(() => setMsg(''), level === 'error' ? 15000 : 5000)
   }
 
   const skipIfInDbRef = useRef(skipIfInDb)
@@ -147,6 +165,12 @@ export default function Tasks() {
       queueId: `job_${j.job_id.slice(0, 8)}`,
       summary: `${j.job_id.slice(0, 8)} (${j.work_dir || '?'})`,
       inputDirs: [],
+      sourceMode: 'dir',
+      imageLsFiles: [],
+      imageSuffixes: [],
+      imageNameRegex: '',
+      filterIgnoreCase: true,
+      filterMatchFullPath: false,
       rotateAngle: '',
       mixedYuv: false,
       bYuv: false,
@@ -174,7 +198,7 @@ export default function Tasks() {
     const now = Date.now()
     setLastSeenAt(now)
     localStorage.setItem(LS_LAST_SEEN, String(now))
-    showMsg('已隐藏此时间之前的任务记录（可在下方「查询」章节查看全部）')
+    showMsg('已隐藏此时间之前的任务记录（可在下方「管理」章节查看全部）')
   }
 
   // 轮询运行中任务；空闲时提交下一个排队项（副作用不得放在 setState updater 内）
@@ -214,7 +238,18 @@ export default function Tasks() {
 
       createInFlightRef.current = nextItem.queueId
       api.createJob({
-        input_dirs: nextItem.inputDirs,
+        input_dirs: nextItem.sourceMode === 'dir' ? nextItem.inputDirs : [],
+        image_ls_files: nextItem.sourceMode === 'list' ? nextItem.imageLsFiles : [],
+        image_suffixes:
+          nextItem.sourceMode === 'dir' && nextItem.imageSuffixes.length > 0
+            ? nextItem.imageSuffixes
+            : null,
+        image_name_regex:
+          nextItem.sourceMode === 'dir' && nextItem.imageNameRegex
+            ? nextItem.imageNameRegex
+            : null,
+        filter_ignore_case: nextItem.filterIgnoreCase,
+        filter_match_full_path: nextItem.filterMatchFullPath,
         rotate_angle: nextItem.rotateAngle || null,
         b_yuv_image: nextItem.bYuv,
         mixed_yuv: nextItem.mixedYuv,
@@ -264,29 +299,57 @@ export default function Tasks() {
   }, [queueArmed])
 
   const confirmTask = async () => {
+    const isList = sourceMode === 'list'
     const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
-    if (dirs.length === 0) {
-      showMsg('请至少填写一个输入目录')
-      return
-    }
-    try {
-      const check = await api.checkDirs(dirs)
-      if (check.not_exist.length > 0) {
-        const msg = `以下目录不存在：\n${check.not_exist.join('\n')}\n\n确定仍要提交吗？`
-        const ok = window.confirm(msg + '\n\n（不存在的目录会被流水线忽略）')
-        if (!ok) {
-          showMsg('已取消')
-          return
-        }
+    const lsFiles = imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean)
+    const suffixes = suffixInput.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
+    const regex = regexInput.trim()
+    // 目录扫描模式：先校验过滤条件
+    if (!isList && filterMode === 'regex' && regex) {
+      try {
+        new RegExp(regex)
+      } catch {
+        showMsg('正则表达式非法，请检查')
+        return
       }
-    } catch (e: any) {
-      showMsg(`无法校验目录（已跳过验证）: ${e.message}`)
     }
-    const summary = dirs.length === 1 ? dirs[0] : `${dirs[0]} 等${dirs.length}项`
+    let summary: string
+    if (isList) {
+      if (lsFiles.length === 0) {
+        showMsg('请至少填写一个 image_ls 文件路径')
+        return
+      }
+      summary = lsFiles.length === 1 ? `[列表] ${lsFiles[0]}` : `[列表] ${lsFiles.length} 个列表文件`
+    } else {
+      if (dirs.length === 0) {
+        showMsg('请至少填写一个输入目录')
+        return
+      }
+      try {
+        const check = await api.checkDirs(dirs)
+        if (check.not_exist.length > 0) {
+          const msg = `以下目录不存在：\n${check.not_exist.join('\n')}\n\n确定仍要提交吗？`
+          const ok = window.confirm(msg + '\n\n（不存在的目录会被流水线忽略）')
+          if (!ok) {
+            showMsg('已取消')
+            return
+          }
+        }
+      } catch (e: any) {
+        showMsg(`无法校验目录（已跳过验证）: ${e.message}`)
+      }
+      summary = dirs.length === 1 ? dirs[0] : `${dirs[0]} 等${dirs.length}项`
+    }
     const newItem: QueueItem = {
       queueId: Math.random().toString(36).slice(2, 10),
       summary,
       inputDirs: dirs,
+      sourceMode,
+      imageLsFiles: lsFiles,
+      imageSuffixes: !isList && filterMode === 'suffix' ? suffixes : [],
+      imageNameRegex: !isList && filterMode === 'regex' ? regex : '',
+      filterIgnoreCase,
+      filterMatchFullPath,
       rotateAngle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || '',
       mixedYuv,
       bYuv,
@@ -303,9 +366,16 @@ export default function Tasks() {
   }
 
   const downloadTaskJson = () => {
+    const suffixes = suffixInput.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
     const data = {
       version: 1,
+      source_mode: sourceMode,
       input_dirs: inputDirs.split('\n').map(s => s.trim()).filter(Boolean),
+      image_ls_files: imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean),
+      image_suffixes: filterMode === 'suffix' && suffixes.length > 0 ? suffixes : null,
+      image_name_regex: filterMode === 'regex' && regexInput.trim() ? regexInput.trim() : null,
+      filter_ignore_case: filterIgnoreCase,
+      filter_match_full_path: filterMatchFullPath,
       rotate_angle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || null,
       b_yuv_image: bYuv,
       mixed_yuv: mixedYuv,
@@ -332,6 +402,28 @@ export default function Tasks() {
         if (data.input_dirs) {
           setInputDirs(Array.isArray(data.input_dirs) ? data.input_dirs.join('\n') : data.input_dirs)
         }
+        if (Array.isArray(data.image_ls_files)) {
+          setImageLsFilesText(data.image_ls_files.join('\n'))
+        }
+        // 模式推断：显式 source_mode 优先；否则有列表且无目录时切到列表模式
+        if (data.source_mode === 'list' || data.source_mode === 'dir') {
+          setSourceMode(data.source_mode)
+        } else if (
+          Array.isArray(data.image_ls_files) && data.image_ls_files.length > 0 &&
+          (!Array.isArray(data.input_dirs) || data.input_dirs.length === 0)
+        ) {
+          setSourceMode('list')
+        }
+        if (Array.isArray(data.image_suffixes) && data.image_suffixes.length > 0) {
+          setFilterMode('suffix')
+          setSuffixInput(data.image_suffixes.join(', '))
+        }
+        if (data.image_name_regex) {
+          setFilterMode('regex')
+          setRegexInput(String(data.image_name_regex))
+        }
+        if (data.filter_ignore_case != null) setFilterIgnoreCase(data.filter_ignore_case)
+        if (data.filter_match_full_path != null) setFilterMatchFullPath(data.filter_match_full_path)
         if (data.rotate_angle) {
           const opt = ROTATE_OPTIONS.find(o => o.value === data.rotate_angle)
           if (opt) setRotLabel(opt.label)
@@ -355,7 +447,11 @@ export default function Tasks() {
     <div>
       <h2 className="text-2xl font-semibold text-gray-800 dark:text-gray-100 mb-6">任务</h2>
       {msg && (
-        <div className="mb-4 px-4 py-2 rounded text-sm bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-800">
+        <div className={`mb-4 px-4 py-2 rounded text-sm border ${
+          msgLevel === 'error'
+            ? 'bg-red-50 dark:bg-red-950/50 text-red-700 dark:text-red-300 border-red-200 dark:border-red-800'
+            : 'bg-blue-50 dark:bg-blue-950/50 text-blue-700 dark:text-blue-300 border-blue-200 dark:border-blue-800'
+        }`}>
           {msg}
         </div>
       )}
@@ -377,16 +473,88 @@ export default function Tasks() {
         <section className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-6">
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">新建</h4>
         <div className="space-y-4">
-          <div>
-            <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">输入目录（每行一个绝对路径）</label>
-            <textarea
-              value={inputDirs}
-              onChange={e => setInputDirs(e.target.value)}
-              placeholder="/path/to/images"
-              className="w-full border rounded px-3 py-2 text-sm font-mono"
-              rows={4}
-            />
+          {/* F1：图片来源双模式切换 */}
+          <div className="flex gap-2">
+            {([['dir', '目录扫描'], ['list', '列表指定 (image_ls)']] as const).map(([mode, label]) => (
+              <button
+                key={mode}
+                onClick={() => setSourceMode(mode)}
+                className={`px-3 py-1.5 text-sm rounded border ${
+                  sourceMode === mode
+                    ? 'bg-blue-600 text-white border-blue-600'
+                    : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
+          {sourceMode === 'dir' ? (
+            <>
+              <div>
+                <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">输入目录（每行一个绝对路径）</label>
+                <textarea
+                  value={inputDirs}
+                  onChange={e => setInputDirs(e.target.value)}
+                  placeholder="/path/to/images"
+                  className="w-full border rounded px-3 py-2 text-sm font-mono"
+                  rows={4}
+                />
+              </div>
+              <div className="border border-gray-200 dark:border-gray-700 rounded p-3 space-y-3">
+                <p className="text-sm text-gray-600 dark:text-gray-400">图片过滤（可选；不填 = 全部常见后缀）</p>
+                <div className="flex gap-4 text-sm text-gray-600 dark:text-gray-300">
+                  <label className="flex items-center gap-1">
+                    <input type="radio" checked={filterMode === 'suffix'} onChange={() => setFilterMode('suffix')} />
+                    按后缀
+                  </label>
+                  <label className="flex items-center gap-1">
+                    <input type="radio" checked={filterMode === 'regex'} onChange={() => setFilterMode('regex')} />
+                    按正则
+                  </label>
+                </div>
+                {filterMode === 'suffix' ? (
+                  <input
+                    value={suffixInput}
+                    onChange={e => setSuffixInput(e.target.value)}
+                    placeholder=".jpg, .png（逗号或换行分隔，可省略前导点）"
+                    className="w-full border rounded px-3 py-2 text-sm font-mono"
+                  />
+                ) : (
+                  <div className="space-y-2">
+                    <input
+                      value={regexInput}
+                      onChange={e => setRegexInput(e.target.value)}
+                      placeholder={'正则匹配文件名，如 .*_front\\.jpg$'}
+                      className="w-full border rounded px-3 py-2 text-sm font-mono"
+                    />
+                    <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+                      <input type="checkbox" checked={filterMatchFullPath} onChange={e => setFilterMatchFullPath(e.target.checked)} />
+                      匹配完整路径（默认仅匹配文件名）
+                    </label>
+                  </div>
+                )}
+                <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+                  <input type="checkbox" checked={filterIgnoreCase} onChange={e => setFilterIgnoreCase(e.target.checked)} />
+                  忽略大小写
+                </label>
+              </div>
+            </>
+          ) : (
+            <div>
+              <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">image_ls 文件路径（每行一个绝对路径，可多个）</label>
+              <textarea
+                value={imageLsFilesText}
+                onChange={e => setImageLsFilesText(e.target.value)}
+                placeholder="/path/to/image_ls.txt"
+                className="w-full border rounded px-3 py-2 text-sm font-mono"
+                rows={4}
+              />
+              <p className="text-xs text-gray-400 mt-1">
+                列表文件格式：首行可为 JSON 头部（如 {'{"prefix": "/data/imgs/", "image_num": 3}'}），其余每行一个路径（相对行与 prefix 拼接）；也兼容旧版 JSON 数组格式。显式列表不参与上方过滤设置。
+              </p>
+            </div>
+          )}
           <div>
             <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">rotate_angle（可选）</label>
             <select value={rotLabel} onChange={e => setRotLabel(e.target.value)} className="border rounded px-3 py-2 text-sm">
@@ -479,6 +647,7 @@ export default function Tasks() {
                   const fail = lj?.failed_so_far || 0
                   const skDb = lj?.skip_in_db || 0
                   const vlm = lj?.vlm_calls || 0
+                  const vlmFail = lj?.vlm_failed || 0
                   const vlmTotal = lj?.new_centers || 0
                   const s1 = lj?.stage1_skips || 0
                   const s2 = lj?.stage2_joins || 0
@@ -514,7 +683,48 @@ export default function Tasks() {
                       </td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{total || '-'}</td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{total > 0 ? fmtRatio(proc, total) : proc || '-'}</td>
-                      <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{vlmDen > 0 ? fmtRatio(vlm, vlmDen) : vlm || '-'}</td>
+                      <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400 whitespace-nowrap">
+                        {vlmDen > 0 ? fmtRatio(vlm, vlmDen) : vlm || '-'}
+                        {vlmFail > 0 ? (
+                          <>
+                            <span className="ml-1 text-red-500">失败{vlmFail}</span>
+                            {item.serverJobId && (
+                              <button
+                                type="button"
+                                title="下载任务日志（定位失败原因）"
+                                className="ml-1 inline-flex items-center justify-center w-5 h-5 rounded-full bg-red-100 text-red-600 hover:bg-red-200 text-[10px] leading-none align-middle"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  api.downloadJobLog(item.serverJobId!).catch((err: any) =>
+                                    showMsg(`日志下载失败: ${err?.message || err}`),
+                                  )
+                                }}
+                              >
+                                ⬇
+                              </button>
+                            )}
+                            {item.serverJobId && (
+                              <button
+                                type="button"
+                                title="仅重跑这部分失败的图片（新建任务）。仅对本功能上线后完成的任务有效；旧任务未落盘失败列表"
+                                className="ml-1 inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-100 text-amber-600 hover:bg-amber-200 text-[10px] leading-none align-middle"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  api.rerunFailedJob(item.serverJobId!)
+                                    .then((resp) =>
+                                      showMsg(`已提交重跑任务（失败 ${resp.failed_count} 张），可在「管理」章节查看进度`),
+                                    )
+                                    .catch((err: any) =>
+                                      showMsg(`重跑失败: ${err?.message || err}`, 'error'),
+                                    )
+                                }}
+                              >
+                                ↻
+                              </button>
+                            )}
+                          </>
+                        ) : null}
+                      </td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{den > 0 ? fmtRatio(skipAll, den) : skipAll || '-'}</td>
                       <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">{den > 0 ? fmtRatio(fail, den) : fail || '-'}</td>
                     </tr>
@@ -531,11 +741,12 @@ export default function Tasks() {
           const total = lj?.total || 0
           const proc = lj?.processed || 0
           const vlmDone = lj?.vlm_calls || 0
+          const vlmFail = lj?.vlm_failed || 0
           const vlmTotal = lj?.new_centers || 0
           const clusterPct = total > 0 ? Math.min(proc / total, 1) : 0
           const vlmPct = vlmTotal > 0 ? Math.min(vlmDone / vlmTotal, 1) : 0
           const clusteringComplete = total > 0 && proc >= total
-          const vlmComplete = vlmTotal === 0 || vlmDone >= vlmTotal
+          const vlmComplete = vlmTotal === 0 || (vlmDone + vlmFail) >= vlmTotal
           const phaseLabel = !clusteringComplete
             ? '建簇中（CLIP + 双阈值）'
             : !vlmComplete
@@ -547,6 +758,7 @@ export default function Tasks() {
                 运行中 <code className="bg-gray-100 px-1 rounded">{item.queueId}</code>
                 · <span className="font-medium text-blue-700 dark:text-blue-300">{phaseLabel}</span>
                 · 失败 {lj?.failed_so_far || 0}
+                {vlmFail > 0 ? ` · VLM失败 ${vlmFail}` : ''}
               </p>
               <div>
                 <div className="flex justify-between text-xs text-gray-500 mb-0.5">
@@ -594,7 +806,7 @@ export default function Tasks() {
         </section>
       </ChapterSection>
 
-      <ChapterSection title="查询" defaultCollapsed>
+      <ChapterSection title="管理" defaultCollapsed>
         <TaskQuerySection />
       </ChapterSection>
     </div>

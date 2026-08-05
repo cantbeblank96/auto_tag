@@ -20,15 +20,17 @@ def stats_file_path(work_dir: str) -> str:
 
 
 def persist_circuit_breaker_states(work_dir: str) -> None:
-    """将当前熔断器各端点统计写入 work_dir/log/vlm_endpoint_stats.json。"""
+    """将当前熔断器各端点统计写入 work_dir/log/vlm_endpoint_stats.json。
+
+    端点为空时也照常落盘（熔断重置后需覆写旧快照，避免重启后恢复出已清除的
+    last_error）。
+    """
     from auto_tag.core.circuit_breaker import get_circuit_breaker
 
     wd = (work_dir or "").strip()
     if not wd:
         return
     payload = get_circuit_breaker().export_persistent_snapshot()
-    if not payload.get("endpoints"):
-        return
     path = stats_file_path(wd)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     json_.write(content=payload, file_path=path, b_use_suggested_converter=True)

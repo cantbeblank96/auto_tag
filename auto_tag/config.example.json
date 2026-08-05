@@ -14,7 +14,8 @@
             "base_url": null,
             "api_key": "your_api_key_here",
             "priority": 1,
-            "enabled": true
+            "enabled": true,
+            "max_tokens": null
         }
     ],
     "questions": {
@@ -44,6 +45,8 @@
     "vlm_concurrency": 10,
     "vlm_http_timeout": 60,
     "vlm_validation_max_corrections": 2,
+    "vlm_chain_dump": false,
+    "vlm_chain_dump_path": "logs/vlm_validation_chain.jsonl",
     "circuit_breaker": {
         "time_window_seconds": 300,
         "failure_rate_threshold": 0.5,

@@ -97,6 +97,7 @@ class ImageAutoAnnotator:
         *,
         profile: Optional[PipelineProfile] = None,
         on_vlm_done: Optional[Callable[[], None]] = None,
+        on_vlm_failed: Optional[Callable[[str], None]] = None,
     ) -> None:
         """启动全局 VLM 标注池（流水线入口调用一次）。"""
         if self._vlm_pool is not None:
@@ -109,6 +110,7 @@ class ImageAutoAnnotator:
             load_context=self._load_context,
             profile=profile,
             on_vlm_done=on_vlm_done,
+            on_vlm_failed=on_vlm_failed,
         )
         self._vlm_pool.start()
 
@@ -125,6 +127,12 @@ class ImageAutoAnnotator:
             self._vlm_pool.wait_idle()
         self._vlm_pool.shutdown(wait=wait, cancel_pending=cancel_pending)
         self._vlm_pool = None
+
+    def backfill_pending_labels(self) -> int:
+        """VLM 池排空后，将簇中心标签回填给仍缺标签的成员（修复 B2 竞态）。"""
+        from auto_tag.core.vlm_annotation_pool import backfill_pending_labels
+
+        return backfill_pending_labels(self.db, self._db_lock)
 
     def _submit_vlm_job(self, job: AnnotationJob) -> None:
         if self._vlm_pool is None:

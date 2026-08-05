@@ -1,5 +1,40 @@
 # Release Record
 
+## v0.0.5 (2026-08-05)
+
+任务可观测性与失败恢复版本：任务日志落盘下载、失败部分单独重跑、任务管理（批量删除）、重试策略与 VLM 错误日志增强。
+
+### Added
+
+- **任务日志落盘与下载** — 任务日志同步写入 `work_dir/log/jobs/job_{job_id}.log`（后端重启不丢）；`GET /api/jobs/{id}/logs/download` 提供下载；前端任务列表 ⬇ 按钮一键下载。
+- **重跑失败部分** — 任务结束落盘失败图片列表 `job_{job_id}_failed.json`（含加载失败与 VLM 标注失败的簇中心）；`POST /api/jobs/{id}/rerun_failed` 以原任务配置快照重建任务、仅跑失败清单（强制 `skip_if_in_db=False`）；前端任务列表 ↻ 按钮；支持链式重跑。
+- **任务管理** — 任务页「查询」章节更名「管理」：多选勾选删除所选、清空全部（自定义确认弹窗，与数据库「高级」清空风格一致）；`DELETE /api/jobs` 批量删除历史记录（运行中/排队中任务拒绝删除，仅删记录不删 work_dir 产物）。
+- **VLM HTTP 错误日志增强** — HTTPStatusError 记录状态码与响应体片段（如 `HTTP 400 ... "sensitive image"`），失败原因可直接从日志定位。
+- **`vlm_chain_dump`** — 配置项开启后将 VLM 校验链（prompt/响应/校验结果）转储至 `work_dir/log/`，用于标注质量排查。
+- **图片过滤与列表指定** — 新建任务支持按后缀/正则过滤（可选匹配完整路径、忽略大小写），或以 `image_ls` 文件显式指定图片清单（v2 格式支持 JSON 头部 `prefix`/`image_num`）。
+- **VLM max_tokens** — 每模型可配置 `max_tokens`；未配置时自动向端点查询上限。
+- **版本 Feature 文档** — `notes/versions/v0-0-5/`：任务日志、重试/重跑/任务管理、图片过滤、vlm_chain_dump、max_tokens 等专题文档与 B1/B2/B3 排查报告。
+
+### Changed
+
+- Version bumped to `0.0.5`（`auto_tag/constant.py`、`pyproject.toml`）。
+- **VLM 重试策略** — 由近似等间隔（2s/2s/4s，3 次）改为 **4 次指数退避**：`wait_exponential(multiplier=2, min=2, max=60)`，间隔 2s → 4s → 8s（上限 60s）。
+- **前端错误提示** — 任务页错误类提示改为红色横幅并停留 15s（原为蓝色 5s，易被误认为无响应）；重跑按钮 hover 提示注明仅对落盘过失败列表的任务有效。
+
+### Fixed
+
+- **重跑失败簇中心无法自愈** — 失败中心被删后重新入库会命中原簇成员（距离≈0）被 Stage1 近重复吸收，不触发 VLM 且原簇变为无中心；现检测无中心簇并将当前图**提升为原簇中心**触发 VLM（`cluster_engine.py`，带中心存在性缓存）。
+- **任务日志只记 WARNING 以上** — Web 后端 root logger 默认 WARNING，任务级 handler 收不到 INFO；任务执行期间临时提升至 INFO、结束恢复，日志现含完整建簇/阶段决策。
+
+### Configuration
+
+| 键 | 默认 | 说明 |
+|----|------|------|
+| `vlm_chain_dump` | `false` | 转储 VLM 校验链至 `work_dir/log/` |
+| `vlm_models[].max_tokens` | 自动查询 | 每模型输出上限，缺省时向端点查询 |
+
+---
+
 ## v0.0.4 (2026-07-15)
 
 Windows 一键启停、跨平台重启日志、`skip_if_in_db` 侧车跳过、设置页路径解析与数据库「高级」清空的维护版本。

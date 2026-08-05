@@ -57,6 +57,8 @@ class ClusterEngine:
         self.duplicate_link_writer = duplicate_link_writer
         self._path_registry = path_prefix_registry
         self._db_lock = db_lock or threading.Lock()
+        # 已知存在中心的簇缓存（避免重复查库；重跑失败中心时用于修复无中心簇）
+        self._known_center_clusters: set = set()
 
     @staticmethod
     def row_meta(
@@ -104,12 +106,15 @@ class ClusterEngine:
         decode_meta: Dict[str, Any],
         *,
         profile: Optional[PipelineProfile] = None,
+        cluster_id: Optional[str] = None,
     ) -> Tuple[str, str, AnnotationJob]:
         """
         写入新簇中心（labels 为空、annotation_status=pending），返回 (cluster_id, doc_id, vlm_job)。
+
+        传入 cluster_id 时沿用原簇 ID（用于修复无中心簇：重跑失败簇中心时把当前图提升为中心）。
         """
         prof = profile or PipelineProfile(False)
-        cluster_id = self.generate_unique_cluster_id()
+        cluster_id = cluster_id or self.generate_unique_cluster_id()
         doc_id = str(uuid.uuid4())
         job = AnnotationJob(
             doc_id=doc_id,
@@ -134,7 +139,37 @@ class ClusterEngine:
                         )
                     ],
                 )
+        self._known_center_clusters.add(cluster_id)
         return cluster_id, doc_id, job
+
+    def _cluster_has_center(
+        self, cluster_id: str, batch_entries: List[_BatchEntry]
+    ) -> bool:
+        """簇内是否存在中心记录（先查本批缓存，再查库）。"""
+        if not cluster_id:
+            return False
+        if cluster_id in self._known_center_clusters:
+            return True
+        if any(be.is_center and be.cluster_id == cluster_id for be in batch_entries):
+            self._known_center_clusters.add(cluster_id)
+            return True
+        try:
+            r = self.db.collection.get(
+                where={
+                    "$and": [
+                        {"cluster_id": {"$eq": cluster_id}},
+                        {"is_cluster_center": {"$eq": True}},
+                    ]
+                },
+                limit=1,
+            )
+            has = bool(r.get("ids"))
+        except Exception as e:
+            logger.warning("Cluster center check failed for %s: %s", cluster_id, e)
+            return True
+        if has:
+            self._known_center_clusters.add(cluster_id)
+        return has
 
     def _find_batch_neighbor(
         self, vector: List[float], batch_entries: List[_BatchEntry], *, centers_only: bool
@@ -227,6 +262,45 @@ class ClusterEngine:
         def _emit(delta: Dict[str, int]) -> None:
             if on_item_done:
                 on_item_done(delta)
+
+        def _promote_centerless(hit_cluster_id: str, i: int, path: str) -> bool:
+            """命中的簇无中心时（如失败的簇中心被删后重跑），把当前图提升为原簇中心并触发 VLM。返回是否执行了修复。"""
+            if not hit_cluster_id or self._cluster_has_center(hit_cluster_id, batch_entries):
+                return False
+            logger.info(
+                "[%s] Hit centerless cluster '%s'; promoting to center (VLM async)",
+                path,
+                hit_cluster_id,
+            )
+            c_id, doc_id, job = self.insert_cluster_center(
+                path, embs[i], metas[i], profile=prof, cluster_id=hit_cluster_id
+            )
+            center_meta = self.row_meta(
+                path,
+                c_id,
+                True,
+                _EMPTY_LABELS,
+                metas[i],
+                path_prefix_registry=self._path_registry,
+                annotation_status="pending",
+            )
+            batch_entries.append(
+                _BatchEntry(
+                    path=path,
+                    vector=embs[i],
+                    cluster_id=c_id,
+                    labels_json=_EMPTY_LABELS,
+                    is_center=True,
+                    doc_id=doc_id,
+                    meta=center_meta,
+                )
+            )
+            vlm_jobs.append(job)
+            if on_vlm_job:
+                on_vlm_job(job)
+            stats["new_centers"] += 1
+            _emit({"vlm_calls": 0, "stage1_skips": 0, "stage2_joins": 0, "new_centers": 1})
+            return True
 
         if not valid_paths or not embeddings:
             return dict(zero), []
@@ -342,6 +416,8 @@ class ClusterEngine:
                 continue
 
             if min_distance <= self.tau_dup:
+                if _promote_centerless(str(nearest_meta.get("cluster_id") or ""), i, path):
+                    continue
                 logger.info(
                     "[%s] Stage 1: duplicate skip (dist=%.3f, via=%s)",
                     path,
@@ -370,7 +446,10 @@ class ClusterEngine:
                 _emit(item)
 
             elif min_distance <= self.tau_cls:
-                cluster_id = nearest_meta.get("cluster_id") or self.generate_unique_cluster_id()
+                _hit_cluster_id = nearest_meta.get("cluster_id")
+                if _hit_cluster_id and _promote_centerless(str(_hit_cluster_id), i, path):
+                    continue
+                cluster_id = _hit_cluster_id or self.generate_unique_cluster_id()
                 labels = str(nearest_meta.get("labels_json") or _EMPTY_LABELS)
                 logger.info(
                     "[%s] Stage 2: join cluster '%s' (dist=%.3f, via=%s)",

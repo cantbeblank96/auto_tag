@@ -26,6 +26,7 @@ interface QuestionEntry {
 interface ModelEntry {
   id: string
   name: string; base_url: string | null; api_key: string; priority: number; enabled?: boolean
+  max_tokens?: string
   tripped?: boolean; failures_in_window?: number; total_calls?: number
   failure_rate?: number; last_error?: string
 }
@@ -42,6 +43,7 @@ function normalizeModelEntry(m: Partial<ModelEntry>, index: number): ModelEntry 
     api_key: m.api_key || '',
     priority: m.priority ?? index + 1,
     enabled: m.enabled ?? true,
+    max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? String(m.max_tokens) : '',
     tripped: m.tripped,
     failures_in_window: m.failures_in_window,
     total_calls: m.total_calls,
@@ -122,6 +124,7 @@ export default function Settings() {
   const [vlmConcurrency, setVlmConcurrency] = useState(3)
   const [vlmHttpTimeout, setVlmHttpTimeout] = useState(60)
   const [vlmValidationMaxCorrections, setVlmValidationMaxCorrections] = useState(2)
+  const [resolvedMaxOutput, setResolvedMaxOutput] = useState<Record<string, { value: number; source: string }>>({})
   const [cbTimeWindow, setCbTimeWindow] = useState(300)
   const [cbFailureThreshold, setCbFailureThreshold] = useState(0.5)
   const [cbCooldown, setCbCooldown] = useState(600)
@@ -139,6 +142,8 @@ export default function Settings() {
   const [workDir, setWorkDir] = useState(`${PROJECT_PATH_MACRO}/work_dir`)
   const [recDup, setRecDup] = useState(true)
   const [pipelineDebug, setPipelineDebug] = useState(false)
+  const [chainDump, setChainDump] = useState(false)
+  const [chainDumpPath, setChainDumpPath] = useState('logs/vlm_validation_chain.jsonl')
 
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
@@ -200,6 +205,7 @@ export default function Settings() {
       vlm_models: models.map(m => ({
         id: m.id,
         name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
+        max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
       })),
       questions: questionsToObject(questions),
       vlm_strategy: vlmStrategy,
@@ -208,6 +214,8 @@ export default function Settings() {
       vlm_validation_max_corrections: vlmValidationMaxCorrections,
       device: clipDevice,
       pipeline_debug: pipelineDebug,
+      vlm_chain_dump: chainDump,
+      vlm_chain_dump_path: chainDumpPath.trim() || 'logs/vlm_validation_chain.jsonl',
       circuit_breaker: {
         time_window_seconds: cbTimeWindow,
         failure_rate_threshold: cbFailureThreshold,
@@ -216,12 +224,23 @@ export default function Settings() {
     }
   }, [
     questions, workDir, batchSize, tauDup, tauCls, recDup, models,
-    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, cbTimeWindow, cbFailureThreshold, cbCooldown,
+    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, cbTimeWindow, cbFailureThreshold, cbCooldown,
   ])
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
     setMsg(text); setMsgType(type); setTimeout(() => setMsg(''), 5000)
   }
+
+  /** 自动模式下查询该模型实际可用的最大输出长度，供 UI 展示。 */
+  const refreshResolvedMaxOutput = useCallback(async (model: ModelEntry) => {
+    if (!model.name || (model.max_tokens != null && String(model.max_tokens).trim() !== '')) return
+    try {
+      const res = await api.resolveMaxOutput({ name: model.name, base_url: model.base_url, api_key: model.api_key })
+      if (res && res.ok) {
+        setResolvedMaxOutput(prev => ({ ...prev, [model.id]: { value: res.value, source: res.source } }))
+      }
+    } catch { /* 后端未就绪或网络异常，不阻断页面 */ }
+  }, [])
 
   const loadEverything = async () => {
     // Load config.json
@@ -239,13 +258,15 @@ export default function Settings() {
         setWorkDir(cfg.work_dir ?? `${PROJECT_PATH_MACRO}/work_dir`)
         setRecDup(cfg.record_stage1_duplicates ?? true)
         setPipelineDebug(cfg.pipeline_debug ?? false)
+        setChainDump(cfg.vlm_chain_dump ?? false)
+        setChainDumpPath(cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl')
         // Load questions
         const qs = cfg.questions || {}
         const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
         setQuestions(loadedQuestions)
         // Load models from config.json（id 以磁盘为准；熔断状态从后端 API 合并）
         const rawModels = cfg.vlm_models || []
-        let loadedModels = rawModels.length > 0
+        let loadedModels: ModelEntry[] = rawModels.length > 0
           ? rawModels.map((m: any, i: number) => normalizeModelEntry(m, i))
           : [normalizeModelEntry({ name: 'None', base_url: null, api_key: '', priority: 1 }, 0)]
         try {
@@ -267,6 +288,7 @@ export default function Settings() {
           })
         } catch { /* 后端未就绪时仅展示 config */ }
         setModels(loadedModels)
+        loadedModels.forEach(m => refreshResolvedMaxOutput(m))
         setVlmStrategy(cfg.vlm_strategy || 'round_robin')
         setVlmConcurrency(cfg.vlm_concurrency ?? 3)
         setVlmHttpTimeout(cfg.vlm_http_timeout ?? 60)
@@ -285,10 +307,13 @@ export default function Settings() {
           embedding_subdir: cfg.embedding_subdir ?? 'embedding_index',
           record_stage1_duplicates: cfg.record_stage1_duplicates ?? true,
           pipeline_debug: cfg.pipeline_debug ?? false,
+          vlm_chain_dump: cfg.vlm_chain_dump ?? false,
+          vlm_chain_dump_path: cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl',
           duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
           vlm_models: loadedModels.map((m) => ({
             id: m.id,
             name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
+            max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
           })),
           questions: questionsToObject(loadedQuestions),
           vlm_strategy: cfg.vlm_strategy || 'round_robin',
@@ -490,9 +515,18 @@ export default function Settings() {
                 </div>
                 {(m.enabled ?? true) && (<>
                 <div className="grid grid-cols-3 gap-3">
-                  <div><label className={labelCls}>模型名称</label><input type="text" value={m.name} onChange={e => updateModel(idx, 'name', e.target.value)} placeholder="gemini/gemini-2.5-flash" className={inputCls} /></div>
-                  <div><label className={labelCls}>Base URL（可选）</label><input type="text" value={m.base_url || ''} onChange={e => updateModel(idx, 'base_url', e.target.value || null)} placeholder="https://..." className={inputCls} /></div>
+                  <div><label className={labelCls}>模型名称</label><input type="text" value={m.name} onChange={e => updateModel(idx, 'name', e.target.value)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder="gemini/gemini-2.5-flash" className={inputCls} /></div>
+                  <div><label className={labelCls}>Base URL（可选）</label><input type="text" value={m.base_url || ''} onChange={e => updateModel(idx, 'base_url', e.target.value || null)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder="https://..." className={inputCls} /></div>
                   <div><label className={labelCls}>API Key</label><input type="password" value={m.api_key} onChange={e => updateModel(idx, 'api_key', e.target.value)} placeholder="your-api-key" className={inputCls} /></div>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <label className="text-xs text-gray-500 dark:text-gray-400">最大输出 tokens</label>
+                  <input type="number" value={m.max_tokens || ''} onChange={e => updateModel(idx, 'max_tokens', e.target.value)} onBlur={() => { const cur = models[idx]; if (cur && (!cur.max_tokens || String(cur.max_tokens).trim() === '')) refreshResolvedMaxOutput(cur) }} min={1} max={131072} placeholder="自动" className="border rounded px-2 py-1 text-sm w-24 bg-white dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200" />
+                  {(!m.max_tokens || String(m.max_tokens).trim() === '') && resolvedMaxOutput[m.id] && (
+                    <span className={`text-xs ${resolvedMaxOutput[m.id].source === 'fallback' ? 'text-amber-600 dark:text-amber-400' : 'text-gray-500 dark:text-gray-400'}`} title="留空时自动查询模型支持的最大输出长度；thinking 模型的思考与答案共用此预算，过小会导致输出截断">
+                      自动：{resolvedMaxOutput[m.id].value}{resolvedMaxOutput[m.id].source === 'fallback' ? '（查询失败，回退默认）' : ''}
+                    </span>
+                  )}
                 </div>
                 {m.tripped !== undefined && (
                   <div className="mt-2 flex items-center gap-3 text-xs">
@@ -501,7 +535,7 @@ export default function Settings() {
                     </span>
                     <span className="text-gray-400 dark:text-gray-500">调用 {m.total_calls || 0} 次</span>
                     <span className="text-gray-400 dark:text-gray-500">失败 {(m.failures_in_window || 0)} 次</span>
-                    {m.last_error && <span className="text-red-400 truncate max-w-48" title={m.last_error}>{m.last_error}</span>}
+                    {m.last_error && (m.tripped || (m.failures_in_window || 0) > 0) && <span className="text-red-400 truncate max-w-48" title={`最近错误：${m.last_error}`}>最近错误：{m.last_error}</span>}
                   </div>
                 )}
                 {testResults[m.id] && (
@@ -554,6 +588,14 @@ export default function Settings() {
             <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={recDup} onChange={e => { setRecDup(e.target.checked); markDirty() }} className="rounded" /> record_stage1_duplicates（记录近重复对到侧车）</label></div>
             <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={pipelineDebug} onChange={e => { setPipelineDebug(e.target.checked); markDirty() }} className="rounded" /> pipeline_debug（性能剖析 + VLM 时序图）</label>
               <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 ml-6">开启后任务结束于 work_dir/log 写入 pipeline_profile.json、vlm_timing.json、vlm_timing.png、vlm_http_trace.txt、vlm_timing_summary.json</p>
+            </div>
+            <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={chainDump} onChange={e => { setChainDump(e.target.checked); markDirty() }} className="rounded" /> vlm_chain_dump（VLM 校验失败对话链转储，排查用）</label>
+              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 ml-6">开启后，VLM 校验链最终失败时会把完整对话链（图片 base64 已剔除）追写到下方路径的 JSONL 文件，便于定位模型输出问题</p>
+              {chainDump && (
+                <div className="mt-2 ml-6">
+                  <input type="text" value={chainDumpPath} onChange={e => { setChainDumpPath(e.target.value); markDirty() }} placeholder="logs/vlm_validation_chain.jsonl" className={inputCls} />
+                </div>
+              )}
             </div>
           </div>
         </section>

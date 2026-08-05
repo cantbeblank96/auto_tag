@@ -178,15 +178,23 @@ export default function Database() {
         setRecResult(null)
       } else {
         const res = await api.clearDuplicates({})
-        showMsg(
-          res.removed
-            ? `已清空近重复侧车：${res.file}`
-            : '近重复侧车文件本就不存在，无需删除',
-        )
+        const before = res.before_rows ?? 0
+        if (!res.existed) {
+          showMsg('近重复侧车文件本就不存在，无需删除')
+        } else if ((res.after_rows ?? 0) === 0) {
+          showMsg(
+            `已清空近重复侧车（${before} → 0 条）${res.removed ? '，文件已删除' : '（表已清空，文件暂未删除）'}：${res.file}`,
+          )
+        } else {
+          showMsg(`清空未完成：仍剩 ${res.after_rows} 条 → ${res.file}`)
+        }
         setDupResult(null)
       }
       setClearDialog(null)
-      await loadStats()
+      // 先结束按钮忙态，再刷新统计（大库 stats 可能较慢，避免像「一直清空不了」）
+      setClearBusy(false)
+      void loadStats()
+      return
     } catch (e: any) {
       showMsg(`清空失败: ${e.message}`)
     } finally {

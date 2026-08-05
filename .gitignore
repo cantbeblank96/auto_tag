@@ -39,6 +39,7 @@ output/*.json
 failed_images.json
 web_job_history.json
 auto_tag_db_build_snapshot.json
+results/
 
 # ============================================================
 # Configuration & secrets（勿提交真实密钥）
@@ -59,6 +60,7 @@ auto_tag/config.json
 .vscode/
 .cursor/
 .cursorignore
+.qoderignore
 *.swp
 *~
 .DS_Store

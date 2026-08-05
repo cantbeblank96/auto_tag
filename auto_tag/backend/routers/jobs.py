@@ -2,11 +2,27 @@ import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from auto_tag.backend.job_runner import get_job, get_job_logs, get_server_started_at, list_jobs, submit_job
+from auto_tag.backend.job_runner import (
+    delete_jobs,
+    get_job,
+    get_job_logs,
+    get_server_started_at,
+    job_log_file,
+    list_jobs,
+    read_failed_images,
+    rerun_failed_job,
+    submit_job,
+)
 from auto_tag.core.config import settings
-from auto_tag.core.pipeline import PipelineConfig, normalize_work_dir
+from auto_tag.core.pipeline import (
+    PipelineConfig,
+    _read_image_list,
+    build_image_filter_spec,
+    normalize_work_dir,
+)
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -46,6 +62,19 @@ class JobCreate(BaseModel):
     skip_if_in_db: bool = True
     pipeline_debug: Optional[bool] = None
 
+    image_suffixes: Optional[List[str]] = Field(
+        default=None,
+        description="后缀过滤（仅作用于 input_dirs 扫描）；如 [\".jpg\", \".png\"]，留空 = 不过滤",
+    )
+    image_name_regex: Optional[str] = Field(
+        default=None,
+        description="文件名正则过滤；非空时优先于 image_suffixes",
+    )
+    filter_ignore_case: bool = Field(default=True, description="过滤时忽略大小写")
+    filter_match_full_path: bool = Field(
+        default=False, description="正则匹配完整路径；False 时仅匹配文件名"
+    )
+
     @model_validator(mode="before")
     @classmethod
     def _legacy_output_dir_key(cls, data: Any) -> Any:
@@ -69,6 +98,10 @@ def _to_pipeline_config(body: JobCreate) -> PipelineConfig:
     return PipelineConfig(
         input_dirs=body.input_dirs,
         image_ls_files=body.image_ls_files,
+        image_suffixes=body.image_suffixes,
+        image_name_regex=body.image_name_regex,
+        filter_ignore_case=body.filter_ignore_case,
+        filter_match_full_path=body.filter_match_full_path,
         work_dir=wd,
         rotate_angle=body.rotate_angle,
         b_yuv_image=body.b_yuv_image,
@@ -89,6 +122,28 @@ def create_job(body: JobCreate) -> Dict[str, Any]:
         raise HTTPException(
             status_code=400, detail="Provide input_dirs or image_ls_files"
         )
+    # 过滤条件提前校验：正则非法 / 后缀全部无效 → 400
+    try:
+        build_image_filter_spec(
+            image_suffixes=body.image_suffixes,
+            image_name_regex=body.image_name_regex,
+            filter_ignore_case=body.filter_ignore_case,
+            filter_match_full_path=body.filter_match_full_path,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    # image_ls 文件提前校验：不存在 / 头部行非法 → 400
+    for f_path in body.image_ls_files:
+        if not os.path.isfile(f_path):
+            raise HTTPException(
+                status_code=400, detail=f"image_ls 文件不存在：{f_path}"
+            )
+        try:
+            _read_image_list(f_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400, detail=f"image_ls 文件 {f_path} 解析失败：{e}"
+            ) from e
     cfg = _to_pipeline_config(body)
     try:
         job_id = submit_job(cfg)
@@ -121,6 +176,7 @@ def job_status(job_id: str) -> Dict[str, Any]:
         "failed_so_far": j.get("failed_so_far", 0),
         "skip_in_db": j.get("skip_in_db", 0),
         "vlm_calls": j.get("vlm_calls", 0),
+        "vlm_failed": j.get("vlm_failed", 0),
         "new_centers": j.get("new_centers", 0),
         "stage1_skips": j.get("stage1_skips", 0),
         "stage2_joins": j.get("stage2_joins", 0),
@@ -137,3 +193,51 @@ def job_logs(job_id: str, tail: int = 200) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Job not found")
     lines = get_job_logs(job_id, tail=tail)
     return {"job_id": job_id, "lines": lines}
+
+
+@router.get("/{job_id}/logs/download")
+def job_logs_download(job_id: str) -> FileResponse:
+    """下载任务完整日志文件（work_dir/log/jobs/job_{job_id}.log）。"""
+    j = get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+    path = job_log_file(job_id)
+    if not path or not os.path.isfile(path):
+        raise HTTPException(
+            status_code=404,
+            detail="该任务日志文件不存在（日志落盘于 v0.0.5 后启用，历史任务可能无日志）",
+        )
+    return FileResponse(
+        path,
+        media_type="text/plain; charset=utf-8",
+        filename=f"job_{job_id[:8]}.log",
+    )
+
+
+@router.post("/{job_id}/rerun_failed")
+def job_rerun_failed(job_id: str) -> Dict[str, Any]:
+    """单独重跑该任务的失败图片（新建一个仅含失败列表的任务）。"""
+    if not get_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    try:
+        new_job_id = rerun_failed_job(job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+    return {"job_id": new_job_id, "source_job_id": job_id,
+            "failed_count": len(read_failed_images(job_id))}
+
+
+class JobsDeleteRequest(BaseModel):
+    job_ids: List[str] = Field(default_factory=list)
+
+
+@router.delete("")
+def delete_job_records_api(body: JobsDeleteRequest) -> Dict[str, Any]:
+    """批量删除任务记录（仅删后端记录，不删 work_dir 产物）；运行中任务拒绝删除。"""
+    if not body.job_ids:
+        raise HTTPException(status_code=400, detail="job_ids 不能为空")
+    return delete_jobs(body.job_ids)

@@ -232,6 +232,28 @@ class VectorDB:
                 break
         return out
 
+    def iter_id_metas(self, *, batch_size: int = 500) -> List[Tuple[str, Dict[str, Any]]]:
+        """返回全部 (doc_id, metadata)（分批拉取后合并），供按 id 回填等场景使用。"""
+        n = self.count()
+        out: List[Tuple[str, Dict[str, Any]]] = []
+        offset = 0
+        while offset < n:
+            r = self.collection.get(
+                limit=min(batch_size, n - offset),
+                offset=offset,
+                include=["metadatas"],
+            )
+            ids = r.get("ids") or []
+            metas = r.get("metadatas") or []
+            for i, doc_id in enumerate(ids):
+                m = metas[i] if i < len(metas) else None
+                if m:
+                    out.append((str(doc_id), m))
+            offset += len(ids)
+            if not ids:
+                break
+        return out
+
     def update_document_metadata(self, doc_id: str, metadata: Dict[str, Any]) -> None:
         self.collection.update(ids=[doc_id], metadatas=[metadata])
 

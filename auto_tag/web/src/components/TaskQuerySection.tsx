@@ -15,6 +15,15 @@ export default function TaskQuerySection() {
   const [sortDesc, setSortDesc] = useState(true)
   const [serverStartedAt, setServerStartedAt] = useState<number | null>(null)
   const [nowSec, setNowSec] = useState(() => Date.now() / 1000)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [msg, setMsg] = useState('')
+  const [confirmDialog, setConfirmDialog] = useState<null | { kind: 'selected' | 'all'; jobIds: string[] }>(null)
+  const [deleting, setDeleting] = useState(false)
+
+  const showMsg = (text: string) => {
+    setMsg(text)
+    window.setTimeout(() => setMsg(''), 6000)
+  }
 
   const loadJobs = () => {
     setLoading(true)
@@ -22,9 +31,38 @@ export default function TaskQuerySection() {
       .then(resp => {
         setJobs(resp.jobs || [])
         setServerStartedAt(resp.server_started_at ?? null)
+        // 清理已不存在/不可选的勾选项
+        setSelected(prev => {
+          const ids = new Set(resp.jobs.map(j => j.job_id))
+          return new Set([...prev].filter(id => ids.has(id)))
+        })
       })
       .catch(() => setJobs([]))
       .finally(() => setLoading(false))
+  }
+
+  const selectable = jobs.filter(j => j.status !== 'running' && j.status !== 'queued')
+  const allSelected = selectable.length > 0 && selectable.every(j => selected.has(j.job_id))
+
+  const toggleAll = () => {
+    setSelected(allSelected ? new Set() : new Set(selectable.map(j => j.job_id)))
+  }
+
+  const doDelete = (jobIds: string[]) => {
+    if (jobIds.length === 0) return
+    setDeleting(true)
+    api.deleteJobs(jobIds)
+      .then(resp => {
+        const n = resp.deleted?.length || 0
+        const rejected = resp.rejected?.length || 0
+        showMsg(
+          `已删除 ${n} 条任务记录${rejected > 0 ? `；${rejected} 条运行中/排队中任务已跳过` : ''}`,
+        )
+        setConfirmDialog(null)
+        loadJobs()
+      })
+      .catch((err: any) => showMsg(`删除失败: ${err?.message || err}`))
+      .finally(() => setDeleting(false))
   }
 
   useEffect(() => {
@@ -74,6 +112,23 @@ export default function TaskQuerySection() {
         >
           {sortDesc ? '最新优先' : '最早优先'}
         </button>
+        <button
+          type="button"
+          disabled={selected.size === 0}
+          onClick={() => setConfirmDialog({ kind: 'selected', jobIds: [...selected] })}
+          className="px-3 py-1.5 text-sm border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 rounded hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          删除所选{selected.size > 0 ? ` (${selected.size})` : ''}
+        </button>
+        <button
+          type="button"
+          disabled={selectable.length === 0}
+          onClick={() => setConfirmDialog({ kind: 'all', jobIds: selectable.map(j => j.job_id) })}
+          className="px-3 py-1.5 text-sm border border-red-300 dark:border-red-700 text-red-600 dark:text-red-400 rounded hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          清空全部
+        </button>
+        {msg && <span className="text-xs text-gray-500 dark:text-gray-400">{msg}</span>}
       </div>
 
       {sorted.length === 0 && !loading && (
@@ -89,6 +144,15 @@ export default function TaskQuerySection() {
           <table className="w-full text-sm border-collapse">
             <thead>
               <tr className="bg-gray-50 dark:bg-gray-900">
+                <th className="px-3 py-2 w-8">
+                  <input
+                    type="checkbox"
+                    title="全选/取消全选（不含运行中/排队中）"
+                    checked={allSelected}
+                    onChange={toggleAll}
+                    disabled={selectable.length === 0}
+                  />
+                </th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">任务 ID</th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">状态</th>
                 <th className="text-left px-3 py-2 text-gray-600 dark:text-gray-400 font-medium">创建时间</th>
@@ -112,6 +176,24 @@ export default function TaskQuerySection() {
                 const ts = j.created_at ? new Date(j.created_at * 1000).toLocaleString() : '-'
                 return (
                   <tr key={j.job_id} className="border-t border-gray-100 dark:border-gray-700">
+                    <td className="px-3 py-2 w-8">
+                      {j.status === 'running' || j.status === 'queued' ? (
+                        <span className="text-[10px] text-gray-400" title="运行中/排队中任务不可删除">-</span>
+                      ) : (
+                        <input
+                          type="checkbox"
+                          checked={selected.has(j.job_id)}
+                          onChange={() => {
+                            setSelected(prev => {
+                              const next = new Set(prev)
+                              if (next.has(j.job_id)) next.delete(j.job_id)
+                              else next.add(j.job_id)
+                              return next
+                            })
+                          }}
+                        />
+                      )}
+                    </td>
                     <td className="px-3 py-2 text-xs font-mono text-gray-500 dark:text-gray-400">
                       {j.job_id.slice(0, 12)}
                     </td>
@@ -143,7 +225,7 @@ export default function TaskQuerySection() {
                     </td>
                     <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">
                       {vlmDen > 0
-                        ? `${j.vlm_calls || 0}/${vlmTotal > 0 ? vlmTotal : vlmDen} (${(((j.vlm_calls || 0) / vlmDen) * 100).toFixed(0)}%)`
+                        ? `${j.vlm_calls || 0}/${vlmTotal > 0 ? vlmTotal : vlmDen} (${(((j.vlm_calls || 0) / vlmDen) * 100).toFixed(0)}%)${(j.vlm_failed || 0) > 0 ? ` · 失败${j.vlm_failed}` : ''}`
                         : j.vlm_calls || 0}
                     </td>
                     <td className="px-3 py-2 text-right text-gray-600 dark:text-gray-400">
@@ -159,6 +241,51 @@ export default function TaskQuerySection() {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* 删除确认弹窗（与数据库页「清空」弹窗风格一致） */}
+      {confirmDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-jobs-dialog-title"
+            className="w-full max-w-md rounded-xl border border-gray-200 bg-white p-5 shadow-xl dark:border-gray-600 dark:bg-gray-800"
+          >
+            <h3
+              id="delete-jobs-dialog-title"
+              className="text-base font-semibold text-gray-900 dark:text-gray-100"
+            >
+              {confirmDialog.kind === 'all' ? '确认清空全部任务记录？' : '确认删除所选任务？'}
+            </h3>
+            <div className="mt-3 space-y-2 text-sm leading-relaxed text-gray-600 dark:text-gray-300">
+              <p>
+                将删除
+                <strong className="font-medium text-gray-800 dark:text-gray-100"> {confirmDialog.jobIds.length} 条 </strong>
+                任务记录（仅删后端历史记录，work_dir 下的日志/索引产物不会被删除）。
+              </p>
+              <p>此操作不可撤销。</p>
+            </div>
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={() => setConfirmDialog(null)}
+                className="rounded-lg border border-gray-300 px-4 py-2 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={() => doDelete(confirmDialog.jobIds)}
+                className="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+              >
+                {deleting ? '正在删除…' : '确认删除'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
