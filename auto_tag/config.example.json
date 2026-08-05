@@ -68,6 +68,10 @@
         "face_attribute": {
             "enabled": false,
             "model_path": "/path/to/kevin_sdk/models/attribute/M_FaceAttribute_xxx.model"
+        },
+        "face_crop": {
+            "enabled": false,
+            "max_faces": 2
         }
     },
     "vlm_chain_dump": false,

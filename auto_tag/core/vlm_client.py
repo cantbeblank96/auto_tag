@@ -285,6 +285,26 @@ def resolve_model_max_output_tokens(
         return fallback
 
 
+def resolve_max_tokens_for_model(model: Dict[str, Any]) -> int:
+    """max_tokens 预算解析：优先级 模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限。
+
+    thinking 模型的 reasoning 与 content 共用预算，调用方应给足余量防截断；
+    智能分析等辅助调用与标注主链路使用同一解析逻辑，保持与设置页配置一致。
+    """
+    from auto_tag.core.config import settings as _settings
+
+    model_max_tokens = model.get("max_tokens")
+    if model_max_tokens not in (None, ""):
+        try:
+            return max(1, min(131072, int(model_max_tokens)))
+        except (TypeError, ValueError):
+            pass
+    cfg_max_tokens = getattr(_settings, "vlm_max_tokens", None)
+    if cfg_max_tokens:
+        return max(1, min(131072, int(cfg_max_tokens)))
+    return resolve_model_max_output_tokens(model)
+
+
 def _extract_content(response_json: Dict[str, Any]) -> str:
     """从 OpenAI 响应中提取文本内容。"""
     try:
@@ -571,19 +591,41 @@ class VLMClient:
                     "text": (
                         "The following are OBJECTIVE MEASUREMENTS from annotation tools "
                         "(e.g. face detection) run on the image to annotate. Each block is "
-                        "labeled [Tool measurement: <tool_name>] with a JSON payload; use "
-                        "them as factual references where relevant:"
+                        "labeled [Tool measurement: <tool_name>] with a JSON payload; some "
+                        "tools also attach cropped images right after their block (labeled "
+                        "[Tool crop: <tool_name> ...]). Use them as factual references where "
+                        "relevant:"
                     ),
                 }
             )
             for tool_name, result in tool_results.items():
+                # `_images` 为工具产出的裁剪图（如 face_crop 转正人脸），
+                # 取出后以独立图片块注入，其余字段作为 JSON 文本
+                payload = dict(result) if isinstance(result, dict) else {"result": result}
+                images_b64 = payload.pop("_images", None) or []
                 content.append(
                     {
                         "type": "text",
                         "text": f"[Tool measurement: {tool_name}]\n"
-                        + json.dumps(result, ensure_ascii=False),
+                        + json.dumps(payload, ensure_ascii=False),
                     }
                 )
+                for k, b64 in enumerate(images_b64, start=1):
+                    content.append(
+                        {
+                            "type": "text",
+                            "text": (
+                                f"[Tool crop: {tool_name} face #{k}] aligned & cropped "
+                                "face from the image to annotate, for detail inspection:"
+                            ),
+                        }
+                    )
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        }
+                    )
         if examples or tool_results:
             content.append(
                 {
@@ -705,20 +747,7 @@ class VLMClient:
         http_timeout = max(5.0, min(600.0, http_timeout))
         # thinking 模型的 reasoning 与 content 共用 max_tokens 预算，给足余量防截断；
         # 优先级：模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限
-        model_max_tokens = model.get("max_tokens")
-        if model_max_tokens not in (None, ""):
-            try:
-                model_max_tokens = max(1, min(131072, int(model_max_tokens)))
-            except (TypeError, ValueError):
-                model_max_tokens = None
-        if model_max_tokens:
-            max_tokens = model_max_tokens
-        else:
-            cfg_max_tokens = getattr(_settings, "vlm_max_tokens", None)
-            if cfg_max_tokens:
-                max_tokens = max(1, min(131072, int(cfg_max_tokens)))
-            else:
-                max_tokens = resolve_model_max_output_tokens(model)
+        max_tokens = resolve_max_tokens_for_model(model)
         t0 = _time.perf_counter()
         thread_name = __import__("threading").current_thread().name
         try:
@@ -1151,6 +1180,8 @@ class VLMClient:
         tools_note = (
             "\n\nObjective measurements from annotation tools are provided BEFORE the image "
             "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "
+            "Some tools also attach cropped images right after their block (each labeled "
+            "[Tool crop: <tool_name> ...], e.g. aligned & cropped faces for detail inspection). "
             "For related fields, use these measurements as factual references, but always "
             "make the final judgement based on the image itself."
             if with_tools_note
@@ -1189,6 +1220,8 @@ Return ONLY valid JSON. Do not include explanations or markdown fences."""
         tools_note = (
             "\n\nObjective measurements from annotation tools are provided BEFORE the image "
             "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "
+            "Some tools also attach cropped images right after their block (each labeled "
+            "[Tool crop: <tool_name> ...], e.g. aligned & cropped faces for detail inspection). "
             "For related fields, use these measurements as factual references, but always "
             "make the final judgement based on the image itself."
             if with_tools_note

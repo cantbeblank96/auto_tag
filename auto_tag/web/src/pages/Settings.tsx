@@ -745,6 +745,24 @@ export default function Settings() {
                   <button onClick={() => toggleToolEnabled(t.name)} className={`px-2 py-0.5 text-xs rounded ${t.enabled ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' : 'bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400'}`}>{t.enabled ? '启用' : '停用'}</button>
                 </div>
                 <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{t.description}</p>
+                {t.name === 'face_crop' && (
+                  <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 mt-2">
+                    注入前 N 大人脸
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={annotationToolsCfg?.face_crop?.max_faces ?? 2}
+                      onChange={e => {
+                        const v = Math.max(1, Math.min(8, parseInt(e.target.value, 10) || 2))
+                        setAnnotationToolsCfg(prev => ({ ...prev, face_crop: { ...(prev.face_crop || {}), max_faces: v } }))
+                        markDirty()
+                      }}
+                      className="w-16 border rounded px-2 py-0.5 text-xs dark:bg-gray-800 dark:border-gray-600 dark:text-gray-200"
+                    />
+                    （按脸框最长边降序选取，align 裁剪后以图片注入）
+                  </label>
+                )}
                 {t.model_path && <p className="text-[10px] font-mono text-gray-400 dark:text-gray-500 mt-1 truncate" title={t.model_path}>{t.model_path}</p>}
               </div>
             ))}

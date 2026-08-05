@@ -62,7 +62,10 @@ def _extract_json_object(content: str) -> Dict[str, Any]:
 @router.post("/analyze")
 def analyze_tools_for_questions(body: AnalyzeBody) -> Dict[str, Any]:
     """由 VLM 分析问题定义，建议每个问题应绑定的标注工具。"""
-    from auto_tag.core.vlm_client import openai_chat_completion
+    from auto_tag.core.vlm_client import (
+        openai_chat_completion,
+        resolve_max_tokens_for_model,
+    )
 
     questions = body.questions or {}
     if not questions:
@@ -106,8 +109,9 @@ Only use tool names from the list above. Do not include any other text."""
             api_key=model.get("api_key"),
             base_url=model.get("base_url"),
             timeout=60,
-            # thinking 模型的 reasoning 与 content 共用预算，给足余量防截断
-            max_tokens=16384,
+            # 与设置页配置一致：模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询；
+            # thinking 模型的 reasoning 与 content 共用预算，防截断
+            max_tokens=resolve_max_tokens_for_model(model),
         )
     except HTTPException:
         raise
