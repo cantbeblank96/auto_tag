@@ -39,6 +39,88 @@ def encode_pil_image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
+def resize_image_for_vlm(image: Image.Image, max_side: int) -> Image.Image:
+    """待标注图送入 VLM 前的缩放：最长边缩到 max_side（只降不升）；
+    max_side<=0（不缩放）或无需缩放时返回原图。"""
+    try:
+        max_side = int(max_side or 0)
+    except (TypeError, ValueError):
+        return image
+    if max_side <= 0:
+        return image
+    w, h = image.size
+    side = max(w, h)
+    if side <= max_side:
+        return image
+    scale = float(max_side) / float(side)
+    return image.resize(
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        Image.LANCZOS,
+    )
+
+
+# ── image-in-prompt：questions 中 examples 参考样图 ────────────────
+
+# 样图 base64 缓存：(绝对路径, mtime, max_side) -> base64（加载失败的负结果也缓存，避免重复警告）
+_EXAMPLE_IMAGE_CACHE: Dict[Tuple[str, float, int], Optional[str]] = {}
+_EXAMPLE_IMAGE_CACHE_LOCK = threading.Lock()
+# 缺失样图告警去重：每路径仅告警一次，避免大批量任务刷屏
+_EXAMPLE_IMAGE_WARNED: set = set()
+
+
+def resolve_example_path(path: str) -> str:
+    """解析 questions examples 中的样图路径：绝对路径直接用；相对路径基于 config.json 所在目录。"""
+    p = os.path.expanduser(str(path or ""))
+    if os.path.isabs(p):
+        return p
+    from auto_tag.core.config import config_json_path
+
+    return os.path.normpath(os.path.join(os.path.dirname(config_json_path), p))
+
+
+def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
+    """加载参考样图 → RGB → 最长边缩放到 max_side → JPEG base64；失败返回 None。"""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    key = (path, mtime, int(max_side))
+    with _EXAMPLE_IMAGE_CACHE_LOCK:
+        if key in _EXAMPLE_IMAGE_CACHE:
+            return _EXAMPLE_IMAGE_CACHE[key]
+    b64: Optional[str] = None
+    try:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            side = max(w, h)
+            if side > max_side:
+                scale = float(max_side) / float(side)
+                im = im.resize(
+                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+                    Image.LANCZOS,
+                )
+            buffered = io.BytesIO()
+            im.save(buffered, format="JPEG", quality=85)
+            b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    except Exception as e:
+        logger.warning("Failed to load reference example image %s: %s", path, e)
+        b64 = None
+    with _EXAMPLE_IMAGE_CACHE_LOCK:
+        _EXAMPLE_IMAGE_CACHE[key] = b64
+    return b64
+
+
+def _example_value_sort_key(value: Any) -> Tuple[int, float, str]:
+    """样图按档位值排序：数值型按数值，其余按字符串，保证 prompt 中档位有序。"""
+    try:
+        return (0, float(value), str(value))
+    except (TypeError, ValueError):
+        return (1, 0.0, str(value))
+
+
 class AllModelsFailedError(Exception):
     """所有模型均失败时抛出。"""
     pass
@@ -437,20 +519,62 @@ class VLMClient:
 
     # ── 多轮对话式 API 调用 ─────────────────────────────
 
-    def _messages_with_image(self, image: Image.Image, text: str) -> List[Dict[str, Any]]:
-        base64_image = encode_pil_image_to_base64(image)
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": text},
+    def _messages_with_image(
+        self,
+        image: Image.Image,
+        text: str,
+        examples: Optional[List[Tuple[str, str, str]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """构造首轮消息：examples 为 (维度, 档位值, base64) 参考样图。
+
+        编排原则：跨请求保持相同的内容（prompt 文本 + 参考样图）放消息前部，
+        每请求不同的待标注图放最后，使前缀稳定，提升推理侧 prefix/KV cache 命中率。
+        """
+        content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+        if examples:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "Before the image to annotate, the following REFERENCE EXAMPLES "
+                        "are provided for calibration, each labeled with the dimension "
+                        "and value it demonstrates:"
+                    ),
+                }
+            )
+            for qkey, value, b64 in examples:
+                content.append(
+                    {"type": "text", "text": f"[Reference example: {qkey} = {value}]"}
+                )
+                content.append(
                     {
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                    },
-                ],
-            }
-        ]
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    }
+                )
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "The reference examples above are ONLY for aligning your judgement "
+                        "scale with the demonstrated values. The LAST image in this message "
+                        "is the one to annotate:"
+                    ),
+                }
+            )
+        from auto_tag.core.config import settings as _settings
+
+        main_image = resize_image_for_vlm(
+            image, getattr(_settings, "vlm_image_max_side", 0)
+        )
+        base64_image = encode_pil_image_to_base64(main_image)
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+            },
+        )
+        return [{"role": "user", "content": content}]
 
     @staticmethod
     def _parse_json_content(content: str) -> Dict[str, Any]:
@@ -618,6 +742,7 @@ class VLMClient:
         *,
         keys: Optional[List[str]] = None,
         profile: Optional["PipelineProfile"] = None,
+        examples: Optional[List[Tuple[str, str, str]]] = None,
     ) -> Dict[str, Any]:
         """首轮带图提问；JSON/校验失败则在同一会话中文字追问改正（不再重传图片）。"""
         from auto_tag.core.config import settings
@@ -627,7 +752,7 @@ class VLMClient:
         )
         max_turns = 1 + max_corr
         messages: List[Dict[str, Any]] = self._messages_with_image(
-            image, initial_prompt
+            image, initial_prompt, examples=examples
         )
         last_raw = ""
         last_parsed: Optional[Dict[str, Any]] = None
@@ -754,12 +879,14 @@ class VLMClient:
         image: Image.Image,
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
+        examples = self._collect_examples(None)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt(),
+            self._generate_prompt(with_examples_note=bool(examples)),
             keys=None,
             profile=profile,
+            examples=examples,
         )
 
     def _call_single_model_subset(
@@ -769,12 +896,14 @@ class VLMClient:
         keys: List[str],
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
+        examples = self._collect_examples(keys)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt_for_keys(keys),
+            self._generate_prompt_for_keys(keys, with_examples_note=bool(examples)),
             keys=keys,
             profile=profile,
+            examples=examples,
         )
 
     # ── 旧单模型 API 调用（保留向后兼容） ──────────────
@@ -785,12 +914,14 @@ class VLMClient:
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
+        examples = self._collect_examples(None)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt(),
+            self._generate_prompt(with_examples_note=bool(examples)),
             keys=None,
             profile=profile,
+            examples=examples,
         )
 
     def _annotate_subset_api(
@@ -800,12 +931,14 @@ class VLMClient:
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
+        examples = self._collect_examples(keys)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt_for_keys(keys),
+            self._generate_prompt_for_keys(keys, with_examples_note=bool(examples)),
             keys=keys,
             profile=profile,
+            examples=examples,
         )
 
     # ── Prompt 生成 ────────────────────────────────────
@@ -818,6 +951,62 @@ class VLMClient:
         if keys is None:
             return qs
         return {k: qs.get(k, {}) for k in keys if k in qs}
+
+    @classmethod
+    def _prompt_schema_dict(cls, keys: Optional[List[str]] = None) -> Dict[str, Any]:
+        """写入 prompt 的 schema：examples 文件路径替换为占位说明，避免路径进入模型上下文。"""
+        schema = cls._schema_dict_for_keys(keys)
+        out: Dict[str, Any] = {}
+        for k, details in schema.items():
+            if isinstance(details, dict) and details.get("examples"):
+                d = dict(details)
+                d["examples"] = (
+                    "<reference images provided after the main image, "
+                    "labeled [Reference example: key = value]>"
+                )
+                out[k] = d
+            else:
+                out[k] = details
+        return out
+
+    @classmethod
+    def _collect_examples(
+        cls, keys: Optional[List[str]] = None
+    ) -> List[Tuple[str, str, str]]:
+        """从 questions 的 examples 字段收集 (维度, 档位值, base64) 参考样图。
+
+        路径支持绝对路径或相对 config.json 的相对路径；加载失败的样图跳过并告警，
+        不阻断标注流程。
+        """
+        from auto_tag.core.config import settings
+
+        max_side = max(
+            128, int(getattr(settings, "vlm_example_image_max_side", 512) or 512)
+        )
+        schema = cls._schema_dict_for_keys(keys)
+        out: List[Tuple[str, str, str]] = []
+        for qkey, details in schema.items():
+            if not isinstance(details, dict):
+                continue
+            examples = details.get("examples")
+            if not isinstance(examples, dict) or not examples:
+                continue
+            for value in sorted(examples.keys(), key=_example_value_sort_key):
+                path = str(examples[value] or "")
+                resolved = resolve_example_path(path)
+                b64 = load_example_image_base64(resolved, max_side)
+                if b64 is None:
+                    if resolved not in _EXAMPLE_IMAGE_WARNED:
+                        _EXAMPLE_IMAGE_WARNED.add(resolved)
+                        logger.warning(
+                            "Reference example unavailable: %s=%s (path=%s)",
+                            qkey,
+                            value,
+                            path,
+                        )
+                    continue
+                out.append((qkey, str(value), b64))
+        return out
 
     @staticmethod
     def _example_value_for_question(details: Dict[str, Any]) -> Any:
@@ -853,11 +1042,19 @@ class VLMClient:
             for key, details in schema.items()
         }
 
-    def _generate_prompt(self) -> str:
-        schema_dict = self._schema_dict_for_keys()
+    def _generate_prompt(self, *, with_examples_note: bool = False) -> str:
+        schema_dict = self._prompt_schema_dict()
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(), indent=4, ensure_ascii=False
+        )
+        examples_note = (
+            "\n\nSome fields provide reference example images BEFORE the image to annotate "
+            "(each labeled [Reference example: key = value]). For those fields, compare "
+            "visually against the reference examples and align your scale/judgement with them. "
+            "The LAST image in the message is always the one to annotate."
+            if with_examples_note
+            else ""
         )
         return f"""Please analyze this image and provide a structured JSON output describing it.
 
@@ -865,15 +1062,25 @@ You must strictly follow this JSON schema (field definitions):
 {schema_json}
 
 Example of a valid response (match this structure — scalar values at top level, no nested objects for numbers):
-{example_json}
+{example_json}{examples_note}
 
 Return ONLY valid JSON. Do not include explanations or markdown fences."""
 
-    def _generate_prompt_for_keys(self, keys: List[str]) -> str:
-        schema_dict = self._schema_dict_for_keys(keys)
+    def _generate_prompt_for_keys(
+        self, keys: List[str], *, with_examples_note: bool = False
+    ) -> str:
+        schema_dict = self._prompt_schema_dict(keys)
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(keys), indent=4, ensure_ascii=False
+        )
+        examples_note = (
+            "\n\nSome fields provide reference example images BEFORE the image to annotate "
+            "(each labeled [Reference example: key = value]). For those fields, compare "
+            "visually against the reference examples and align your scale/judgement with them. "
+            "The LAST image in the message is always the one to annotate."
+            if with_examples_note
+            else ""
         )
         return f"""Please analyze this image and provide a structured JSON output.
 
@@ -881,7 +1088,7 @@ You must strictly follow this JSON schema (only these keys):
 {schema_json}
 
 Example of a valid response:
-{example_json}
+{example_json}{examples_note}
 
 Return ONLY valid JSON. Do not include markdown fences."""
 
@@ -892,7 +1099,7 @@ Return ONLY valid JSON. Do not include markdown fences."""
         *,
         keys: Optional[List[str]] = None,
     ) -> str:
-        schema_dict = self._schema_dict_for_keys(keys)
+        schema_dict = self._prompt_schema_dict(keys)
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(keys), indent=4, ensure_ascii=False
@@ -924,7 +1131,7 @@ Do not include markdown or explanations."""
         *,
         keys: Optional[List[str]] = None,
     ) -> str:
-        schema_dict = self._schema_dict_for_keys(keys)
+        schema_dict = self._prompt_schema_dict(keys)
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(keys), indent=4, ensure_ascii=False

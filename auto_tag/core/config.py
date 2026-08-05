@@ -201,6 +201,20 @@ class Settings(BaseSettings):
         default_factory=_cfg_vlm_chain_dump_path,
         description="校验链转储文件路径；环境变量 VLM_CHAIN_DUMP 优先",
     )
+    vlm_example_image_max_side: int = Field(
+        default=max(128, min(1024, int(cfg.get("vlm_example_image_max_side", 512) or 512))),
+        description=(
+            "questions 中 examples 参考样图的最长边上限（像素）；"
+            "送入 VLM 前统一缩放，控制请求体积"
+        ),
+    )
+    vlm_image_max_side: int = Field(
+        default=max(0, min(8192, int(cfg.get("vlm_image_max_side", 0) or 0))),
+        description=(
+            "待标注图送入 VLM 前的最长边上限（像素）；0 = 不缩放、原图发送；"
+            "只降不升，可显著减小请求体积与推理耗时"
+        ),
+    )
 
     # Dynamic Questions
     questions: dict = Field(default=cfg.get("questions", {}), description="Dynamic questions for VLM structured output")
@@ -258,6 +272,10 @@ def reload_settings_from_disk() -> None:
         ),
         "vlm_chain_dump": _cfg_vlm_chain_dump(),
         "vlm_chain_dump_path": _cfg_vlm_chain_dump_path(),
+        "vlm_example_image_max_side": max(
+            128, min(1024, int(cfg.get("vlm_example_image_max_side", 512) or 512))
+        ),
+        "vlm_image_max_side": max(0, min(8192, int(cfg.get("vlm_image_max_side", 0) or 0))),
         "device": str(cfg.get("device", settings.device)),
         "questions": dict(cfg.get("questions") or {}),
         "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),

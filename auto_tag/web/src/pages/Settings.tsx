@@ -144,6 +144,8 @@ export default function Settings() {
   const [pipelineDebug, setPipelineDebug] = useState(false)
   const [chainDump, setChainDump] = useState(false)
   const [chainDumpPath, setChainDumpPath] = useState('logs/vlm_validation_chain.jsonl')
+  const [vlmImageMaxSide, setVlmImageMaxSide] = useState(0)
+  const [vlmExampleImageMaxSide, setVlmExampleImageMaxSide] = useState(512)
 
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
@@ -216,6 +218,8 @@ export default function Settings() {
       pipeline_debug: pipelineDebug,
       vlm_chain_dump: chainDump,
       vlm_chain_dump_path: chainDumpPath.trim() || 'logs/vlm_validation_chain.jsonl',
+      vlm_image_max_side: Math.max(0, Math.floor(vlmImageMaxSide || 0)),
+      vlm_example_image_max_side: Math.min(1024, Math.max(128, Math.floor(vlmExampleImageMaxSide || 512))),
       circuit_breaker: {
         time_window_seconds: cbTimeWindow,
         failure_rate_threshold: cbFailureThreshold,
@@ -224,7 +228,7 @@ export default function Settings() {
     }
   }, [
     questions, workDir, batchSize, tauDup, tauCls, recDup, models,
-    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, cbTimeWindow, cbFailureThreshold, cbCooldown,
+    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, vlmImageMaxSide, vlmExampleImageMaxSide, cbTimeWindow, cbFailureThreshold, cbCooldown,
   ])
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
@@ -260,6 +264,8 @@ export default function Settings() {
         setPipelineDebug(cfg.pipeline_debug ?? false)
         setChainDump(cfg.vlm_chain_dump ?? false)
         setChainDumpPath(cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl')
+        setVlmImageMaxSide(cfg.vlm_image_max_side ?? 0)
+        setVlmExampleImageMaxSide(cfg.vlm_example_image_max_side ?? 512)
         // Load questions
         const qs = cfg.questions || {}
         const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
@@ -309,6 +315,8 @@ export default function Settings() {
           pipeline_debug: cfg.pipeline_debug ?? false,
           vlm_chain_dump: cfg.vlm_chain_dump ?? false,
           vlm_chain_dump_path: cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl',
+          vlm_image_max_side: cfg.vlm_image_max_side ?? 0,
+          vlm_example_image_max_side: cfg.vlm_example_image_max_side ?? 512,
           duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
           vlm_models: loadedModels.map((m) => ({
             id: m.id,
@@ -579,6 +587,12 @@ export default function Settings() {
             </div>
             <div><label className={labelCls}>tau_dup（去重阈值）</label><input type="number" value={tauDup} onChange={e => { setTauDup(Number(e.target.value)); markDirty() }} min={0} max={1} step={0.01} className={inputCls} /></div>
             <div><label className={labelCls}>tau_cls（聚类阈值）</label><input type="number" value={tauCls} onChange={e => { setTauCls(Number(e.target.value)); markDirty() }} min={0} max={1} step={0.01} className={inputCls} /></div>
+            <div><label className={labelCls}>vlm_image_max_side（待标注图最长边）</label><input type="number" value={vlmImageMaxSide} onChange={e => { setVlmImageMaxSide(Number(e.target.value)); markDirty() }} min={0} max={8192} className={inputCls} />
+              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">待标注图送入 VLM 前按最长边缩放（只降不升）；0 = 不缩放、原图发送</p>
+            </div>
+            <div><label className={labelCls}>vlm_example_image_max_side（参考样图最长边）</label><input type="number" value={vlmExampleImageMaxSide} onChange={e => { setVlmExampleImageMaxSide(Number(e.target.value)); markDirty() }} min={128} max={1024} className={inputCls} />
+              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">questions 中 examples 参考样图送入 VLM 前的最长边上限（128~1024）</p>
+            </div>
             <div className="col-span-2"><label className={labelCls}>work_dir（工作根目录）</label>
               <input type="text" value={workDir} onChange={e => { setWorkDir(e.target.value); markDirty() }} className={inputCls} />
               <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
