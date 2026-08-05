@@ -8,7 +8,15 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from auto_tag.backend.routers import database, duplicates, health, jobs, models, records
+from auto_tag.backend.routers import (
+    annotation_tools,
+    database,
+    duplicates,
+    health,
+    jobs,
+    models,
+    records,
+)
 from auto_tag.constant import VERSION
 
 import logging
@@ -31,6 +39,7 @@ app.include_router(models.router, prefix="/api")
 app.include_router(records.router, prefix="/api")
 app.include_router(duplicates.router, prefix="/api")
 app.include_router(database.router, prefix="/api")
+app.include_router(annotation_tools.router, prefix="/api")
 
 
 @app.on_event("startup")

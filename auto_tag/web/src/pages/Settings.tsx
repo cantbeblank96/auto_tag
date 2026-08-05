@@ -21,6 +21,17 @@ interface QuestionEntry {
   max: string
   step: string
   freeformJson: string
+  tools: string[]
+}
+
+interface AnnotationToolStatus {
+  name: string
+  display_name: string
+  description: string
+  enabled: boolean
+  available: boolean
+  reason: string
+  model_path: string
 }
 
 interface ModelEntry {
@@ -59,7 +70,14 @@ type QuestionDetail = Record<string, any>
 function questionToDetail(q: QuestionEntry): QuestionDetail | null {
   if (!q.enabled) return null
   if (q._mode === 'freeform') {
-    try { return JSON.parse(q.freeformJson) } catch { return null }
+    try {
+      const obj = JSON.parse(q.freeformJson)
+      if (Array.isArray(q.tools) && q.tools.length) {
+        const existing = Array.isArray(obj.tools) ? obj.tools : []
+        obj.tools = Array.from(new Set([...existing, ...q.tools]))
+      }
+      return obj
+    } catch { return null }
   }
   const d: QuestionDetail = { description: q.description, type: q.type }
   if (q.type === 'category' && q.choices.trim()) {
@@ -70,15 +88,25 @@ function questionToDetail(q: QuestionEntry): QuestionDetail | null {
     if (q.max) d.max = q.max ? Number(q.max) : null
     if (q.type === 'float' && q.step) d.step = Number(q.step)
   }
+  if (Array.isArray(q.tools) && q.tools.length) d.tools = q.tools
   return d
 }
 
-function questionsToObject(entries: QuestionEntry[]): Record<string, any> {
+function questionsToObject(
+  entries: QuestionEntry[],
+  enabledTools?: Set<string>,
+): Record<string, any> {
   const questionsObj: Record<string, any> = {}
   for (const q of entries) {
     if (!q.key.trim()) continue
     const detail = questionToDetail(q)
-    if (detail) questionsObj[q.key.trim()] = detail
+    if (!detail) continue
+    // 全局关闭的工具：从所有问题绑定中移除
+    if (enabledTools && Array.isArray(detail.tools)) {
+      detail.tools = detail.tools.filter((t: any) => enabledTools.has(String(t)))
+      if (!detail.tools.length) delete detail.tools
+    }
+    questionsObj[q.key.trim()] = detail
   }
   return questionsObj
 }
@@ -94,11 +122,12 @@ function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
     max: detail.max != null ? String(detail.max) : '',
     step: detail.step != null ? String(detail.step) : '',
     freeformJson: JSON.stringify(detail, null, 2),
+    tools: Array.isArray(detail.tools) ? detail.tools.map(String) : [],
   }
 }
 
 function emptyQuestion(): QuestionEntry {
-  return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}' }
+  return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}', tools: [] }
 }
 
 function stableStringify(value: unknown): string {
@@ -150,6 +179,11 @@ export default function Settings() {
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
   const [questionSearch, setQuestionSearch] = useState('')
+  // 标注工具管理
+  const [annotationTools, setAnnotationTools] = useState<AnnotationToolStatus[]>([])
+  const [annotationToolsCfg, setAnnotationToolsCfg] = useState<Record<string, any>>({})
+  const [alignModelPaths, setAlignModelPaths] = useState<string[]>([])
+  const [analyzing, setAnalyzing] = useState(false)
   const baselineConfigRef = useRef<string>('')
   const [restartDialog, setRestartDialog] = useState<RestartDialogState>({
     open: false,
@@ -195,6 +229,12 @@ export default function Settings() {
     }
   }, [refreshModelStats])
 
+  const enabledToolNames = new Set(
+    Object.entries(annotationToolsCfg)
+      .filter(([k, v]) => k !== 'align_model_paths' && v && typeof v === 'object' && (v as any).enabled === true)
+      .map(([k]) => k),
+  )
+
   const buildConfigPayload = useCallback(() => {
     return {
       work_dir: workDir,
@@ -209,7 +249,8 @@ export default function Settings() {
         name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
         max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
       })),
-      questions: questionsToObject(questions),
+      questions: questionsToObject(questions, enabledToolNames),
+      annotation_tools: annotationToolsCfg,
       vlm_strategy: vlmStrategy,
       vlm_concurrency: vlmConcurrency,
       vlm_http_timeout: vlmHttpTimeout,
@@ -229,6 +270,7 @@ export default function Settings() {
   }, [
     questions, workDir, batchSize, tauDup, tauCls, recDup, models,
     vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, vlmImageMaxSide, vlmExampleImageMaxSide, cbTimeWindow, cbFailureThreshold, cbCooldown,
+    annotationToolsCfg,
   ])
 
   const showMsg = (text: string, type: 'success' | 'error' = 'success') => {
@@ -270,6 +312,28 @@ export default function Settings() {
         const qs = cfg.questions || {}
         const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
         setQuestions(loadedQuestions)
+        // Load annotation tools：开关以磁盘 config 为准，状态/描述从后端 API 合并
+        const rawToolsCfg = cfg.annotation_tools && typeof cfg.annotation_tools === 'object' ? cfg.annotation_tools : {}
+        setAnnotationToolsCfg(rawToolsCfg)
+        try {
+          const tres = await fetch('/api/annotation_tools')
+          if (tres.ok) {
+            const tdata = await tres.json()
+            const diskEnabled = (name: string) => {
+              const v = rawToolsCfg[name]
+              return !!(v && typeof v === 'object' && v.enabled === true)
+            }
+            setAnnotationTools(
+              (tdata.tools || []).map((t: any) => ({ ...t, enabled: diskEnabled(t.name) })),
+            )
+            setAlignModelPaths(Array.isArray(tdata.align_model_paths) ? tdata.align_model_paths : [])
+          }
+        } catch { /* 后端未就绪：仅展示磁盘开关 */ }
+        const loadedEnabledTools = new Set(
+          Object.entries(rawToolsCfg)
+            .filter(([k, v]) => k !== 'align_model_paths' && v && typeof v === 'object' && (v as any).enabled === true)
+            .map(([k]) => k),
+        )
         // Load models from config.json（id 以磁盘为准；熔断状态从后端 API 合并）
         const rawModels = cfg.vlm_models || []
         let loadedModels: ModelEntry[] = rawModels.length > 0
@@ -323,7 +387,8 @@ export default function Settings() {
             name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
             max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
           })),
-          questions: questionsToObject(loadedQuestions),
+          questions: questionsToObject(loadedQuestions, loadedEnabledTools),
+          annotation_tools: rawToolsCfg,
           vlm_strategy: cfg.vlm_strategy || 'round_robin',
           vlm_concurrency: cfg.vlm_concurrency ?? 3,
           vlm_http_timeout: cfg.vlm_http_timeout ?? 60,
@@ -403,6 +468,47 @@ export default function Settings() {
     next[idx] = { ...next[idx], enabled: !next[idx].enabled }
     setQuestions(next)
     markDirty()
+  }
+
+  // 标注工具 handlers
+  const toggleToolEnabled = (name: string) => {
+    setAnnotationToolsCfg(prev => {
+      const cur = prev[name] && typeof prev[name] === 'object' ? prev[name] : {}
+      return { ...prev, [name]: { ...cur, enabled: !(cur.enabled === true) } }
+    })
+    setAnnotationTools(prev => prev.map(t => t.name === name ? { ...t, enabled: !t.enabled } : t))
+    markDirty()
+  }
+
+  /** 智能分析：由 VLM 根据问题定义建议每个问题应绑定的工具。 */
+  const handleAnalyzeTools = async () => {
+    const qs = questionsToObject(questions, enabledToolNames)
+    if (!Object.keys(qs).length) { showMsg('暂无有效问题可供分析', 'error'); return }
+    setAnalyzing(true)
+    try {
+      const res = await fetch('/api/annotation_tools/analyze', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ questions: qs }),
+      })
+      if (!res.ok) {
+        const detail = await res.json().catch(() => ({}))
+        throw new Error(detail.detail || `HTTP ${res.status}`)
+      }
+      const data = await res.json()
+      const sug: Record<string, string[]> = data.suggestions || {}
+      setQuestions(prev => prev.map(q => {
+        const s = sug[q.key.trim()]
+        if (!Array.isArray(s)) return q
+        return { ...q, tools: s.filter(t => enabledToolNames.has(t)) }
+      }))
+      markDirty()
+      showMsg(`智能分析完成，已应用 ${Object.keys(sug).length} 条建议，可人工调整`)
+    } catch (e: any) {
+      showMsg(`智能分析失败: ${e.message}`, 'error')
+    } finally {
+      setAnalyzing(false)
+    }
   }
 
   // Model handlers
@@ -614,11 +720,50 @@ export default function Settings() {
           </div>
         </section>
 
+        {/* ═══ 标注工具管理 ═══ */}
+        <section className={sectionCls}>
+          <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-3">标注工具管理</h3>
+          <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">
+            标注时工具的测量结果会以文本形式注入 VLM prompt，辅助相关问题判断；最终标签仍由 VLM 综合图片决定。
+            仅启用的工具才能在下方 Questions 中绑定。
+          </p>
+          {annotationTools.length === 0 && <p className="text-xs text-gray-400 py-4 text-center">暂无工具信息（后端未就绪）</p>}
+          <div className="space-y-2">
+            {annotationTools.map(t => (
+              <div key={t.name} className="border rounded-lg p-3 border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-sm font-medium text-gray-700 dark:text-gray-200">{t.display_name}</span>
+                    <code className="text-[10px] text-gray-400 dark:text-gray-500 bg-gray-100 dark:bg-gray-800 px-1 rounded">{t.name}</code>
+                    {t.enabled
+                      ? (t.available
+                        ? <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300">可用</span>
+                        : <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300" title={t.reason}>不可用</span>)
+                      : <span className="px-1.5 py-0.5 text-[10px] rounded-full bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400">已停用</span>}
+                    {t.enabled && !t.available && t.reason && <span className="text-[10px] text-red-400">{t.reason}</span>}
+                  </div>
+                  <button onClick={() => toggleToolEnabled(t.name)} className={`px-2 py-0.5 text-xs rounded ${t.enabled ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300' : 'bg-gray-200 dark:bg-gray-600 text-gray-500 dark:text-gray-400'}`}>{t.enabled ? '启用' : '停用'}</button>
+                </div>
+                <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{t.description}</p>
+                {t.model_path && <p className="text-[10px] font-mono text-gray-400 dark:text-gray-500 mt-1 truncate" title={t.model_path}>{t.model_path}</p>}
+              </div>
+            ))}
+          </div>
+          {alignModelPaths.length > 0 && (
+            <p className="text-[10px] font-mono text-gray-400 dark:text-gray-500 mt-3" title={alignModelPaths.join('\n')}>
+              关键点依赖模型（align）：{alignModelPaths.length} 个，路径见 config.json → annotation_tools.align_model_paths
+            </p>
+          )}
+        </section>
+
         {/* ═══ Questions 管理 ═══ */}
         <section className={sectionCls}>
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">Questions 管理</h3>
-            <button onClick={addQuestion} className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">+ 添加问题</button>
+            <div className="flex gap-2">
+              <button onClick={handleAnalyzeTools} disabled={analyzing} title="由 VLM 分析当前问题定义，建议每个问题应绑定的标注工具" className="px-3 py-1.5 text-xs border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-300 rounded hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50">{analyzing ? '分析中…' : '智能分析工具'}</button>
+              <button onClick={addQuestion} className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">+ 添加问题</button>
+            </div>
           </div>
           <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">每个问题定义一条 VLM 标注结构中需要生成的字段。可按模版填写或自由输入 JSON。</p>
 
@@ -696,6 +841,29 @@ export default function Settings() {
                   </div>
                 ) : (
                   <div><label className={labelCls}>JSON 定义</label><textarea value={q.freeformJson} onChange={e => updateQuestion(idx, { freeformJson: e.target.value })} rows={4} className={inputCls} /></div>
+                )}
+                {annotationTools.filter(t => t.enabled && t.available).length > 0 && (
+                  <div className="mt-2">
+                    <label className={labelCls}>标注工具（标注时其测量结果注入 VLM，辅助回答本问题）</label>
+                    <div className="flex flex-wrap gap-3">
+                      {annotationTools.filter(t => t.enabled && t.available).map(t => (
+                        <label key={t.name} className="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-300" title={t.description}>
+                          <input
+                            type="checkbox"
+                            className="rounded"
+                            checked={q.tools.includes(t.name)}
+                            onChange={e => {
+                              const nextTools = e.target.checked
+                                ? Array.from(new Set([...q.tools, t.name]))
+                                : q.tools.filter(x => x !== t.name)
+                              updateQuestion(idx, { tools: nextTools })
+                            }}
+                          />
+                          {t.display_name}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
                 )}
                 </>)}
               </div>

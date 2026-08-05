@@ -524,11 +524,14 @@ class VLMClient:
         image: Image.Image,
         text: str,
         examples: Optional[List[Tuple[str, str, str]]] = None,
+        tool_results: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """构造首轮消息：examples 为 (维度, 档位值, base64) 参考样图。
+        """构造首轮消息：examples 为 (维度, 档位值, base64) 参考样图，
+        tool_results 为 {工具名: 测量结果 dict}。
 
         编排原则：跨请求保持相同的内容（prompt 文本 + 参考样图）放消息前部，
-        每请求不同的待标注图放最后，使前缀稳定，提升推理侧 prefix/KV cache 命中率。
+        每请求不同的内容（工具测量结果 + 待标注图）放后部，使前缀稳定，
+        提升推理侧 prefix/KV cache 命中率。
         """
         content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
         if examples:
@@ -557,9 +560,35 @@ class VLMClient:
                     "type": "text",
                     "text": (
                         "The reference examples above are ONLY for aligning your judgement "
-                        "scale with the demonstrated values. The LAST image in this message "
-                        "is the one to annotate:"
+                        "scale with the demonstrated values. "
                     ),
+                }
+            )
+        if tool_results:
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "The following are OBJECTIVE MEASUREMENTS from annotation tools "
+                        "(e.g. face detection) run on the image to annotate. Each block is "
+                        "labeled [Tool measurement: <tool_name>] with a JSON payload; use "
+                        "them as factual references where relevant:"
+                    ),
+                }
+            )
+            for tool_name, result in tool_results.items():
+                content.append(
+                    {
+                        "type": "text",
+                        "text": f"[Tool measurement: {tool_name}]\n"
+                        + json.dumps(result, ensure_ascii=False),
+                    }
+                )
+        if examples or tool_results:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "The LAST image in this message is the one to annotate:",
                 }
             )
         from auto_tag.core.config import settings as _settings
@@ -743,16 +772,28 @@ class VLMClient:
         keys: Optional[List[str]] = None,
         profile: Optional["PipelineProfile"] = None,
         examples: Optional[List[Tuple[str, str, str]]] = None,
+        tools: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """首轮带图提问；JSON/校验失败则在同一会话中文字追问改正（不再重传图片）。"""
         from auto_tag.core.config import settings
+
+        tool_results: Optional[Dict[str, Any]] = None
+        if tools:
+            try:
+                from auto_tag.core.annotation_tools import run_tools_for_image
+
+                tool_results = run_tools_for_image(image, tools) or None
+                if tool_results:
+                    logger.info("标注工具注入: %s", ", ".join(tool_results))
+            except Exception as e:
+                logger.warning("annotation_tools 执行异常，按无工具处理: %s", e)
 
         max_corr = max(
             0, int(getattr(settings, "vlm_validation_max_corrections", 2) or 2)
         )
         max_turns = 1 + max_corr
         messages: List[Dict[str, Any]] = self._messages_with_image(
-            image, initial_prompt, examples=examples
+            image, initial_prompt, examples=examples, tool_results=tool_results
         )
         last_raw = ""
         last_parsed: Optional[Dict[str, Any]] = None
@@ -880,13 +921,17 @@ class VLMClient:
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
         examples = self._collect_examples(None)
+        tools = self._collect_tools(None)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt(with_examples_note=bool(examples)),
+            self._generate_prompt(
+                with_examples_note=bool(examples), with_tools_note=bool(tools)
+            ),
             keys=None,
             profile=profile,
             examples=examples,
+            tools=tools,
         )
 
     def _call_single_model_subset(
@@ -897,13 +942,19 @@ class VLMClient:
         profile: Optional["PipelineProfile"] = None,
     ) -> Dict[str, Any]:
         examples = self._collect_examples(keys)
+        tools = self._collect_tools(keys)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt_for_keys(keys, with_examples_note=bool(examples)),
+            self._generate_prompt_for_keys(
+                keys,
+                with_examples_note=bool(examples),
+                with_tools_note=bool(tools),
+            ),
             keys=keys,
             profile=profile,
             examples=examples,
+            tools=tools,
         )
 
     # ── 旧单模型 API 调用（保留向后兼容） ──────────────
@@ -915,13 +966,17 @@ class VLMClient:
     ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
         examples = self._collect_examples(None)
+        tools = self._collect_tools(None)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt(with_examples_note=bool(examples)),
+            self._generate_prompt(
+                with_examples_note=bool(examples), with_tools_note=bool(tools)
+            ),
             keys=None,
             profile=profile,
             examples=examples,
+            tools=tools,
         )
 
     def _annotate_subset_api(
@@ -932,13 +987,19 @@ class VLMClient:
     ) -> Dict[str, Any]:
         model = self.models[0] if self.models else {}
         examples = self._collect_examples(keys)
+        tools = self._collect_tools(keys)
         return self._annotate_via_conversation(
             model,
             image,
-            self._generate_prompt_for_keys(keys, with_examples_note=bool(examples)),
+            self._generate_prompt_for_keys(
+                keys,
+                with_examples_note=bool(examples),
+                with_tools_note=bool(tools),
+            ),
             keys=keys,
             profile=profile,
             examples=examples,
+            tools=tools,
         )
 
     # ── Prompt 生成 ────────────────────────────────────
@@ -1008,6 +1069,32 @@ class VLMClient:
                 out.append((qkey, str(value), b64))
         return out
 
+    @classmethod
+    def _collect_tools(cls, keys: Optional[List[str]] = None) -> List[str]:
+        """汇总本次 keys 涉及问题绑定的标注工具（questions[key].tools），
+        与全局可用工具取交集、去重并保持注册顺序；无绑定时返回空列表。"""
+        try:
+            from auto_tag.core.annotation_tools import (
+                TOOL_REGISTRY,
+                enabled_tool_names,
+            )
+        except Exception as e:
+            logger.warning("annotation_tools 模块不可用，跳过工具注入: %s", e)
+            return []
+
+        schema = cls._schema_dict_for_keys(keys)
+        bound: set = set()
+        for details in schema.values():
+            if not isinstance(details, dict):
+                continue
+            tools = details.get("tools")
+            if isinstance(tools, (list, tuple)):
+                bound.update(str(t) for t in tools if t)
+        if not bound:
+            return []
+        available = set(enabled_tool_names())
+        return [t["name"] for t in TOOL_REGISTRY if t["name"] in bound & available]
+
     @staticmethod
     def _example_value_for_question(details: Dict[str, Any]) -> Any:
         """根据 question 定义生成 one-shot 示例值（未知 type 亦给出占位）。"""
@@ -1042,7 +1129,12 @@ class VLMClient:
             for key, details in schema.items()
         }
 
-    def _generate_prompt(self, *, with_examples_note: bool = False) -> str:
+    def _generate_prompt(
+        self,
+        *,
+        with_examples_note: bool = False,
+        with_tools_note: bool = False,
+    ) -> str:
         schema_dict = self._prompt_schema_dict()
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
@@ -1056,18 +1148,30 @@ class VLMClient:
             if with_examples_note
             else ""
         )
+        tools_note = (
+            "\n\nObjective measurements from annotation tools are provided BEFORE the image "
+            "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "
+            "For related fields, use these measurements as factual references, but always "
+            "make the final judgement based on the image itself."
+            if with_tools_note
+            else ""
+        )
         return f"""Please analyze this image and provide a structured JSON output describing it.
 
 You must strictly follow this JSON schema (field definitions):
 {schema_json}
 
 Example of a valid response (match this structure — scalar values at top level, no nested objects for numbers):
-{example_json}{examples_note}
+{example_json}{examples_note}{tools_note}
 
 Return ONLY valid JSON. Do not include explanations or markdown fences."""
 
     def _generate_prompt_for_keys(
-        self, keys: List[str], *, with_examples_note: bool = False
+        self,
+        keys: List[str],
+        *,
+        with_examples_note: bool = False,
+        with_tools_note: bool = False,
     ) -> str:
         schema_dict = self._prompt_schema_dict(keys)
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
@@ -1082,13 +1186,21 @@ Return ONLY valid JSON. Do not include explanations or markdown fences."""
             if with_examples_note
             else ""
         )
+        tools_note = (
+            "\n\nObjective measurements from annotation tools are provided BEFORE the image "
+            "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "
+            "For related fields, use these measurements as factual references, but always "
+            "make the final judgement based on the image itself."
+            if with_tools_note
+            else ""
+        )
         return f"""Please analyze this image and provide a structured JSON output.
 
 You must strictly follow this JSON schema (only these keys):
 {schema_json}
 
 Example of a valid response:
-{example_json}{examples_note}
+{example_json}{examples_note}{tools_note}
 
 Return ONLY valid JSON. Do not include markdown fences."""
 

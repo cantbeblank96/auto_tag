@@ -51,6 +51,25 @@
     "vlm_validation_max_corrections": 2,
     "vlm_example_image_max_side": 512,
     "vlm_image_max_side": 0,
+    "annotation_tools": {
+        "align_model_paths": [
+            "/path/to/kevin_sdk/models/alignment/M_Align_occlusion_106_360_xxx.model",
+            "/path/to/kevin_sdk/models/alignment/M_Align_occlusion_106_xxx.model"
+        ],
+        "face_detect": {
+            "enabled": true,
+            "model_path": "/path/to/kevin_sdk/models/detection/M_Detect_xxx.model",
+            "min_score": 0.5
+        },
+        "head_pose": {
+            "enabled": false,
+            "model_path": "/path/to/kevin_sdk/models/head_pose/M_Align_CalcPose_xxx.model"
+        },
+        "face_attribute": {
+            "enabled": false,
+            "model_path": "/path/to/kevin_sdk/models/attribute/M_FaceAttribute_xxx.model"
+        }
+    },
     "vlm_chain_dump": false,
     "vlm_chain_dump_path": "logs/vlm_validation_chain.jsonl",
     "circuit_breaker": {

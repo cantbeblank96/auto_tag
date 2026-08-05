@@ -215,6 +215,14 @@ class Settings(BaseSettings):
             "只降不升，可显著减小请求体积与推理耗时"
         ),
     )
+    annotation_tools: dict = Field(
+        default=cfg.get("annotation_tools", {}),
+        description=(
+            "标注工具配置：各工具（face_detect/head_pose/face_attribute）的 enabled 与 "
+            "model_path，及 align_model_paths（关键点依赖）；问题级绑定在 "
+            "questions[key].tools"
+        ),
+    )
 
     # Dynamic Questions
     questions: dict = Field(default=cfg.get("questions", {}), description="Dynamic questions for VLM structured output")
@@ -276,6 +284,7 @@ def reload_settings_from_disk() -> None:
             128, min(1024, int(cfg.get("vlm_example_image_max_side", 512) or 512))
         ),
         "vlm_image_max_side": max(0, min(8192, int(cfg.get("vlm_image_max_side", 0) or 0))),
+        "annotation_tools": dict(cfg.get("annotation_tools") or {}),
         "device": str(cfg.get("device", settings.device)),
         "questions": dict(cfg.get("questions") or {}),
         "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),
