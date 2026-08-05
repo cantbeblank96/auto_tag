@@ -10,6 +10,7 @@
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | 架构师 / 新功能开发者 | 模块依赖图、API 路由图、前端组件关系、数据流向 |
 | [DATABASE_UPDATE_BOX.md](./DATABASE_UPDATE_BOX.md) | 维护功能 / 测试 | 数据库页「更新」区域：快照比对、三种维护操作、按钮启用条件 |
 | [DATABASE_EXPORT_BOX.md](./DATABASE_EXPORT_BOX.md) | 数据导出 / 测试 | 数据库页「导出」区域：三类数据源、range/chunk/cluster、紧凑标注两步下载 |
+| [ANNOTATION_TOOLS.md](./ANNOTATION_TOOLS.md) | 标注链路 / 功能拓展 | 标注工具注入：注册表、双层绑定、消息布局、`_images` 图片注入约定、新增工具步骤 |
 | [EXTENDING.md](./EXTENDING.md) | 功能拓展开发者 | 各模块扩展点、新增 VLM 后端、新增路由、定制标注逻辑 |
 | [../Release_Record.md](../Release_Record.md) | 所有人 | 版本发布记录 |
 
