@@ -48,12 +48,8 @@ def merge_stats_params_from_file(
     if "clip_model_name" in raw:
         out["clip_model_name"] = str(raw["clip_model_name"])
     if "vlm_models" in raw and isinstance(raw["vlm_models"], list):
-        # 与快照同口径：优先按多端点 vlm_models 启用名推导
-        derived = effective_vlm_model_name(raw["vlm_models"], str(raw.get("vlm_model_name") or ""))
-        if derived:
-            out["vlm_model_name"] = derived
-    elif "vlm_model_name" in raw:
-        out["vlm_model_name"] = str(raw["vlm_model_name"])
+        # 与快照同口径：按多端点 vlm_models 启用名推导（唯一配置口径）
+        out["vlm_model_name"] = effective_vlm_model_name(raw["vlm_models"])
     if "duplicate_links_filename" in raw:
         out["duplicate_links_filename"] = str(raw["duplicate_links_filename"])
     if "embedding_subdir" in raw:

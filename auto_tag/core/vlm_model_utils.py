@@ -42,26 +42,19 @@ def iter_enabled_vlm_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return enabled
 
 
-def effective_vlm_model_name(
-    models: List[Dict[str, Any]], fallback: str = ""
-) -> str:
+def effective_vlm_model_name(models: List[Dict[str, Any]]) -> str:
     """实际标注所用 VLM 的展示名：启用端点名称去重后逗号拼接；
-    多端点为空时回退单模型配置名（兼容旧配置）。"""
+    无启用端点时返回空串（多端点 vlm_models 是唯一配置口径）。"""
     names: List[str] = []
     for m in iter_enabled_vlm_models(list(models or [])):
         n = str(m.get("name") or "").strip()
         if n and n not in names:
             names.append(n)
-    if names:
-        return ", ".join(names)
-    return str(fallback or "")
+    return ", ".join(names)
 
 
 def resolve_effective_vlm_model_name() -> str:
     """从当前 settings 解析实际 VLM 展示名（供快照/数据库页比对）。"""
     from auto_tag.core.config import settings
 
-    return effective_vlm_model_name(
-        getattr(settings, "vlm_models", None) or [],
-        getattr(settings, "vlm_model_name", ""),
-    )
+    return effective_vlm_model_name(getattr(settings, "vlm_models", None) or [])
