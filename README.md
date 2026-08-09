@@ -138,6 +138,12 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_backend.ps1
 powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_frontend_v2.ps1
 ```
 
+## 可选依赖：kevin_sdk（专项模型辅助标注）
+
+若需开启**专项模型辅助标注工具**（人脸检测、关键点/对齐、头姿、人脸属性、转正人脸裁剪注入等），需额外安装 **`kevin_sdk`** 库。该库目前为作者私有，暂不对外提供；可自行寻找开源方案替代（如 InsightFace / MediaPipe 等）并适配 `auto_tag/core/annotation_tools.py` 的调用点。
+
+> 说明：缺少 `kevin_sdk` **不影响本工具的整体使用**（标注任务、Web 控制台、数据库管理等均正常运行），仅部分人脸相关标注的准确率可能会略有下降；相关工具会在设置/状态页中自动标记为不可用并静默跳过。
+
 ## License
 
 本项目采用 [MIT License](./LICENSE)。

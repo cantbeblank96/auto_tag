@@ -103,6 +103,12 @@ powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_backend.ps1
 powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_frontend_v2.ps1
 ```
 
+## Optional dependency: kevin_sdk (specialized-model-assisted annotation)
+
+To enable the **specialized-model-assisted annotation tools** (face detection, landmark/alignment, head pose, face attributes, aligned-face crop injection, etc.), the **`kevin_sdk`** library must be installed separately. This library is currently private to the author and is not distributed; you may look for open-source alternatives (e.g., InsightFace / MediaPipe) and adapt the call sites in `auto_tag/core/annotation_tools.py`.
+
+> Note: without `kevin_sdk`, the tool **still works as a whole** (annotation jobs, web console, database management all run normally); only the accuracy of some face-related labels may drop slightly. The affected tools are automatically marked unavailable in Settings/status pages and are silently skipped.
+
 ## License
 
 This project is licensed under the [MIT License](./LICENSE).

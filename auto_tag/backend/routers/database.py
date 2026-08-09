@@ -19,6 +19,7 @@ from auto_tag.core.db_build_snapshot import read_build_snapshot
 from auto_tag.core.duplicate_store import read_duplicate_store
 from auto_tag.core.pipeline import normalize_work_dir, work_chroma_dir, work_log_dir
 from auto_tag.core.vector_db import VectorDB
+from auto_tag.core.vlm_model_utils import resolve_effective_vlm_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -219,7 +220,7 @@ def _database_stats_impl(
         "questions": dict(settings.questions or {}),
         "collection_name": str(settings.collection_name),
         "clip_model_name": str(settings.clip_model_name),
-        "vlm_model_name": str(settings.vlm_model_name),
+        "vlm_model_name": resolve_effective_vlm_model_name(),
         "duplicate_links_filename": str(settings.duplicate_links_filename),
         "embedding_subdir": str(settings.embedding_subdir),
     }

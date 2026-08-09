@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from auto_tag.core.config import settings
 from auto_tag.core.pipeline import PipelineConfig
+from auto_tag.core.vlm_model_utils import resolve_effective_vlm_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +31,9 @@ def write_build_snapshot(log_dir: str, cfg: PipelineConfig) -> None:
         "batch_size": int(settings.batch_size),
         "collection_name": str(settings.collection_name),
         "clip_model_name": str(settings.clip_model_name),
-        "vlm_model_name": str(settings.vlm_model_name),
+        # 记录实际标注所用模型：多端点 vlm_models 启用名（去重拼接），
+        # 而非遗留单模型配置项 vlm_model_name
+        "vlm_model_name": resolve_effective_vlm_model_name(),
         "duplicate_links_filename": str(settings.duplicate_links_filename),
         "work_dir": str(cfg.work_dir),
         "embedding_subdir": str(settings.embedding_subdir),
