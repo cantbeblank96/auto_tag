@@ -74,6 +74,7 @@
             "max_faces": 2
         }
     },
+    "annotation_tools_on_examples": false,
     "vlm_chain_dump": false,
     "vlm_chain_dump_path": "logs/vlm_validation_chain.jsonl",
     "circuit_breaker": {

@@ -107,6 +107,18 @@ analyze 接口的 max_tokens 与标注链路一致，统一走
 模型条目 `max_tokens` > 全局 `vlm_max_tokens` > 自动查询模型上限
 （thinking 模型 reasoning 与 content 共用预算，防截断）。
 
+### 样图工具测量（可选增强，默认关）
+
+`annotation_tools_on_examples: true` 时，对 questions 的 examples 参考样图也执行其
+**该维度绑定**的工具（绑定 ∩ 全局可用，与待标注图同口径），测量结果紧随对应样图
+之后注入：`[Reference measurement: <tool>]` JSON + `[Reference crop: ...]` 裁剪图，
+供模型与待标注图的工具结果对比校准刻度。实现要点（vlm_client）：
+
+- `_example_tool_results`：结果按 (路径, mtime, max_side, 工具签名) 常驻缓存，
+  样图为跨请求静态内容，只跑一次；纯失败条目（仅含 error 键）剔除，全失败静默降级为仅注入样图；
+- `_collect_examples` 返回四元组 (维度, 档位值, base64, 工具结果|None)，开关关闭时第四元素恒 None；
+- 开关在 Settings 页通用设置区暴露，保存后经 `reload_settings_from_disk` 免重启生效。
+
 ## 6. 新增一个工具
 
 1. `TOOL_REGISTRY` 追加条目：`name / display_name / description`（描述同时供

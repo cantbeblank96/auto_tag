@@ -61,8 +61,12 @@ def resize_image_for_vlm(image: Image.Image, max_side: int) -> Image.Image:
 
 # ── image-in-prompt：questions 中 examples 参考样图 ────────────────
 
-# 样图 base64 缓存：(绝对路径, mtime, max_side) -> base64（加载失败的负结果也缓存，避免重复警告）
+# 样图 PIL 缓存：(绝对路径, mtime, max_side) -> PIL（加载失败的负结果也缓存，避免重复警告）
+_EXAMPLE_PIL_CACHE: Dict[Tuple[str, float, int], Optional[Image.Image]] = {}
+# 样图 base64 缓存：同上键 -> JPEG base64
 _EXAMPLE_IMAGE_CACHE: Dict[Tuple[str, float, int], Optional[str]] = {}
+# 样图工具测量结果缓存：(路径, mtime, max_side, 工具签名) -> 结果（None = 无可用结果）
+_EXAMPLE_TOOL_RESULTS_CACHE: Dict[Tuple[str, float, int, str], Optional[Dict[str, Any]]] = {}
 _EXAMPLE_IMAGE_CACHE_LOCK = threading.Lock()
 # 缺失样图告警去重：每路径仅告警一次，避免大批量任务刷屏
 _EXAMPLE_IMAGE_WARNED: set = set()
@@ -78,19 +82,23 @@ def resolve_example_path(path: str) -> str:
     return os.path.normpath(os.path.join(os.path.dirname(config_json_path), p))
 
 
-def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
-    """加载参考样图 → RGB → 最长边缩放到 max_side → JPEG base64；失败返回 None。"""
-    if not path or not os.path.isfile(path):
-        return None
+def _example_cache_key(path: str, max_side: int) -> Tuple[str, float, int]:
     try:
         mtime = os.path.getmtime(path)
     except OSError:
         mtime = 0.0
-    key = (path, mtime, int(max_side))
+    return (path, mtime, int(max_side))
+
+
+def load_example_image_pil(path: str, max_side: int) -> Optional[Image.Image]:
+    """加载参考样图 → RGB → 最长边缩放到 max_side（缓存）；失败返回 None。"""
+    if not path or not os.path.isfile(path):
+        return None
+    key = _example_cache_key(path, max_side)
     with _EXAMPLE_IMAGE_CACHE_LOCK:
-        if key in _EXAMPLE_IMAGE_CACHE:
-            return _EXAMPLE_IMAGE_CACHE[key]
-    b64: Optional[str] = None
+        if key in _EXAMPLE_PIL_CACHE:
+            return _EXAMPLE_PIL_CACHE[key]
+    im_out: Optional[Image.Image] = None
     try:
         with Image.open(path) as im:
             im = im.convert("RGB")
@@ -102,12 +110,30 @@ def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
                     (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
                     Image.LANCZOS,
                 )
-            buffered = io.BytesIO()
-            im.save(buffered, format="JPEG", quality=85)
-            b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            im_out = im
     except Exception as e:
         logger.warning("Failed to load reference example image %s: %s", path, e)
-        b64 = None
+    with _EXAMPLE_IMAGE_CACHE_LOCK:
+        _EXAMPLE_PIL_CACHE[key] = im_out
+    return im_out
+
+
+def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
+    """参考样图 → JPEG base64（缓存）；失败返回 None。"""
+    im = load_example_image_pil(path, max_side)
+    if im is None:
+        return None
+    key = _example_cache_key(path, max_side)
+    with _EXAMPLE_IMAGE_CACHE_LOCK:
+        if key in _EXAMPLE_IMAGE_CACHE:
+            return _EXAMPLE_IMAGE_CACHE[key]
+    b64: Optional[str] = None
+    try:
+        buffered = io.BytesIO()
+        im.save(buffered, format="JPEG", quality=85)
+        b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    except Exception as e:
+        logger.warning("Failed to encode reference example image %s: %s", path, e)
     with _EXAMPLE_IMAGE_CACHE_LOCK:
         _EXAMPLE_IMAGE_CACHE[key] = b64
     return b64
@@ -543,10 +569,10 @@ class VLMClient:
         self,
         image: Image.Image,
         text: str,
-        examples: Optional[List[Tuple[str, str, str]]] = None,
+        examples: Optional[List[Tuple[str, str, str, Optional[Dict[str, Any]]]]] = None,
         tool_results: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
-        """构造首轮消息：examples 为 (维度, 档位值, base64) 参考样图，
+        """构造首轮消息：examples 为 (维度, 档位值, base64, 样图工具测量结果) 参考样图，
         tool_results 为 {工具名: 测量结果 dict}。
 
         编排原则：跨请求保持相同的内容（prompt 文本 + 参考样图）放消息前部，
@@ -565,7 +591,7 @@ class VLMClient:
                     ),
                 }
             )
-            for qkey, value, b64 in examples:
+            for qkey, value, b64, ex_tools in examples:
                 content.append(
                     {"type": "text", "text": f"[Reference example: {qkey} = {value}]"}
                 )
@@ -575,6 +601,40 @@ class VLMClient:
                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                     }
                 )
+                # 样图工具测量结果（annotation_tools_on_examples 开启时）：
+                # 紧随对应样图之后注入，供模型与待标注图的工具结果对比校准
+                if ex_tools:
+                    for tool_name, result in ex_tools.items():
+                        payload = dict(result) if isinstance(result, dict) else {"result": result}
+                        ex_images = payload.pop("_images", None) or []
+                        content.append(
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"[Reference measurement: {tool_name}] objective "
+                                    f"measurements of the reference example above "
+                                    f"({qkey} = {value}):\n"
+                                    + json.dumps(payload, ensure_ascii=False)
+                                ),
+                            }
+                        )
+                        for k, cb64 in enumerate(ex_images, start=1):
+                            content.append(
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        f"[Reference crop: {tool_name} face #{k}] aligned "
+                                        "& cropped face from the reference example above "
+                                        f"({qkey} = {value}):"
+                                    ),
+                                }
+                            )
+                            content.append(
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/jpeg;base64,{cb64}"},
+                                }
+                            )
             content.append(
                 {
                     "type": "text",
@@ -956,7 +1016,9 @@ class VLMClient:
             model,
             image,
             self._generate_prompt(
-                with_examples_note=bool(examples), with_tools_note=bool(tools)
+                with_examples_note=bool(examples),
+                with_tools_note=bool(tools),
+                with_example_measurements=self._examples_have_measurements(examples),
             ),
             keys=None,
             profile=profile,
@@ -980,6 +1042,7 @@ class VLMClient:
                 keys,
                 with_examples_note=bool(examples),
                 with_tools_note=bool(tools),
+                with_example_measurements=self._examples_have_measurements(examples),
             ),
             keys=keys,
             profile=profile,
@@ -1001,7 +1064,9 @@ class VLMClient:
             model,
             image,
             self._generate_prompt(
-                with_examples_note=bool(examples), with_tools_note=bool(tools)
+                with_examples_note=bool(examples),
+                with_tools_note=bool(tools),
+                with_example_measurements=self._examples_have_measurements(examples),
             ),
             keys=None,
             profile=profile,
@@ -1025,6 +1090,7 @@ class VLMClient:
                 keys,
                 with_examples_note=bool(examples),
                 with_tools_note=bool(tools),
+                with_example_measurements=self._examples_have_measurements(examples),
             ),
             keys=keys,
             profile=profile,
@@ -1063,19 +1129,23 @@ class VLMClient:
     @classmethod
     def _collect_examples(
         cls, keys: Optional[List[str]] = None
-    ) -> List[Tuple[str, str, str]]:
-        """从 questions 的 examples 字段收集 (维度, 档位值, base64) 参考样图。
+    ) -> List[Tuple[str, str, str, Optional[Dict[str, Any]]]]:
+        """从 questions 的 examples 字段收集 (维度, 档位值, base64, 样图工具测量结果)。
 
         路径支持绝对路径或相对 config.json 的相对路径；加载失败的样图跳过并告警，
-        不阻断标注流程。
+        不阻断标注流程。annotation_tools_on_examples 开启时对样图执行其绑定
+        维度的工具（结果缓存），否则第四元素为 None。
         """
         from auto_tag.core.config import settings
 
         max_side = max(
             128, int(getattr(settings, "vlm_example_image_max_side", 512) or 512)
         )
+        run_example_tools = bool(
+            getattr(settings, "annotation_tools_on_examples", False)
+        )
         schema = cls._schema_dict_for_keys(keys)
-        out: List[Tuple[str, str, str]] = []
+        out: List[Tuple[str, str, str, Optional[Dict[str, Any]]]] = []
         for qkey, details in schema.items():
             if not isinstance(details, dict):
                 continue
@@ -1096,34 +1166,89 @@ class VLMClient:
                             path,
                         )
                     continue
-                out.append((qkey, str(value), b64))
+                tool_results = None
+                if run_example_tools:
+                    tool_results = cls._example_tool_results(
+                        resolved, max_side, details
+                    )
+                out.append((qkey, str(value), b64, tool_results))
         return out
 
+    @staticmethod
+    def _examples_have_measurements(
+        examples: Optional[List[Tuple[str, str, str, Optional[Dict[str, Any]]]]],
+    ) -> bool:
+        return bool(examples) and any(e[3] for e in examples)
+
     @classmethod
-    def _collect_tools(cls, keys: Optional[List[str]] = None) -> List[str]:
-        """汇总本次 keys 涉及问题绑定的标注工具（questions[key].tools），
-        与全局可用工具取交集、去重并保持注册顺序；无绑定时返回空列表。"""
+    def _example_tool_results(
+        cls,
+        path: str,
+        max_side: int,
+        details: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """对样图执行其绑定工具（结果按路径+mtime+工具签名缓存）。
+
+        剔除纯失败条目后仍无可用结果时返回 None；任何异常静默降级为仅注入样图。
+        """
+        tools = cls._question_bound_tools(details)
+        if not tools:
+            return None
+        key = (*_example_cache_key(path, max_side), ",".join(tools))
+        with _EXAMPLE_IMAGE_CACHE_LOCK:
+            if key in _EXAMPLE_TOOL_RESULTS_CACHE:
+                return _EXAMPLE_TOOL_RESULTS_CACHE[key]
+        results: Optional[Dict[str, Any]] = None
+        try:
+            pil = load_example_image_pil(path, max_side)
+            if pil is not None:
+                from auto_tag.core.annotation_tools import run_tools_for_image
+
+                raw = run_tools_for_image(pil, tools)
+                # 仅保留非纯失败条目（error 单键条目无对比价值）
+                usable = {
+                    k: v
+                    for k, v in (raw or {}).items()
+                    if not (isinstance(v, dict) and set(v.keys()) == {"error"})
+                }
+                results = usable or None
+        except Exception as e:
+            logger.warning("样图工具执行失败（%s），仅注入样图: %s", path, e)
+            results = None
+        with _EXAMPLE_IMAGE_CACHE_LOCK:
+            _EXAMPLE_TOOL_RESULTS_CACHE[key] = results
+        return results
+
+    @classmethod
+    def _question_bound_tools(cls, details: Any) -> List[str]:
+        """单个问题绑定的工具（questions[key].tools）∩ 全局可用，按注册顺序。"""
         try:
             from auto_tag.core.annotation_tools import (
                 TOOL_REGISTRY,
                 enabled_tool_names,
             )
-        except Exception as e:
-            logger.warning("annotation_tools 模块不可用，跳过工具注入: %s", e)
+        except Exception:
             return []
-
-        schema = cls._schema_dict_for_keys(keys)
-        bound: set = set()
-        for details in schema.values():
-            if not isinstance(details, dict):
-                continue
-            tools = details.get("tools")
-            if isinstance(tools, (list, tuple)):
-                bound.update(str(t) for t in tools if t)
+        tools = details.get("tools") if isinstance(details, dict) else None
+        if not isinstance(tools, (list, tuple)):
+            return []
+        bound = {str(t) for t in tools if t}
         if not bound:
             return []
         available = set(enabled_tool_names())
         return [t["name"] for t in TOOL_REGISTRY if t["name"] in bound & available]
+
+    @classmethod
+    def _collect_tools(cls, keys: Optional[List[str]] = None) -> List[str]:
+        """汇总本次 keys 涉及问题绑定的标注工具（questions[key].tools），
+        与全局可用工具取交集、去重并保持注册顺序；无绑定时返回空列表。"""
+        schema = cls._schema_dict_for_keys(keys)
+        merged: List[str] = []
+        for details in schema.values():
+            for name in cls._question_bound_tools(details):
+                if name not in merged:
+                    merged.append(name)
+        return merged
 
     @staticmethod
     def _example_value_for_question(details: Dict[str, Any]) -> Any:
@@ -1170,20 +1295,27 @@ class VLMClient:
         *,
         with_examples_note: bool = False,
         with_tools_note: bool = False,
+        with_example_measurements: bool = False,
     ) -> str:
         schema_dict = self._prompt_schema_dict()
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(), indent=4, ensure_ascii=False
         )
-        examples_note = (
-            "\n\nSome fields provide reference example images BEFORE the image to annotate "
-            "(each labeled [Reference example: key = value]). For those fields, compare "
-            "visually against the reference examples and align your scale/judgement with them. "
-            "The LAST image in the message is always the one to annotate."
-            if with_examples_note
-            else ""
-        )
+        examples_note = ""
+        if with_examples_note:
+            examples_note = (
+                "\n\nSome fields provide reference example images BEFORE the image to annotate "
+                "(each labeled [Reference example: key = value]). For those fields, compare "
+                "visually against the reference examples and align your scale/judgement with them. "
+                "The LAST image in the message is always the one to annotate."
+            )
+            if with_example_measurements:
+                examples_note += (
+                    " Some reference examples also carry objective tool measurements right "
+                    "after the example image (each labeled [Reference measurement: <tool_name>]); "
+                    "use them as calibration anchors for the corresponding scale."
+                )
         tools_note = (
             "\n\nObjective measurements from annotation tools are provided BEFORE the image "
             "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "
@@ -1210,20 +1342,27 @@ Return ONLY valid JSON. Do not include explanations or markdown fences."""
         *,
         with_examples_note: bool = False,
         with_tools_note: bool = False,
+        with_example_measurements: bool = False,
     ) -> str:
         schema_dict = self._prompt_schema_dict(keys)
         schema_json = json.dumps(schema_dict, indent=4, ensure_ascii=False)
         example_json = json.dumps(
             self.build_example_json(keys), indent=4, ensure_ascii=False
         )
-        examples_note = (
-            "\n\nSome fields provide reference example images BEFORE the image to annotate "
-            "(each labeled [Reference example: key = value]). For those fields, compare "
-            "visually against the reference examples and align your scale/judgement with them. "
-            "The LAST image in the message is always the one to annotate."
-            if with_examples_note
-            else ""
-        )
+        examples_note = ""
+        if with_examples_note:
+            examples_note = (
+                "\n\nSome fields provide reference example images BEFORE the image to annotate "
+                "(each labeled [Reference example: key = value]). For those fields, compare "
+                "visually against the reference examples and align your scale/judgement with them. "
+                "The LAST image in the message is always the one to annotate."
+            )
+            if with_example_measurements:
+                examples_note += (
+                    " Some reference examples also carry objective tool measurements right "
+                    "after the example image (each labeled [Reference measurement: <tool_name>]); "
+                    "use them as calibration anchors for the corresponding scale."
+                )
         tools_note = (
             "\n\nObjective measurements from annotation tools are provided BEFORE the image "
             "to annotate (each block labeled [Tool measurement: <tool_name>] with JSON). "

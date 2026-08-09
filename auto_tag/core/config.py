@@ -223,6 +223,13 @@ class Settings(BaseSettings):
             "questions[key].tools"
         ),
     )
+    annotation_tools_on_examples: bool = Field(
+        default=bool(cfg.get("annotation_tools_on_examples", False)),
+        description=(
+            "实验性增强：对 examples 参考样图也执行其绑定维度的标注工具，并将测量结果以 "
+            "[Reference measurement: ...] 随样图注入，供模型校准时对比；默认关"
+        ),
+    )
 
     # Dynamic Questions
     questions: dict = Field(default=cfg.get("questions", {}), description="Dynamic questions for VLM structured output")
@@ -285,6 +292,7 @@ def reload_settings_from_disk() -> None:
         ),
         "vlm_image_max_side": max(0, min(8192, int(cfg.get("vlm_image_max_side", 0) or 0))),
         "annotation_tools": dict(cfg.get("annotation_tools") or {}),
+        "annotation_tools_on_examples": bool(cfg.get("annotation_tools_on_examples", False)),
         "device": str(cfg.get("device", settings.device)),
         "questions": dict(cfg.get("questions") or {}),
         "record_stage1_duplicates": bool(cfg.get("record_stage1_duplicates", True)),
