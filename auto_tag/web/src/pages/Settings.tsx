@@ -7,6 +7,7 @@ import {
   resolveMacroPath,
 } from '../constants/config'
 import { waitForBackendHealthy } from '../utils/backendHealth'
+import ConfirmDialog from '../components/ConfirmDialog'
 
 // ── Types ──────────────────────────────────────────────
 
@@ -225,6 +226,7 @@ export default function Settings() {
     activeJobCount: 0,
     restarting: false,
   })
+  const [refreshConfirmOpen, setRefreshConfirmOpen] = useState(false)
 
   useEffect(() => { loadEverything() }, [])
 
@@ -978,10 +980,12 @@ export default function Settings() {
           <div className="flex items-center gap-3 justify-between">
             <p className="text-xs text-gray-400 dark:text-gray-500">「刷新」从后端加载最新配置，「保存」将当前设置写入后端。</p>
             <div className="flex gap-2">
-              <button onClick={async () => {
-                if (isDirty && !window.confirm('当前有未保存的改动，刷新将丢失这些改动。确定要继续吗？')) return
-                await loadEverything()
-                setIsDirty(false)
+              <button onClick={() => {
+                if (isDirty) {
+                  setRefreshConfirmOpen(true)
+                } else {
+                  void loadEverything().then(() => setIsDirty(false))
+                }
               }} className="px-4 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700 dark:text-gray-300">刷新</button>
               <button onClick={saveAll} className="px-6 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700">保存</button>
             </div>
@@ -1035,6 +1039,17 @@ export default function Settings() {
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={refreshConfirmOpen}
+        title="确认刷新配置？"
+        message="当前有未保存的改动，刷新将从后端重新加载配置并丢失这些改动。"
+        confirmLabel="继续刷新"
+        onCancel={() => setRefreshConfirmOpen(false)}
+        onConfirm={() => {
+          setRefreshConfirmOpen(false)
+          void loadEverything().then(() => setIsDirty(false))
+        }}
+      />
     </div>
   )
 }

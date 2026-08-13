@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, type ReactNode } from 'react'
 import { api, type JobStatusResponse, type JobSummary } from '../api/client'
 import TaskQuerySection from '../components/TaskQuerySection'
+import ConfirmDialog from '../components/ConfirmDialog'
 import { formatJobRuntime } from '../utils/jobDuration'
 
 const sectionTitleCls =
@@ -298,11 +299,44 @@ export default function Tasks() {
     }
   }, [queueArmed])
 
-  const confirmTask = async () => {
+  const [missingDirs, setMissingDirs] = useState<string[] | null>(null)
+
+  /** 将当前表单状态打包为队列项并入队（confirmTask 校验通过与缺失目录弹窗确认后共用）。 */
+  const enqueueCurrentForm = (summary: string) => {
     const isList = sourceMode === 'list'
     const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
     const lsFiles = imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean)
     const suffixes = suffixInput.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
+    const regex = regexInput.trim()
+    const newItem: QueueItem = {
+      queueId: Math.random().toString(36).slice(2, 10),
+      summary,
+      inputDirs: dirs,
+      sourceMode,
+      imageLsFiles: lsFiles,
+      imageSuffixes: !isList && filterMode === 'suffix' ? suffixes : [],
+      imageNameRegex: !isList && filterMode === 'regex' ? regex : '',
+      filterIgnoreCase,
+      filterMatchFullPath,
+      rotateAngle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || '',
+      mixedYuv,
+      bYuv,
+      yuvW,
+      yuvH,
+      yuvType,
+      status: 'queued',
+      serverJobId: null,
+      error: null,
+      createdAt: Date.now(),
+    }
+    setQueue(prev => [...prev, newItem])
+    showMsg('已加入任务队列，请在「提交任务」中执行')
+  }
+
+  const confirmTask = async () => {
+    const isList = sourceMode === 'list'
+    const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
+    const lsFiles = imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean)
     const regex = regexInput.trim()
     // 目录扫描模式：先校验过滤条件
     if (!isList && filterMode === 'regex' && regex) {
@@ -328,41 +362,16 @@ export default function Tasks() {
       try {
         const check = await api.checkDirs(dirs)
         if (check.not_exist.length > 0) {
-          const msg = `以下目录不存在：\n${check.not_exist.join('\n')}\n\n确定仍要提交吗？`
-          const ok = window.confirm(msg + '\n\n（不存在的目录会被流水线忽略）')
-          if (!ok) {
-            showMsg('已取消')
-            return
-          }
+          // 存在缺失目录：弹窗确认后再入队
+          setMissingDirs(check.not_exist)
+          return
         }
       } catch (e: any) {
         showMsg(`无法校验目录（已跳过验证）: ${e.message}`)
       }
       summary = dirs.length === 1 ? dirs[0] : `${dirs[0]} 等${dirs.length}项`
     }
-    const newItem: QueueItem = {
-      queueId: Math.random().toString(36).slice(2, 10),
-      summary,
-      inputDirs: dirs,
-      sourceMode,
-      imageLsFiles: lsFiles,
-      imageSuffixes: !isList && filterMode === 'suffix' ? suffixes : [],
-      imageNameRegex: !isList && filterMode === 'regex' ? regex : '',
-      filterIgnoreCase,
-      filterMatchFullPath,
-      rotateAngle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || '',
-      mixedYuv,
-      bYuv,
-      yuvW,
-      yuvH,
-      yuvType,
-      status: 'queued',
-      serverJobId: null,
-      error: null,
-      createdAt: Date.now(),
-    }
-    setQueue(prev => [...prev, newItem])
-    showMsg('已加入任务队列，请在「提交任务」中执行')
+    enqueueCurrentForm(summary)
   }
 
   const downloadTaskJson = () => {
@@ -809,6 +818,31 @@ export default function Tasks() {
       <ChapterSection title="管理" defaultCollapsed>
         <TaskQuerySection />
       </ChapterSection>
+
+      <ConfirmDialog
+        open={missingDirs !== null}
+        title="部分目录不存在"
+        message={
+          <>
+            <p>以下目录不存在：</p>
+            <ul className="list-disc pl-5 font-mono text-xs break-all">
+              {(missingDirs || []).map(d => <li key={d}>{d}</li>)}
+            </ul>
+            <p>不存在的目录会被流水线忽略。确定仍要提交吗？</p>
+          </>
+        }
+        confirmLabel="仍要提交"
+        onCancel={() => {
+          setMissingDirs(null)
+          showMsg('已取消')
+        }}
+        onConfirm={() => {
+          const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
+          const summary = dirs.length === 1 ? dirs[0] : `${dirs[0]} 等${dirs.length}项`
+          setMissingDirs(null)
+          enqueueCurrentForm(summary)
+        }}
+      />
     </div>
   )
 }

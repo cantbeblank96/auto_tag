@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { api, type HealthResponse } from '../api/client'
 import { formatAppVersion } from '../constants/version'
 import { waitForBackendHealthy } from '../utils/backendHealth'
+import ConfirmDialog from './ConfirmDialog'
 
 const cardCls =
   'bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 mb-4 max-w-3xl'
@@ -11,6 +12,7 @@ export default function SystemInfoSection() {
   const [health, setHealth] = useState<HealthResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [restarting, setRestarting] = useState(false)
+  const [restartConfirmJobs, setRestartConfirmJobs] = useState<number | null>(null)
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
 
@@ -37,20 +39,8 @@ export default function SystemInfoSection() {
     }
   }
 
-  const handleRestartBackend = async () => {
-    setError('')
-    try {
-      const status = await api.backendStatus()
-      if (status.active_job_count > 0) {
-        const ok = window.confirm(
-          `当前有 ${status.active_job_count} 个标注/维护任务正在进行。重启会立即中断这些任务，是否继续？`,
-        )
-        if (!ok) return
-      }
-    } catch {
-      /* 状态接口不可用时仍允许尝试重启 */
-    }
-
+  /** 真正执行重启（弹窗确认后或无进行中任务时直接调用）。 */
+  const doRestartBackend = async () => {
     setRestarting(true)
     try {
       await api.restartBackend()
@@ -65,6 +55,21 @@ export default function SystemInfoSection() {
     } finally {
       setRestarting(false)
     }
+  }
+
+  const handleRestartBackend = async () => {
+    setError('')
+    try {
+      const status = await api.backendStatus()
+      if (status.active_job_count > 0) {
+        // 有进行中任务：弹窗确认后再重启
+        setRestartConfirmJobs(status.active_job_count)
+        return
+      }
+    } catch {
+      /* 状态接口不可用时仍允许尝试重启 */
+    }
+    await doRestartBackend()
   }
 
   return (
@@ -121,6 +126,27 @@ export default function SystemInfoSection() {
           </p>
         </div>
       </section>
+
+      <ConfirmDialog
+        open={restartConfirmJobs !== null}
+        title="确认重启后端？"
+        message={
+          <>
+            <p>
+              当前有 <strong className="font-medium text-gray-800 dark:text-gray-100">{restartConfirmJobs ?? 0}</strong> 个标注/维护任务正在进行。
+            </p>
+            <p>重启会<strong className="font-medium text-gray-800 dark:text-gray-100">立即中断</strong>这些任务，已处理进度可能不完整。是否继续？</p>
+          </>
+        }
+        confirmLabel="仍要重启"
+        danger
+        busy={restarting}
+        onCancel={() => setRestartConfirmJobs(null)}
+        onConfirm={() => {
+          setRestartConfirmJobs(null)
+          void doRestartBackend()
+        }}
+      />
     </div>
   )
 }
