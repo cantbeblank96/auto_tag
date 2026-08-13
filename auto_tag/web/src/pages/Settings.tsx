@@ -22,6 +22,8 @@ interface QuestionEntry {
   step: string
   freeformJson: string
   tools: string[]
+  /** 参考样图：档位值 → 样图路径（模版模式下的编辑态） */
+  examples: { value: string; path: string }[]
 }
 
 interface AnnotationToolStatus {
@@ -89,6 +91,14 @@ function questionToDetail(q: QuestionEntry): QuestionDetail | null {
     if (q.type === 'float' && q.step) d.step = Number(q.step)
   }
   if (Array.isArray(q.tools) && q.tools.length) d.tools = q.tools
+  // 参考样图：仅保留档位值与路径都非空的行
+  const ex: Record<string, string> = {}
+  for (const e of q.examples || []) {
+    const v = e.value.trim()
+    const p = e.path.trim()
+    if (v && p) ex[v] = p
+  }
+  if (Object.keys(ex).length) d.examples = ex
   return d
 }
 
@@ -123,11 +133,35 @@ function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
     step: detail.step != null ? String(detail.step) : '',
     freeformJson: JSON.stringify(detail, null, 2),
     tools: Array.isArray(detail.tools) ? detail.tools.map(String) : [],
+    examples: detail.examples && typeof detail.examples === 'object' && !Array.isArray(detail.examples)
+      ? Object.entries(detail.examples).map(([value, path]) => ({ value, path: String(path) }))
+      : [],
   }
 }
 
 function emptyQuestion(): QuestionEntry {
-  return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}', tools: [] }
+  return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}', tools: [], examples: [] }
+}
+
+/** 模版态 examples 行 → config 的 examples 对象（供 freeform JSON 同步）。 */
+function examplesToObject(rows: { value: string; path: string }[]): Record<string, string> {
+  const ex: Record<string, string> = {}
+  for (const e of rows || []) {
+    const v = e.value.trim()
+    const p = e.path.trim()
+    if (v && p) ex[v] = p
+  }
+  return ex
+}
+
+/** 将 examples 对象合并进 freeform JSON 文本（空则移除该键）。 */
+function mergeExamplesIntoFreeform(freeformJson: string, rows: { value: string; path: string }[]): string {
+  let obj: Record<string, any> = {}
+  try { obj = JSON.parse(freeformJson) } catch { /* JSON 不合法时重建 */ }
+  const ex = examplesToObject(rows)
+  if (Object.keys(ex).length) obj.examples = ex
+  else delete obj.examples
+  return JSON.stringify(obj, null, 2)
 }
 
 function stableStringify(value: unknown): string {
@@ -804,8 +838,9 @@ export default function Settings() {
 
           <div className="space-y-3 max-h-[26rem] overflow-y-auto pr-1">
             {questions
-              .filter(q => !questionSearch || q.key.toLowerCase().includes(questionSearch.toLowerCase()) || q.description.toLowerCase().includes(questionSearch.toLowerCase()))
-              .map((q, idx) => (
+              .map((q, origIdx) => ({ q, origIdx }))
+              .filter(({ q }) => !questionSearch || q.key.toLowerCase().includes(questionSearch.toLowerCase()) || q.description.toLowerCase().includes(questionSearch.toLowerCase()))
+              .map(({ q, origIdx: idx }) => (
               <div key={idx} className={`border rounded-lg p-3 ${q.enabled ? 'border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50' : 'border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/30 opacity-60'}`}>
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2 flex-1">
@@ -844,14 +879,34 @@ export default function Settings() {
                     <input type="radio" checked={q._mode === 'template'} onChange={() => {
                       if (q._mode === 'freeform' && !isFreeformValidatable(q.freeformJson)) {
                         // 不可解释为模版 → 清空所有模版字段
-                        updateQuestion(idx, { _mode: 'template', type: 'string', description: '', choices: '', min: '', max: '', step: '' })
+                        updateQuestion(idx, { _mode: 'template', type: 'string', description: '', choices: '', min: '', max: '', step: '', examples: [] })
+                      } else if (q._mode === 'freeform') {
+                        // freeform → template：解析 JSON 同步模版字段（含 examples），避免手改 JSON 后模版态过期
+                        try {
+                          const parsed = detailToQuestion(q.key, JSON.parse(q.freeformJson))
+                          updateQuestion(idx, {
+                            _mode: 'template',
+                            description: parsed.description,
+                            type: parsed.type,
+                            choices: parsed.choices,
+                            min: parsed.min,
+                            max: parsed.max,
+                            step: parsed.step,
+                            examples: parsed.examples,
+                          })
+                        } catch {
+                          updateQuestion(idx, { _mode: 'template' })
+                        }
                       } else {
                         updateQuestion(idx, { _mode: 'template' })
                       }
                     }} /> 按模版填写
                   </label>
                   <label className="flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400">
-                    <input type="radio" checked={q._mode === 'freeform'} onChange={() => updateQuestion(idx, { _mode: 'freeform' })} /> 自由形式
+                    <input type="radio" checked={q._mode === 'freeform'} onChange={() => {
+                      // template → freeform：将模版态（含 examples）序列化进 JSON 再编辑
+                      updateQuestion(idx, { _mode: 'freeform', freeformJson: mergeExamplesIntoFreeform(q.freeformJson, q.examples) })
+                    }} /> 自由形式
                   </label>
                 </div>
                 {q._mode === 'template' ? (
@@ -867,6 +922,28 @@ export default function Settings() {
                 ) : (
                   <div><label className={labelCls}>JSON 定义</label><textarea value={q.freeformJson} onChange={e => updateQuestion(idx, { freeformJson: e.target.value })} rows={4} className={inputCls} /></div>
                 )}
+                <div className="mt-2">
+                  <label className={labelCls}>参考样图 examples（档位值 → 样图路径，注入 VLM 辅助校准尺度）</label>
+                  {(q.examples.length > 0) && (
+                    <div className="space-y-1.5">
+                      {q.examples.map((ex, ei) => (
+                        <div key={ei} className="flex items-center gap-2">
+                          <input type="text" value={ex.value} placeholder={q.type === 'category' ? '类别名' : '档位值（如 2.5）'}
+                            onChange={e => { const next = [...q.examples]; next[ei] = { ...next[ei], value: e.target.value }; updateQuestion(idx, { examples: next }) }}
+                            className="border border-gray-300 dark:border-gray-600 rounded px-2 py-1 text-sm bg-white dark:bg-gray-900 dark:text-gray-200 w-32 shrink-0 font-mono" />
+                          <input type="text" value={ex.path} placeholder="样图路径（绝对路径，或相对 config.json 目录）"
+                            onChange={e => { const next = [...q.examples]; next[ei] = { ...next[ei], path: e.target.value }; updateQuestion(idx, { examples: next }) }}
+                            className="border border-gray-300 dark:border-gray-600 rounded px-2 py-1 text-sm bg-white dark:bg-gray-900 dark:text-gray-200 flex-1 min-w-0 font-mono" />
+                          <button onClick={() => updateQuestion(idx, { examples: q.examples.filter((_, i2) => i2 !== ei) })}
+                            className="px-1.5 py-0.5 text-xs text-red-600 border border-red-200 dark:border-red-800 rounded hover:bg-red-50 dark:hover:bg-red-900/30 dark:text-red-400 shrink-0">×</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <button onClick={() => updateQuestion(idx, { examples: [...q.examples, { value: '', path: '' }] })}
+                    className="mt-1.5 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">+ 添加样图</button>
+                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">档位值需符合本问题类型（category 用类别名）；保存后免重启生效</p>
+                </div>
                 {annotationTools.filter(t => t.enabled && t.available).length > 0 && (
                   <div className="mt-2">
                     <label className={labelCls}>标注工具（标注时其测量结果注入 VLM，辅助回答本问题）</label>
