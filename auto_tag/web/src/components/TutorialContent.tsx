@@ -73,7 +73,7 @@ export default function TutorialContent() {
               </li>
               <li>启动后端与前端脚本，浏览器打开控制台</li>
               <li>在「设置」中配置 VLM 模型（API Key、Base URL），可点「测试连接」</li>
-              <li>在「任务」中填写输入目录，确认后提交任务</li>
+              <li>在「任务」中填写输入目录（或 image_ls 列表），按需设置过滤条件，确认后提交任务</li>
               <li>等待流水线完成（约 2 秒轮询；运行中任务显示<strong>建簇</strong>与<strong>VLM 标注</strong>两条进度）</li>
               <li>在「图片查询」中按路径检索标注；在「数据库」中查看统计、比对参数、导出数据</li>
             </ol>
@@ -124,8 +124,10 @@ export default function TutorialContent() {
             <p>流水线执行以下步骤：</p>
             <ol className="list-decimal list-inside space-y-2">
               <li>
-                <strong>图片收集</strong> — 扫描输入目录下所有支持格式的图片文件（
-                <code className={codeCls}>.jpg / .png / .bmp / .webp / .yuv / .nv21 / .nv12</code>）。
+                <strong>图片收集</strong> — 支持两种来源：扫描输入目录（默认全部常见格式：
+                <code className={codeCls}>.jpg / .png / .bmp / .webp / .yuv / .nv21 / .nv12</code>），或按{' '}
+                <code className={codeCls}>image_ls</code> 列表文件显式指定图片集（见「任务页与历史查询」）。
+                目录扫描可叠加过滤：按后缀白名单，或按文件名/完整路径正则（正则优先；可选忽略大小写）。
               </li>
               <li>
                 <strong>样图校验</strong> — 从每个输入源选取首张样图保存到
@@ -215,7 +217,38 @@ export default function TutorialContent() {
         <SectionHeader id="tasks_help" title="任务页与历史查询" />
         {expanded.tasks_help && (
           <div className="mt-3 space-y-3 text-sm text-gray-600 dark:text-gray-400">
-            <p>「任务」页上半部分用于新建与提交；下半部分 <strong>「查询」</strong> 章节列出服务端全部历史任务（默认折叠）：</p>
+            <p>「任务」页「新建」支持两种图片来源（可切换）：</p>
+            <ul className="list-disc list-inside space-y-1">
+              <li>
+                <strong>目录扫描</strong> — 每行一个输入目录（绝对路径），可叠加图片过滤：
+                <ul className="list-disc list-inside ml-4 mt-1">
+                  <li>
+                    <strong>按后缀</strong> — 逗号/换行分隔的后缀白名单（如 <code className={codeCls}>.jpg, .png</code>）；留空 = 全部常见后缀
+                  </li>
+                  <li>
+                    <strong>按正则</strong> — 文件名正则（如 <code className={codeCls}>.*_front\.jpg$</code>），非空时优先于后缀过滤；
+                    可选忽略大小写（默认）与匹配完整路径（默认仅文件名）
+                  </li>
+                </ul>
+              </li>
+              <li>
+                <strong>列表指定（image_ls）</strong> — 每行一个列表文件路径，显式指定待处理图片集合，支持两种格式：
+                <ul className="list-disc list-inside ml-4 mt-1">
+                  <li>
+                    <strong>v2 行式（推荐）</strong> — 首个非空行为 JSON 头部（含 <code className={codeCls}>prefix</code> /{' '}
+                    <code className={codeCls}>image_num</code>），其余每行一个路径（UTF-8，空行忽略）；相对路径自动拼接{' '}
+                    <code className={codeCls}>prefix</code>，无 prefix 的相对行跳过并告警；
+                    <code className={codeCls}>image_num</code> 与实际行数不一致时仅警告不中断
+                  </li>
+                  <li><strong>JSON 数组</strong> — 文件整体为路径数组</li>
+                </ul>
+              </li>
+            </ul>
+            <p className="text-xs text-gray-400">
+              注意：后缀/正则过滤仅作用于目录扫描；image_ls 显式列表不参与过滤。提交前会校验目录存在性与 image_ls 文件可读性，
+              缺失目录弹窗确认后可选择仍要提交（会被流水线忽略）。
+            </p>
+            <p>「查询」章节列出服务端全部历史任务（默认折叠）：</p>
             <ul className="list-disc list-inside space-y-1">
               <li>支持按创建时间正序/倒序、手动刷新</li>
               <li>点击任务可查看 <code className={codeCls}>processed / total</code>、失败数、VLM 调用次数等</li>
@@ -329,6 +362,12 @@ python -m auto_tag.main \\
     --input_dir /path/to/images \\
     --work_dir ./work
 
+# 或：image_ls 列表指定 + 过滤（与 Web 任务页同能力）
+python -m auto_tag.main \\
+    --image_ls_file /path/to/image_ls.txt \\
+    --image_suffix .jpg --image_name_regex '.*_front\\.jpg$' \\
+    --work_dir ./work
+
 # 可选：自定义配置文件
 python -m auto_tag.main \\
     --input_dir /path/to/images \\
@@ -392,10 +431,61 @@ bash scripts/linux/run_web_frontend_v2.sh`}
     "type": "float",
     "min": 0,
     "max": 10,
-    "step": 0.1
+    "step": 0.1,
+    "examples": {
+      "2.5": "examples/brightness_2.5.jpg",
+      "7.5": "/abs/path/to/brightness_7.5.jpg"
+    }
   }
 }`}
             </pre>
+            <p>
+              <strong>参考样图（examples）</strong>：可为任意问题配置「档位值 → 样图路径」映射（如上例），
+              标注时样图随 prompt 注入 VLM，帮助模型对齐评分尺度，尤其适合亮度/清晰度/人脸大小等主观连续量。
+              在「设置 → Questions」卡片内可直接增删样图行；路径支持绝对路径或相对{' '}
+              <code className={codeCls}>config.json</code> 目录的相对路径，保存后免重启生效。
+            </p>
+            <ul className="list-disc list-inside space-y-1 text-xs text-gray-400">
+              <li>
+                样图送入 VLM 前缩放到最长边 ≤ <code className={codeCls}>vlm_example_image_max_side</code>（默认 512，可在「设置」调整）
+              </li>
+              <li>样图加载失败仅告警跳过，不影响标注</li>
+              <li>
+                实验性增强：开启 <code className={codeCls}>annotation_tools_on_examples</code> 后，样图也会执行其维度绑定的标注工具，
+                测量结果随样图注入供对比校准（见下节）
+              </li>
+            </ul>
+          </div>
+        )}
+      </section>
+
+      <section className={sectionCls}>
+        <SectionHeader id="tools" title="标注工具（专项模型辅助）" />
+        {expanded.tools && (
+          <div className="mt-3 space-y-3 text-sm text-gray-600 dark:text-gray-400">
+            <p>
+              除纯 VLM 判断外，系统支持在标注时调用<strong>专项模型工具</strong>对待标注图（可选含参考样图）做客观测量，
+              结果以文本/图片形式注入 VLM 辅助回答，最终标签仍由 VLM 综合判断，工具不硬覆盖。当前内置四个工具（基于可选库{' '}
+              <code className={codeCls}>kevin_sdk</code>）：
+            </p>
+            <ul className="list-disc list-inside space-y-1">
+              <li><strong>face_detect</strong> — 人脸数量、主脸位置框与占比</li>
+              <li><strong>head_pose</strong> — 头部姿态角 yaw/pitch/roll</li>
+              <li><strong>face_attribute</strong> — 性别、年龄、眼镜等属性分类</li>
+              <li><strong>face_crop</strong> — 前 N 大人脸的转正裁剪图（以图片注入）</li>
+            </ul>
+            <p>使用方式（双层开关，两者都命中才执行）：</p>
+            <ul className="list-disc list-inside space-y-1">
+              <li>
+                <strong>全局启用</strong> — 「设置 → 标注工具」中启用工具并配置模型路径；缺库/缺模型时自动标记不可用并静默跳过，不影响主流程
+              </li>
+              <li>
+                <strong>问题级绑定</strong> — Questions 卡片内勾选「标注工具」（如 face_size 绑 face_detect），也可点「智能分析工具」由 VLM 建议绑定
+              </li>
+            </ul>
+            <p className="text-xs text-gray-400">
+              kevin_sdk 为作者私有库，未随仓库提供；缺失时人脸相关维度准确率可能略有下降，其余功能不受影响（详见 README）。
+            </p>
           </div>
         )}
       </section>
