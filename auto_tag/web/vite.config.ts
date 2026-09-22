@@ -20,6 +20,9 @@ function readAppVersion(): string {
 
 const appVersion = readAppVersion()
 
+/** WSL 后端模式可设 AUTO_TAG_API_PROXY=http://<wsl-ip>:8000（见 scripts/windows/start_web_wsl.ps1） */
+const apiProxy = process.env.AUTO_TAG_API_PROXY || 'http://localhost:8000'
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {
@@ -28,7 +31,7 @@ export default defineConfig({
   server: {
     port: 5020,
     proxy: {
-      '/api': 'http://localhost:8000',
+      '/api': apiProxy,
     },
   },
 })

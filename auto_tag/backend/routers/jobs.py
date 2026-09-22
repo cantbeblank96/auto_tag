@@ -23,6 +23,7 @@ from auto_tag.core.pipeline import (
     build_image_filter_spec,
     normalize_work_dir,
 )
+from auto_tag.core.utils.path_utils import normalize_fs_path
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
@@ -95,9 +96,13 @@ class JobCreate(BaseModel):
 
 def _to_pipeline_config(body: JobCreate) -> PipelineConfig:
     wd = _resolve_work_dir(body.work_dir)
+    input_dirs = [normalize_fs_path(d) for d in body.input_dirs if (d or "").strip()]
+    image_ls_files = [
+        normalize_fs_path(f) for f in body.image_ls_files if (f or "").strip()
+    ]
     return PipelineConfig(
-        input_dirs=body.input_dirs,
-        image_ls_files=body.image_ls_files,
+        input_dirs=input_dirs,
+        image_ls_files=image_ls_files,
         image_suffixes=body.image_suffixes,
         image_name_regex=body.image_name_regex,
         filter_ignore_case=body.filter_ignore_case,
@@ -134,12 +139,13 @@ def create_job(body: JobCreate) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(e)) from e
     # image_ls 文件提前校验：不存在 / 头部行非法 → 400
     for f_path in body.image_ls_files:
-        if not os.path.isfile(f_path):
+        f_norm = normalize_fs_path(f_path) if (f_path or "").strip() else f_path
+        if not os.path.isfile(f_norm):
             raise HTTPException(
                 status_code=400, detail=f"image_ls 文件不存在：{f_path}"
             )
         try:
-            _read_image_list(f_path)
+            _read_image_list(f_norm)
         except ValueError as e:
             raise HTTPException(
                 status_code=400, detail=f"image_ls 文件 {f_path} 解析失败：{e}"

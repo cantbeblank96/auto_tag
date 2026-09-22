@@ -27,6 +27,10 @@ from auto_tag.core.vlm_timing_collector import record as timing_record
 from auto_tag.core.vlm_timing_collector import save_json as timing_save_json
 from auto_tag.core.vlm_timing_report import write_debug_artifacts
 from auto_tag.core.utils.load_image import load_image_for_job
+from auto_tag.core.utils.path_utils import (
+    normalize_fs_path,
+    windows_drive_path_to_posix_mount,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,14 +170,13 @@ def decode_meta_for_path(path: str, cfg: "PipelineConfig") -> Dict[str, Any]:
 
 
 def normalize_work_dir(work_dir: str) -> str:
-    """工作根目录：去空白、展开 ~、{PROJECT_PATH} 宏、绝对路径 + realpath，避免线程内相对路径错误。"""
+    """工作根目录：去空白、展开 ~、{PROJECT_PATH} 宏、Windows↔WSL 路径、绝对路径 + realpath。"""
     s = (work_dir or "").strip()
     # 替换 {PROJECT_PATH} 宏
     s = s.replace("{PROJECT_PATH}", _AUTO_TAG_DIR)
     if not s:
         s = os.path.join(_AUTO_TAG_DIR, "work_dir")
-    return os.path.realpath(os.path.abspath(os.path.expanduser(s)))
-
+    return normalize_fs_path(s)
 
 def work_log_dir(work_dir: str) -> str:
     """日志目录：work_dir/log。"""
@@ -263,7 +266,11 @@ def _read_image_list(path: str) -> List[str]:
         except json.JSONDecodeError:
             data = None
         if isinstance(data, list):
-            return [str(x) for x in data if str(x).strip()]
+            return [
+                normalize_fs_path(str(x))
+                for x in data
+                if str(x).strip()
+            ]
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     prefix = ""
     image_num: Optional[int] = None
@@ -283,13 +290,15 @@ def _read_image_list(path: str) -> List[str]:
             except (TypeError, ValueError):
                 raise ValueError(f"image_ls 头部 image_num 非整数：{raw_num!r}")
         start = 1
+    prefix_norm = normalize_fs_path(prefix) if prefix.strip() else ""
     out: List[str] = []
     skipped = 0
     for ln in lines[start:]:
-        if os.path.isabs(ln):
-            out.append(ln)
-        elif prefix:
-            out.append(os.path.join(prefix, ln))
+        # Linux/WSL 下 os.path.isabs("D:\\foo") 为 False，需识别盘符路径
+        if os.path.isabs(ln) or windows_drive_path_to_posix_mount(ln) is not None:
+            out.append(normalize_fs_path(ln))
+        elif prefix_norm:
+            out.append(os.path.join(prefix_norm, ln))
         else:
             skipped += 1
     if skipped:
@@ -337,27 +346,28 @@ def collect_image_paths(
         scan_suffixes = DEFAULT_IMAGE_SUFFIXES
 
     for d in input_dirs:
-        if os.path.isdir(d):
-            imgs = _walk_collect_images(d, scan_suffixes)
+        d_norm = normalize_fs_path(d) if (d or "").strip() else d
+        if os.path.isdir(d_norm):
+            imgs = _walk_collect_images(d_norm, scan_suffixes)
             imgs = _apply_image_filter(imgs, filter_spec)
             if imgs:
-                all_sources.append({"name": os.path.basename(d), "sample_path": imgs[0]})
+                all_sources.append({"name": os.path.basename(d_norm), "sample_path": imgs[0]})
                 image_list.extend(imgs)
         else:
             logger.warning("Input dir not found or not a directory: %s", d)
 
     for f_path in image_ls_files:
-        if os.path.exists(f_path):
+        f_norm = normalize_fs_path(f_path) if (f_path or "").strip() else f_path
+        if os.path.exists(f_norm):
             try:
-                imgs = _read_image_list(f_path)
+                imgs = _read_image_list(f_norm)
                 if imgs:
-                    all_sources.append({"name": os.path.basename(f_path), "sample_path": imgs[0]})
+                    all_sources.append({"name": os.path.basename(f_norm), "sample_path": imgs[0]})
                     image_list.extend(imgs)
             except Exception as e:
                 logger.error("Failed to load image list file %s: %s", f_path, e)
         else:
             logger.warning("Image list file not found: %s", f_path)
-
     return image_list, all_sources
 
 

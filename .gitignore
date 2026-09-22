@@ -88,6 +88,9 @@ promt.md
 git_push.sh
 plans/
 skills/
+notes/for_deploy/
+_deploy_backups/
+_sync_backup/
 
 # ============================================================
 # SpecStory

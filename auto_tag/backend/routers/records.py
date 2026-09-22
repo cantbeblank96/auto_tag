@@ -24,7 +24,7 @@ from auto_tag.core.pipeline import (
     work_chroma_dir,
     work_log_dir,
 )
-from auto_tag.core.utils.path_utils import path_variants
+from auto_tag.core.utils.path_utils import normalize_fs_path, path_variants
 from auto_tag.core.utils.load_image import load_image_for_job
 from auto_tag.core.vector_db import VectorDB
 
@@ -208,7 +208,7 @@ def list_records(
 @router.get("/safe_path_check")
 def safe_path_check(path: str) -> Dict[str, Any]:
     """用于缩略图等：仅检查路径是否存在且为文件（后续可加白名单）。"""
-    p = os.path.abspath(os.path.expanduser(path))
+    p = normalize_fs_path(path)
     if not os.path.isfile(p):
         raise HTTPException(status_code=404, detail="File not found")
     return {"path": p, "ok": True}
@@ -359,7 +359,7 @@ def preview_image(
     rotate_angle: Optional[str] = Query(None),
 ) -> Response:
     """将磁盘上的图片解码为 PNG（优先使用库中保存的 YUV 元数据）。"""
-    p = os.path.realpath(os.path.abspath(os.path.expanduser(image_path.strip())))
+    p = normalize_fs_path(image_path.strip())
     if not os.path.isfile(p):
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -452,9 +452,7 @@ def update_labels(body: UpdateLabelsBody) -> Dict[str, Any]:
             }
 
         # 库中无该路径（例如 Stage1 重复未入库）：插入新文档
-        p = os.path.realpath(
-            os.path.abspath(os.path.expanduser(body.image_path.strip()))
-        )
+        p = normalize_fs_path(body.image_path.strip())
         if not os.path.isfile(p):
             raise HTTPException(
                 status_code=404,

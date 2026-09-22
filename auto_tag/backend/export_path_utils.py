@@ -5,15 +5,17 @@ import os
 import uuid
 from typing import Any, Dict, List
 
+from auto_tag.core.utils.path_utils import normalize_fs_path
+
 _PROBE_BASENAME = ".auto_tag_export_write_probe"
 
 
 def normalize_export_dir(path_str: str) -> str:
-    """展开 ~ 并转为绝对 realpath。"""
+    """展开 ~、Windows↔WSL 盘符路径，并转为绝对 realpath。"""
     raw = str(path_str or "").strip()
     if not raw:
         raise ValueError("路径不能为空")
-    return os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+    return normalize_fs_path(raw)
 
 
 def validate_export_directory(

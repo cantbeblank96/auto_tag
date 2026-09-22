@@ -12,6 +12,7 @@ from auto_tag.backend.export_path_utils import validate_export_directory
 from auto_tag.backend.job_runner import is_busy, list_jobs
 from auto_tag.constant import VERSION
 from auto_tag.core.config import _AUTO_TAG_DIR, reload_settings_from_disk, settings
+from auto_tag.core.utils.path_utils import normalize_fs_path
 
 
 def _default_backend_log_path(repo_root: str) -> str:
@@ -237,11 +238,17 @@ def reload_config() -> Dict[str, Any]:
 
 @router.post("/utils/check_dirs")
 def check_dirs(body: CheckDirsBody) -> Dict[str, Any]:
-    """检查输入的目录列表中哪些存在、哪些不存在，用于前端提交前校验。"""
+    """检查输入的目录列表中哪些存在、哪些不存在，用于前端提交前校验。
+
+    在 WSL/Linux 后端上会把 Windows 盘符路径（如 D:\\data）规范为 /mnt/d/data。
+    """
     exist: List[str] = []
     not_exist: List[str] = []
     for d in body.dirs:
-        p = os.path.realpath(os.path.abspath(os.path.expanduser(d.strip())))
+        raw = (d or "").strip()
+        if not raw:
+            continue
+        p = normalize_fs_path(raw)
         if os.path.isdir(p):
             exist.append(p)
         else:
