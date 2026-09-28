@@ -31,13 +31,16 @@ port_in_use() {
 }
 
 wait_http_ok() {
-  local url="$1"
-  local timeout_sec="${2:-90}"
+  local timeout_sec="${1:-90}"
+  shift
   local i=0
   while [ "$i" -lt "$timeout_sec" ]; do
-    if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
-      return 0
-    fi
+    local url
+    for url in "$@"; do
+      if curl -sf --max-time 3 "$url" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
     sleep 1
     i=$((i + 1))
   done
@@ -96,8 +99,12 @@ fi
 echo "==> 等待服务就绪（最多约 90 秒）..."
 ok_be=0
 ok_fe=0
-wait_http_ok "http://127.0.0.1:${BACKEND_PORT}/api/health" 90 && ok_be=1
-wait_http_ok "http://127.0.0.1:${FRONTEND_PORT}/" 90 && ok_fe=1
+wait_http_ok 90 \
+  "http://127.0.0.1:${BACKEND_PORT}/api/health" \
+  "http://localhost:${BACKEND_PORT}/api/health" && ok_be=1
+wait_http_ok 90 \
+  "http://127.0.0.1:${FRONTEND_PORT}/" \
+  "http://localhost:${FRONTEND_PORT}/" && ok_fe=1
 
 if [ "$ok_be" -eq 1 ] && [ "$ok_fe" -eq 1 ]; then
   echo ""

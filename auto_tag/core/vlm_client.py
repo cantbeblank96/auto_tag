@@ -25,6 +25,13 @@ from auto_tag.core.vlm_timing_collector import record as timing_record
 from auto_tag.core.vlm_timing_collector import is_enabled as timing_enabled
 
 from auto_tag.core.circuit_breaker import CircuitBreaker, get_circuit_breaker
+from auto_tag.core.example_sources import (
+    EXAMPLE_IMAGES_PER_VALUE,
+    example_source_path,
+    iter_example_candidates,
+    resolve_example_path,
+    take_example_images,
+)
 from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
 
 if TYPE_CHECKING:
@@ -70,16 +77,6 @@ _EXAMPLE_TOOL_RESULTS_CACHE: Dict[Tuple[str, float, int, str], Optional[Dict[str
 _EXAMPLE_IMAGE_CACHE_LOCK = threading.Lock()
 # 缺失样图告警去重：每路径仅告警一次，避免大批量任务刷屏
 _EXAMPLE_IMAGE_WARNED: set = set()
-
-
-def resolve_example_path(path: str) -> str:
-    """解析 questions examples 中的样图路径：绝对路径直接用；相对路径基于 config.json 所在目录。"""
-    p = os.path.expanduser(str(path or ""))
-    if os.path.isabs(p):
-        return p
-    from auto_tag.core.config import config_json_path
-
-    return os.path.normpath(os.path.join(os.path.dirname(config_json_path), p))
 
 
 def _example_cache_key(path: str, max_side: int) -> Tuple[str, float, int]:
@@ -591,9 +588,22 @@ class VLMClient:
                     ),
                 }
             )
+            example_totals: Dict[Tuple[str, str], int] = {}
+            for qkey, value, _b64, _tools in examples:
+                pair = (qkey, value)
+                example_totals[pair] = example_totals.get(pair, 0) + 1
+            example_seen: Dict[Tuple[str, str], int] = {}
             for qkey, value, b64, ex_tools in examples:
+                pair = (qkey, value)
+                example_seen[pair] = example_seen.get(pair, 0) + 1
+                if example_totals[pair] > 1:
+                    example_label = (
+                        f"{qkey} = {value} ({example_seen[pair]}/{example_totals[pair]})"
+                    )
+                else:
+                    example_label = f"{qkey} = {value}"
                 content.append(
-                    {"type": "text", "text": f"[Reference example: {qkey} = {value}]"}
+                    {"type": "text", "text": f"[Reference example: {example_label}]"}
                 )
                 content.append(
                     {
@@ -613,7 +623,7 @@ class VLMClient:
                                 "text": (
                                     f"[Reference measurement: {tool_name}] objective "
                                     f"measurements of the reference example above "
-                                    f"({qkey} = {value}):\n"
+                                    f"({example_label}):\n"
                                     + json.dumps(payload, ensure_ascii=False)
                                 ),
                             }
@@ -625,7 +635,7 @@ class VLMClient:
                                     "text": (
                                         f"[Reference crop: {tool_name} face #{k}] aligned "
                                         "& cropped face from the reference example above "
-                                        f"({qkey} = {value}):"
+                                        f"({example_label}):"
                                     ),
                                 }
                             )
@@ -1132,9 +1142,10 @@ class VLMClient:
     ) -> List[Tuple[str, str, str, Optional[Dict[str, Any]]]]:
         """从 questions 的 examples 字段收集 (维度, 档位值, base64, 样图工具测量结果)。
 
-        路径支持绝对路径或相对 config.json 的相对路径；加载失败的样图跳过并告警，
-        不阻断标注流程。annotation_tools_on_examples 开启时对样图执行其绑定
-        维度的工具（结果缓存），否则第四元素为 None。
+        每个档位值只对应一条路径（后写覆盖先写）。路径是图片时使用这一张；
+        路径是文件夹时按文件名字典序最多读取 2 张合法图片（含子目录）。
+        读不出来的文件不占名额。加载失败仅告警，不阻断标注。
+        annotation_tools_on_examples 开启时对样图执行其绑定维度的工具，否则第四元素为 None。
         """
         from auto_tag.core.config import settings
 
@@ -1153,25 +1164,47 @@ class VLMClient:
             if not isinstance(examples, dict) or not examples:
                 continue
             for value in sorted(examples.keys(), key=_example_value_sort_key):
-                path = str(examples[value] or "")
-                resolved = resolve_example_path(path)
-                b64 = load_example_image_base64(resolved, max_side)
-                if b64 is None:
-                    if resolved not in _EXAMPLE_IMAGE_WARNED:
-                        _EXAMPLE_IMAGE_WARNED.add(resolved)
-                        logger.warning(
-                            "Reference example unavailable: %s=%s (path=%s)",
-                            qkey,
-                            value,
-                            path,
-                        )
+                source = example_source_path(examples[value])
+                if not source:
                     continue
-                tool_results = None
-                if run_example_tools:
-                    tool_results = cls._example_tool_results(
-                        resolved, max_side, details
+                sources = [source]
+                for src, image in iter_example_candidates(sources):
+                    if image is not None:
+                        continue
+                    warn_key = f"{qkey}={value}:{src}"
+                    if warn_key in _EXAMPLE_IMAGE_WARNED:
+                        continue
+                    _EXAMPLE_IMAGE_WARNED.add(warn_key)
+                    logger.warning(
+                        "Reference example source unavailable: %s=%s (path=%s)",
+                        qkey,
+                        value,
+                        src,
                     )
-                out.append((qkey, str(value), b64, tool_results))
+
+                def _loadable(path: str, _max_side: int = max_side) -> bool:
+                    return load_example_image_base64(path, _max_side) is not None
+
+                paths, truncated = take_example_images(sources, accept=_loadable)
+                if not paths:
+                    continue
+                if truncated:
+                    logger.info(
+                        "Reference examples for %s=%s capped at %d images; extra files ignored",
+                        qkey,
+                        value,
+                        EXAMPLE_IMAGES_PER_VALUE,
+                    )
+                for path in paths:
+                    b64 = load_example_image_base64(path, max_side)
+                    if not b64:
+                        continue
+                    tool_results = None
+                    if run_example_tools:
+                        tool_results = cls._example_tool_results(
+                            path, max_side, details
+                        )
+                    out.append((qkey, str(value), b64, tool_results))
         return out
 
     @staticmethod

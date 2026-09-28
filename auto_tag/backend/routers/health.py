@@ -3,7 +3,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -12,6 +12,11 @@ from auto_tag.backend.export_path_utils import validate_export_directory
 from auto_tag.backend.job_runner import is_busy, list_jobs
 from auto_tag.constant import VERSION
 from auto_tag.core.config import _AUTO_TAG_DIR, reload_settings_from_disk, settings
+from auto_tag.core.utils.directory_dialog import (
+    DirectoryDialogBusy,
+    DirectoryDialogError,
+    pick_existing_directory,
+)
 from auto_tag.core.utils.path_utils import normalize_fs_path
 
 
@@ -234,6 +239,30 @@ def reload_config() -> Dict[str, Any]:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
     return {"ok": True, "reloaded": True}
+
+
+class PickDirectoryBody(BaseModel):
+    title: str = Field(default="选择目录", max_length=80, description="系统目录窗口标题")
+    initial_dir: Optional[str] = Field(
+        default=None,
+        description="初始目录；仅当后端机器上该路径是已存在目录时才会定位过去",
+    )
+
+
+@router.post("/utils/pick_directory")
+def pick_directory(body: PickDirectoryBody) -> Dict[str, Any]:
+    """在运行后端的电脑上打开系统目录窗口，返回选中的绝对路径。
+
+    取消选择时 cancelled 为 true。Windows 使用系统文件夹对话框（可选任意盘符）；
+    Linux / macOS 使用各自的系统目录窗口。
+    """
+    try:
+        result = pick_existing_directory(title=body.title, initial_dir=body.initial_dir)
+    except DirectoryDialogBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DirectoryDialogError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"cancelled": result.cancelled, "path": result.path}
 
 
 @router.post("/utils/check_dirs")

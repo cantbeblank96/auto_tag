@@ -38,7 +38,45 @@ const ROTATE_OPTIONS = [
   { label: '逆时针 90° (ROTATE_90_COUNTERCLOCKWISE)', value: 'ROTATE_90_COUNTERCLOCKWISE' },
 ]
 
-const YUV_TYPES = ['nv21', 'nv12', 'yuv420p']
+type MediaMode = 'yuv' | 'image' | 'mixed'
+
+const YUV_FILE_SUFFIXES = ['.nv21', '.nv12', '.yuv']
+const IMAGE_FILE_SUFFIXES = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
+
+const MEDIA_MODE_OPTIONS: { id: MediaMode; label: string; hint: string }[] = [
+  { id: 'yuv', label: '标注原始 YUV', hint: '只收 .nv21 / .nv12 / .yuv，不收可视化图片' },
+  { id: 'image', label: '标注可视化图片', hint: '只收 .jpg / .jpeg / .png / .webp / .bmp' },
+  { id: 'mixed', label: '混合目录', hint: 'YUV 与图片都作为独立文件参与标注' },
+]
+
+function suffixesForMedia(mode: MediaMode): string[] {
+  if (mode === 'yuv') return YUV_FILE_SUFFIXES
+  if (mode === 'image') return IMAGE_FILE_SUFFIXES
+  return [...IMAGE_FILE_SUFFIXES, ...YUV_FILE_SUFFIXES]
+}
+
+function mediaNeedsYuv(mode: MediaMode): boolean {
+  return mode !== 'image'
+}
+
+function inferMediaMode(data: Record<string, any>): MediaMode {
+  const explicit = data.media_mode
+  if (explicit === 'yuv' || explicit === 'image' || explicit === 'mixed') return explicit
+  const suffixes = (Array.isArray(data.image_suffixes) ? data.image_suffixes : []).map((s: unknown) => {
+    const text = String(s || '').trim().toLowerCase()
+    if (!text) return ''
+    return text.startsWith('.') ? text : `.${text}`
+  }).filter(Boolean)
+  const yuvSet = new Set(YUV_FILE_SUFFIXES)
+  const imageSet = new Set(IMAGE_FILE_SUFFIXES)
+  const hasYuv = suffixes.some(s => yuvSet.has(s))
+  const hasImage = suffixes.some(s => imageSet.has(s))
+  if (hasYuv && !hasImage) return 'yuv'
+  if (hasImage && !hasYuv) return 'image'
+  if (data.b_yuv_image && !data.mixed_yuv) return 'yuv'
+  if (data.mixed_yuv) return 'mixed'
+  return 'image'
+}
 
 interface QueueItem {
   queueId: string
@@ -47,10 +85,8 @@ interface QueueItem {
   /** 图片来源模式：目录扫描 / 列表指定 */
   sourceMode: 'dir' | 'list'
   imageLsFiles: string[]
-  imageSuffixes: string[]
-  imageNameRegex: string
-  filterIgnoreCase: boolean
-  filterMatchFullPath: boolean
+  /** 目录扫描收哪些文件；列表模式不按此过滤 */
+  mediaMode: MediaMode
   rotateAngle: string
   mixedYuv: boolean
   bYuv: boolean
@@ -77,25 +113,29 @@ function fmtRatio(num: number, den: number): string {
   return `${num} (${(num / den * 100).toFixed(0)}%)`
 }
 
+/** 把系统目录窗口返回的绝对路径追加到「输入目录」多行文本。已存在则不重复添加。 */
+function appendDirectoryPath(current: string, picked: string): { text: string; added: boolean } {
+  const path = picked.trim()
+  if (!path) return { text: current, added: false }
+  const lines = current.split('\n').map(s => s.trim()).filter(Boolean)
+  if (lines.includes(path)) return { text: current, added: false }
+  if (!current.trim()) return { text: path, added: true }
+  return { text: `${current.replace(/\n+$/, '')}\n${path}`, added: true }
+}
+
 /** localStorage key */
 const LS_LAST_SEEN = 'auto_tag_tasks_last_seen'
 
 export default function Tasks() {
   const [inputDirs, setInputDirs] = useState('')
+  const [pickingDir, setPickingDir] = useState(false)
   const [rotLabel, setRotLabel] = useState(ROTATE_OPTIONS[0].label)
-  const [mixedYuv, setMixedYuv] = useState(false)
-  const [bYuv, setBYuv] = useState(false)
   const [yuvW, setYuvW] = useState(640)
   const [yuvH, setYuvH] = useState(480)
   const [yuvType, setYuvType] = useState('nv21')
-  // F1：新建任务双模式（目录扫描 vs 列表指定）与过滤设置
   const [sourceMode, setSourceMode] = useState<'dir' | 'list'>('dir')
   const [imageLsFilesText, setImageLsFilesText] = useState('')
-  const [filterMode, setFilterMode] = useState<'suffix' | 'regex'>('suffix')
-  const [suffixInput, setSuffixInput] = useState('')
-  const [regexInput, setRegexInput] = useState('')
-  const [filterIgnoreCase, setFilterIgnoreCase] = useState(true)
-  const [filterMatchFullPath, setFilterMatchFullPath] = useState(false)
+  const [mediaMode, setMediaMode] = useState<MediaMode>('image')
   const [skipIfInDb, setSkipIfInDb] = useState(true)
   // 本地队列（当前 session 提交的 + 从后端拉取的）
   const [queue, setQueue] = useState<QueueItem[]>([])
@@ -113,6 +153,27 @@ export default function Tasks() {
     setMsgLevel(level)
     // 错误提示停留更久，避免用户误以为操作无响应
     setTimeout(() => setMsg(''), level === 'error' ? 15000 : 5000)
+  }
+
+  const pickInputDir = async () => {
+    if (pickingDir) return
+    const lines = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
+    const initial = lines.length ? lines[lines.length - 1] : ''
+    setPickingDir(true)
+    try {
+      const res = await api.pickDirectory(initial)
+      if (res.cancelled || !res.path) return
+      const next = appendDirectoryPath(inputDirs, res.path)
+      if (!next.added) {
+        showMsg('该目录已在输入目录中')
+        return
+      }
+      setInputDirs(next.text)
+    } catch (e: any) {
+      showMsg(e?.message || '无法打开目录选择窗口', 'error')
+    } finally {
+      setPickingDir(false)
+    }
   }
 
   const skipIfInDbRef = useRef(skipIfInDb)
@@ -168,10 +229,7 @@ export default function Tasks() {
       inputDirs: [],
       sourceMode: 'dir',
       imageLsFiles: [],
-      imageSuffixes: [],
-      imageNameRegex: '',
-      filterIgnoreCase: true,
-      filterMatchFullPath: false,
+      mediaMode: 'image',
       rotateAngle: '',
       mixedYuv: false,
       bYuv: false,
@@ -241,22 +299,16 @@ export default function Tasks() {
       api.createJob({
         input_dirs: nextItem.sourceMode === 'dir' ? nextItem.inputDirs : [],
         image_ls_files: nextItem.sourceMode === 'list' ? nextItem.imageLsFiles : [],
-        image_suffixes:
-          nextItem.sourceMode === 'dir' && nextItem.imageSuffixes.length > 0
-            ? nextItem.imageSuffixes
-            : null,
-        image_name_regex:
-          nextItem.sourceMode === 'dir' && nextItem.imageNameRegex
-            ? nextItem.imageNameRegex
-            : null,
-        filter_ignore_case: nextItem.filterIgnoreCase,
-        filter_match_full_path: nextItem.filterMatchFullPath,
+        image_suffixes: nextItem.sourceMode === 'dir' ? suffixesForMedia(nextItem.mediaMode) : null,
+        image_name_regex: null,
+        filter_ignore_case: true,
+        filter_match_full_path: false,
         rotate_angle: nextItem.rotateAngle || null,
-        b_yuv_image: nextItem.bYuv,
-        mixed_yuv: nextItem.mixedYuv,
+        b_yuv_image: false,
+        mixed_yuv: mediaNeedsYuv(nextItem.mediaMode),
         yuv_type: nextItem.yuvType,
-        image_width: nextItem.yuvW,
-        image_height: nextItem.yuvH,
+        image_width: mediaNeedsYuv(nextItem.mediaMode) ? nextItem.yuvW : 0,
+        image_height: mediaNeedsYuv(nextItem.mediaMode) ? nextItem.yuvH : 0,
         skip_if_in_db: skipIfInDbRef.current,
       }).then(res => {
         if (cancelled) return
@@ -303,24 +355,18 @@ export default function Tasks() {
 
   /** 将当前表单状态打包为队列项并入队（confirmTask 校验通过与缺失目录弹窗确认后共用）。 */
   const enqueueCurrentForm = (summary: string) => {
-    const isList = sourceMode === 'list'
     const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
     const lsFiles = imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean)
-    const suffixes = suffixInput.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
-    const regex = regexInput.trim()
     const newItem: QueueItem = {
       queueId: Math.random().toString(36).slice(2, 10),
       summary,
       inputDirs: dirs,
       sourceMode,
       imageLsFiles: lsFiles,
-      imageSuffixes: !isList && filterMode === 'suffix' ? suffixes : [],
-      imageNameRegex: !isList && filterMode === 'regex' ? regex : '',
-      filterIgnoreCase,
-      filterMatchFullPath,
+      mediaMode,
       rotateAngle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || '',
-      mixedYuv,
-      bYuv,
+      mixedYuv: mediaNeedsYuv(mediaMode),
+      bYuv: false,
       yuvW,
       yuvH,
       yuvType,
@@ -337,15 +383,9 @@ export default function Tasks() {
     const isList = sourceMode === 'list'
     const dirs = inputDirs.split('\n').map(s => s.trim()).filter(Boolean)
     const lsFiles = imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean)
-    const regex = regexInput.trim()
-    // 目录扫描模式：先校验过滤条件
-    if (!isList && filterMode === 'regex' && regex) {
-      try {
-        new RegExp(regex)
-      } catch {
-        showMsg('正则表达式非法，请检查')
-        return
-      }
+    if (mediaNeedsYuv(mediaMode) && (yuvW <= 0 || yuvH <= 0)) {
+      showMsg('标注 YUV 需要填写大于 0 的宽度和高度', 'error')
+      return
     }
     let summary: string
     if (isList) {
@@ -375,19 +415,19 @@ export default function Tasks() {
   }
 
   const downloadTaskJson = () => {
-    const suffixes = suffixInput.split(/[,，\n]/).map(s => s.trim()).filter(Boolean)
     const data = {
       version: 1,
       source_mode: sourceMode,
       input_dirs: inputDirs.split('\n').map(s => s.trim()).filter(Boolean),
       image_ls_files: imageLsFilesText.split('\n').map(s => s.trim()).filter(Boolean),
-      image_suffixes: filterMode === 'suffix' && suffixes.length > 0 ? suffixes : null,
-      image_name_regex: filterMode === 'regex' && regexInput.trim() ? regexInput.trim() : null,
-      filter_ignore_case: filterIgnoreCase,
-      filter_match_full_path: filterMatchFullPath,
+      media_mode: mediaMode,
+      image_suffixes: sourceMode === 'dir' ? suffixesForMedia(mediaMode) : null,
+      image_name_regex: null,
+      filter_ignore_case: true,
+      filter_match_full_path: false,
       rotate_angle: ROTATE_OPTIONS.find(o => o.label === rotLabel)?.value || null,
-      b_yuv_image: bYuv,
-      mixed_yuv: mixedYuv,
+      b_yuv_image: false,
+      mixed_yuv: mediaNeedsYuv(mediaMode),
       yuv_type: yuvType,
       image_width: yuvW,
       image_height: yuvH,
@@ -423,27 +463,22 @@ export default function Tasks() {
         ) {
           setSourceMode('list')
         }
-        if (Array.isArray(data.image_suffixes) && data.image_suffixes.length > 0) {
-          setFilterMode('suffix')
-          setSuffixInput(data.image_suffixes.join(', '))
-        }
-        if (data.image_name_regex) {
-          setFilterMode('regex')
-          setRegexInput(String(data.image_name_regex))
-        }
-        if (data.filter_ignore_case != null) setFilterIgnoreCase(data.filter_ignore_case)
-        if (data.filter_match_full_path != null) setFilterMatchFullPath(data.filter_match_full_path)
+        const hadRegex = Boolean(data.image_name_regex)
+        setMediaMode(inferMediaMode(data))
         if (data.rotate_angle) {
           const opt = ROTATE_OPTIONS.find(o => o.value === data.rotate_angle)
           if (opt) setRotLabel(opt.label)
         }
-        if (data.b_yuv_image != null) setBYuv(data.b_yuv_image)
-        if (data.mixed_yuv != null) setMixedYuv(data.mixed_yuv)
         if (data.yuv_type) setYuvType(data.yuv_type)
         if (data.image_width) setYuvW(data.image_width)
         if (data.image_height) setYuvH(data.image_height)
         if (data.skip_if_in_db != null) setSkipIfInDb(data.skip_if_in_db)
-        showMsg('已加载到表单')
+        showMsg(
+          hadRegex
+            ? '已加载到表单。文件名正则过滤已不再使用，本次按媒体类型收集文件'
+            : '已加载到表单',
+          hadRegex ? 'error' : 'info',
+        )
       } catch (e: any) {
         showMsg(`JSON 解析失败: ${e.message}`)
       }
@@ -501,52 +536,28 @@ export default function Tasks() {
           {sourceMode === 'dir' ? (
             <>
               <div>
-                <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">输入目录（每行一个绝对路径）</label>
+                <div className="flex items-center justify-between gap-3 mb-1">
+                  <label className="block text-sm text-gray-600 dark:text-gray-400">输入目录（每行一个绝对路径）</label>
+                  <button
+                    type="button"
+                    onClick={() => void pickInputDir()}
+                    disabled={pickingDir}
+                    title="在运行后端的电脑上打开系统目录窗口，可选任意磁盘中的文件夹"
+                    className="shrink-0 px-3 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                  >
+                    {pickingDir ? '请在弹出的窗口中选择…' : '添加目录'}
+                  </button>
+                </div>
                 <textarea
                   value={inputDirs}
                   onChange={e => setInputDirs(e.target.value)}
-                  placeholder="/path/to/images"
+                  placeholder={'/path/to/images 或 D:\\images'}
                   className="w-full border rounded px-3 py-2 text-sm font-mono"
                   rows={4}
                 />
-              </div>
-              <div className="border border-gray-200 dark:border-gray-700 rounded p-3 space-y-3">
-                <p className="text-sm text-gray-600 dark:text-gray-400">图片过滤（可选；不填 = 全部常见后缀）</p>
-                <div className="flex gap-4 text-sm text-gray-600 dark:text-gray-300">
-                  <label className="flex items-center gap-1">
-                    <input type="radio" checked={filterMode === 'suffix'} onChange={() => setFilterMode('suffix')} />
-                    按后缀
-                  </label>
-                  <label className="flex items-center gap-1">
-                    <input type="radio" checked={filterMode === 'regex'} onChange={() => setFilterMode('regex')} />
-                    按正则
-                  </label>
-                </div>
-                {filterMode === 'suffix' ? (
-                  <input
-                    value={suffixInput}
-                    onChange={e => setSuffixInput(e.target.value)}
-                    placeholder=".jpg, .png（逗号或换行分隔，可省略前导点）"
-                    className="w-full border rounded px-3 py-2 text-sm font-mono"
-                  />
-                ) : (
-                  <div className="space-y-2">
-                    <input
-                      value={regexInput}
-                      onChange={e => setRegexInput(e.target.value)}
-                      placeholder={'正则匹配文件名，如 .*_front\\.jpg$'}
-                      className="w-full border rounded px-3 py-2 text-sm font-mono"
-                    />
-                    <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
-                      <input type="checkbox" checked={filterMatchFullPath} onChange={e => setFilterMatchFullPath(e.target.checked)} />
-                      匹配完整路径（默认仅匹配文件名）
-                    </label>
-                  </div>
-                )}
-                <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
-                  <input type="checkbox" checked={filterIgnoreCase} onChange={e => setFilterIgnoreCase(e.target.checked)} />
-                  忽略大小写
-                </label>
+                <p className="text-xs text-gray-400 mt-1">
+                  「添加目录」会在运行后端的电脑上弹出系统目录窗口，选中后把绝对路径追加到上面。Windows 下可选任意盘符（如 D:\images）；也可以直接粘贴路径。
+                </p>
               </div>
             </>
           ) : (
@@ -560,45 +571,65 @@ export default function Tasks() {
                 rows={4}
               />
               <p className="text-xs text-gray-400 mt-1">
-                列表文件格式：首行可为 JSON 头部（如 {'{"prefix": "/data/imgs/", "image_num": 3}'}），其余每行一个路径（相对行与 prefix 拼接）；也兼容旧版 JSON 数组格式。显式列表不参与上方过滤设置。
+                列表文件格式：首行可为 JSON 头部（如 {'{"prefix": "/data/imgs/", "image_num": 3}'}），其余每行一个路径（相对行与 prefix 拼接）；也兼容旧版 JSON 数组格式。列表里有什么就标什么，不按待标注文件类型过滤。
               </p>
             </div>
           )}
+          <div className="border border-gray-200 dark:border-gray-700 rounded p-3 space-y-2">
+            <p className="text-sm text-gray-600 dark:text-gray-400">待标注文件</p>
+            {MEDIA_MODE_OPTIONS.map(opt => (
+              <label key={opt.id} className="flex items-start gap-2 text-sm text-gray-700 dark:text-gray-300">
+                <input
+                  type="radio"
+                  name="media-mode"
+                  className="mt-0.5"
+                  checked={mediaMode === opt.id}
+                  onChange={() => setMediaMode(opt.id)}
+                />
+                <span>
+                  <span className="font-medium">{opt.label}</span>
+                  <span className="block text-xs text-gray-400">{opt.hint}</span>
+                </span>
+              </label>
+            ))}
+            <p className="text-xs text-gray-400">
+              {sourceMode === 'dir'
+                ? '目录扫描只收集所选类型。后缀匹配忽略大小写，Windows 上的 .JPG、.NV21 同样会收进来。'
+                : '列表模式不按这里过滤路径。选中含 YUV 的选项时，列表里的 .nv21 / .nv12 / .yuv 按 YUV 解码，其余按图片解码。'}
+            </p>
+          </div>
           <div>
             <label className="block text-sm text-gray-600 dark:text-gray-400 mb-1">rotate_angle（可选）</label>
             <select value={rotLabel} onChange={e => setRotLabel(e.target.value)} className="border rounded px-3 py-2 text-sm">
               {ROTATE_OPTIONS.map(o => <option key={o.value} value={o.label}>{o.label}</option>)}
             </select>
           </div>
-          <div>
-            <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">YUV 相关设置</p>
-            <div className="space-y-2">
-              <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={mixedYuv} onChange={e => setMixedYuv(e.target.checked)} />
-                混合目录（.nv21/.nv12/.yuv 按 YUV 读，其余按图）
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={bYuv} onChange={e => setBYuv(e.target.checked)} />
-                整批均为 YUV（与「混合目录」二选一通常只开其一）
-              </label>
+          {mediaNeedsYuv(mediaMode) && (
+            <div>
+              <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">YUV 解码</p>
+              <p className="text-xs text-gray-400 mb-2">
+                .nv21 / .nv12 按后缀解码。.yuv 使用这里选择的格式（文件名里含 nv12、nv21、420p 时优先跟文件名）。
+              </p>
               <div className="flex gap-4">
                 <div>
-                  <label className="block text-xs text-gray-500">YUV 宽度</label>
-                  <input type="number" value={yuvW} onChange={e => setYuvW(Number(e.target.value))} className="border rounded px-2 py-1 text-sm w-24" />
+                  <label className="block text-xs text-gray-500">宽度</label>
+                  <input type="number" min={1} value={yuvW} onChange={e => setYuvW(Number(e.target.value))} className="border rounded px-2 py-1 text-sm w-24" />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500">YUV 高度</label>
-                  <input type="number" value={yuvH} onChange={e => setYuvH(Number(e.target.value))} className="border rounded px-2 py-1 text-sm w-24" />
+                  <label className="block text-xs text-gray-500">高度</label>
+                  <input type="number" min={1} value={yuvH} onChange={e => setYuvH(Number(e.target.value))} className="border rounded px-2 py-1 text-sm w-24" />
                 </div>
                 <div>
-                  <label className="block text-xs text-gray-500">YUV 类型</label>
+                  <label className="block text-xs text-gray-500">格式</label>
                   <select value={yuvType} onChange={e => setYuvType(e.target.value)} className="border rounded px-2 py-1 text-sm">
-                    {YUV_TYPES.map(t => <option key={t} value={t}>{t}</option>)}
+                    <option value="nv12">NV12</option>
+                    <option value="nv21">NV21</option>
+                    <option value="yuv420p">420p</option>
                   </select>
                 </div>
               </div>
             </div>
-          </div>
+          )}
           <button onClick={confirmTask} className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700">
             确认
           </button>

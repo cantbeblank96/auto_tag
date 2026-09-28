@@ -297,6 +297,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ dirs }),
     }),
+  /** 在运行后端的电脑上打开系统目录窗口，返回绝对路径 */
+  pickDirectory: (initialDir?: string) =>
+    fetchJSON<{ cancelled: boolean; path: string | null }>('/utils/pick_directory', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: '选择输入目录',
+        initial_dir: initialDir || '',
+      }),
+    }),
   validateExportDir: (path: string, createIfMissing = false) =>
     fetchJSON<ValidateExportDirResult>('/utils/validate_export_dir', {
       method: 'POST',

@@ -13,4 +13,5 @@ echo "    API 请求会代理到 http://localhost:8000"
 # 如环境 inotify 充裕，可设 CHOKIDAR_USEPOLLING=0 恢复原生监听
 export CHOKIDAR_USEPOLLING="${CHOKIDAR_USEPOLLING:-1}"
 export CHOKIDAR_INTERVAL="${CHOKIDAR_INTERVAL:-2000}"
-exec npm run dev
+# --host 0.0.0.0：避免 Vite 只绑 IPv6 ::1，导致 127.0.0.1 探测失败（与 Windows 脚本一致）
+exec npm run dev -- --host 0.0.0.0 --port "${FRONTEND_PORT:-5020}"

@@ -92,13 +92,7 @@ function questionToDetail(q: QuestionEntry): QuestionDetail | null {
     if (q.type === 'float' && q.step) d.step = Number(q.step)
   }
   if (Array.isArray(q.tools) && q.tools.length) d.tools = q.tools
-  // 参考样图：仅保留档位值与路径都非空的行
-  const ex: Record<string, string> = {}
-  for (const e of q.examples || []) {
-    const v = e.value.trim()
-    const p = e.path.trim()
-    if (v && p) ex[v] = p
-  }
+  const ex = examplesToObject(q.examples || [])
   if (Object.keys(ex).length) d.examples = ex
   return d
 }
@@ -134,9 +128,7 @@ function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
     step: detail.step != null ? String(detail.step) : '',
     freeformJson: JSON.stringify(detail, null, 2),
     tools: Array.isArray(detail.tools) ? detail.tools.map(String) : [],
-    examples: detail.examples && typeof detail.examples === 'object' && !Array.isArray(detail.examples)
-      ? Object.entries(detail.examples).map(([value, path]) => ({ value, path: String(path) }))
-      : [],
+    examples: examplesFromConfig(detail.examples),
   }
 }
 
@@ -144,7 +136,25 @@ function emptyQuestion(): QuestionEntry {
   return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}', tools: [], examples: [] }
 }
 
-/** 模版态 examples 行 → config 的 examples 对象（供 freeform JSON 同步）。 */
+/** 配置里的 examples 还原成行。一个档位一行；若曾存成路径列表，只保留最后一条。 */
+function examplesFromConfig(raw: unknown): { value: string; path: string }[] {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
+  const rows: { value: string; path: string }[] = []
+  for (const [value, path] of Object.entries(raw as Record<string, unknown>)) {
+    let text = ''
+    if (typeof path === 'string') text = path.trim()
+    else if (Array.isArray(path)) {
+      for (const item of path) {
+        const next = String(item ?? '').trim()
+        if (next) text = next
+      }
+    }
+    if (text) rows.push({ value, path: text })
+  }
+  return rows
+}
+
+/** 模版态 examples 行 → config。同一档位只保留最后一行。 */
 function examplesToObject(rows: { value: string; path: string }[]): Record<string, string> {
   const ex: Record<string, string> = {}
   for (const e of rows || []) {
@@ -214,6 +224,7 @@ export default function Settings() {
 
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
+  const [pickingExampleKey, setPickingExampleKey] = useState<string | null>(null)
   const [questionSearch, setQuestionSearch] = useState('')
   // 标注工具管理
   const [annotationTools, setAnnotationTools] = useState<AnnotationToolStatus[]>([])
@@ -508,6 +519,26 @@ export default function Settings() {
     next[idx] = { ...next[idx], enabled: !next[idx].enabled }
     setQuestions(next)
     markDirty()
+  }
+  const pickExampleDir = async (qi: number, ei: number) => {
+    const pickKey = `${qi}-${ei}`
+    if (pickingExampleKey) return
+    setPickingExampleKey(pickKey)
+    try {
+      const current = questions[qi]?.examples[ei]?.path || ''
+      const res = await api.pickDirectory(current)
+      if (res.cancelled || !res.path) return
+      const next = [...questions]
+      const rows = [...next[qi].examples]
+      rows[ei] = { ...rows[ei], path: res.path }
+      next[qi] = { ...next[qi], examples: rows }
+      setQuestions(next)
+      markDirty()
+    } catch (e: any) {
+      showMsg(e?.message || '无法打开目录选择窗口', 'error')
+    } finally {
+      setPickingExampleKey(null)
+    }
   }
 
   // 标注工具 handlers
@@ -925,7 +956,7 @@ export default function Settings() {
                   <div><label className={labelCls}>JSON 定义</label><textarea value={q.freeformJson} onChange={e => updateQuestion(idx, { freeformJson: e.target.value })} rows={4} className={inputCls} /></div>
                 )}
                 <div className="mt-2">
-                  <label className={labelCls}>参考样图 examples（档位值 → 样图路径，注入 VLM 辅助校准尺度）</label>
+                  <label className={labelCls}>参考样图 examples（档位值 → 图片或文件夹，注入 VLM 辅助校准尺度）</label>
                   {(q.examples.length > 0) && (
                     <div className="space-y-1.5">
                       {q.examples.map((ex, ei) => (
@@ -933,9 +964,18 @@ export default function Settings() {
                           <input type="text" value={ex.value} placeholder={q.type === 'category' ? '类别名' : '档位值（如 2.5）'}
                             onChange={e => { const next = [...q.examples]; next[ei] = { ...next[ei], value: e.target.value }; updateQuestion(idx, { examples: next }) }}
                             className="border border-gray-300 dark:border-gray-600 rounded px-2 py-1 text-sm bg-white dark:bg-gray-900 dark:text-gray-200 w-32 shrink-0 font-mono" />
-                          <input type="text" value={ex.path} placeholder="样图路径（绝对路径，或相对 config.json 目录）"
+                          <input type="text" value={ex.path} placeholder="图片或文件夹路径（绝对路径，或相对 config.json 目录）"
                             onChange={e => { const next = [...q.examples]; next[ei] = { ...next[ei], path: e.target.value }; updateQuestion(idx, { examples: next }) }}
                             className="border border-gray-300 dark:border-gray-600 rounded px-2 py-1 text-sm bg-white dark:bg-gray-900 dark:text-gray-200 flex-1 min-w-0 font-mono" />
+                          <button
+                            type="button"
+                            onClick={() => void pickExampleDir(idx, ei)}
+                            disabled={pickingExampleKey !== null}
+                            title="在运行后端的电脑上选择文件夹，填入这一行"
+                            className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0 disabled:opacity-50"
+                          >
+                            {pickingExampleKey === `${idx}-${ei}` ? '选择中…' : '选目录'}
+                          </button>
                           <button onClick={() => updateQuestion(idx, { examples: q.examples.filter((_, i2) => i2 !== ei) })}
                             className="px-1.5 py-0.5 text-xs text-red-600 border border-red-200 dark:border-red-800 rounded hover:bg-red-50 dark:hover:bg-red-900/30 dark:text-red-400 shrink-0">×</button>
                         </div>
@@ -944,7 +984,9 @@ export default function Settings() {
                   )}
                   <button onClick={() => updateQuestion(idx, { examples: [...q.examples, { value: '', path: '' }] })}
                     className="mt-1.5 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">+ 添加样图</button>
-                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">档位值需符合本问题类型（category 用类别名）；保存后免重启生效</p>
+                  <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                    每个档位只保留一行，重复档位以后填的路径为准。路径可以是单张图片，也可以是文件夹；文件夹按文件名字典序最多读取 2 张合法图片（png/jpg/jpeg/bmp/webp/gif/tif，含子目录）。档位值需符合本问题类型（category 用类别名）。
+                  </p>
                 </div>
                 {annotationTools.filter(t => t.enabled && t.available).length > 0 && (
                   <div className="mt-2">

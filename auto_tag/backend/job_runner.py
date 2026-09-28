@@ -42,6 +42,25 @@ except Exception:
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s - %(message)s"
 
 
+def _log_reference_examples() -> None:
+    """写入任务日志开头：各问题档位实际选用的参考图路径。"""
+    from auto_tag.core.config import settings
+    from auto_tag.core.example_sources import planned_example_rows
+
+    rows = planned_example_rows(getattr(settings, "questions", None))
+    if not rows:
+        logger.info("参考样图: 本次任务未配置")
+        return
+    logger.info("参考样图:")
+    for qkey, value, source, paths in rows:
+        if paths:
+            logger.info("  %s = %s", qkey, value)
+            for path in paths:
+                logger.info("    %s", path)
+        else:
+            logger.info("  %s = %s  （未找到可用图片，配置路径: %s）", qkey, value, source or "空")
+
+
 def job_log_file(job_id: str) -> str:
     """任务级日志落盘路径：work_dir/log/jobs/job_{job_id}.log（后端重启不丢）。"""
     j = _jobs.get(job_id)
@@ -169,6 +188,7 @@ def submit_job(cfg: PipelineConfig) -> str:
                 except Exception:
                     logger.exception("create job log file failed for %s", job_id)
                     file_handler = None
+            _log_reference_examples()
 
             def on_progress(
                 done: int,

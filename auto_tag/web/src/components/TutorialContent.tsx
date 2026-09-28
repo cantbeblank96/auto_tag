@@ -220,16 +220,7 @@ export default function TutorialContent() {
             <p>「任务」页「新建」支持两种图片来源（可切换）：</p>
             <ul className="list-disc list-inside space-y-1">
               <li>
-                <strong>目录扫描</strong> — 每行一个输入目录（绝对路径），可叠加图片过滤：
-                <ul className="list-disc list-inside ml-4 mt-1">
-                  <li>
-                    <strong>按后缀</strong> — 逗号/换行分隔的后缀白名单（如 <code className={codeCls}>.jpg, .png</code>）；留空 = 全部常见后缀
-                  </li>
-                  <li>
-                    <strong>按正则</strong> — 文件名正则（如 <code className={codeCls}>.*_front\.jpg$</code>），非空时优先于后缀过滤；
-                    可选忽略大小写（默认）与匹配完整路径（默认仅文件名）
-                  </li>
-                </ul>
+                <strong>目录扫描</strong> — 每行一个输入目录（绝对路径）。可点「添加目录」打开系统目录窗口（Windows 可选任意盘符），也可直接粘贴路径。用「待标注文件」三选一决定收集范围：只收原始 YUV（.nv21/.nv12/.yuv）、只收可视化图片（.jpg/.jpeg/.png/.webp/.bmp），或两类都作为独立文件标注。后缀匹配忽略大小写。
               </li>
               <li>
                 <strong>列表指定（image_ls）</strong> — 每行一个列表文件路径，显式指定待处理图片集合，支持两种格式：
@@ -327,16 +318,7 @@ export default function TutorialContent() {
                 支持格式：<code className={codeCls}>.nv21 / .nv12 / .yuv</code>
               </li>
               <li>
-                两种模式：
-                <ul className="list-disc list-inside ml-4">
-                  <li>
-                    <strong>整批 YUV</strong> — 所有输入文件都按 YUV 解码
-                  </li>
-                  <li>
-                    <strong>混合目录（mixed_yuv）</strong> — 同目录下 JPG/PNG 按图处理，
-                    <code className={codeCls}>.nv21/.nv12/.yuv</code> 按 YUV 处理
-                  </li>
-                </ul>
+                在「待标注文件」里选择原始 YUV 或混合目录后，填写宽、高和格式（NV12 / NV21 / 420p）。.nv21、.nv12 按后缀解码，.yuv 使用所选格式。可视化图片模式不需要这些参数。
               </li>
               <li>
                 解码参数（宽、高、类型）在提交任务时指定，且会随向量元数据保存，后续在图片查询页预览时会自动沿用。
@@ -434,7 +416,7 @@ bash scripts/linux/run_web_frontend_v2.sh`}
     "step": 0.1,
     "examples": {
       "2.5": "examples/brightness_2.5.jpg",
-      "7.5": "/abs/path/to/brightness_7.5.jpg"
+      "7.5": "/abs/path/to/brightness_7.5/"
     }
   }
 }`}
@@ -442,8 +424,10 @@ bash scripts/linux/run_web_frontend_v2.sh`}
             <p>
               <strong>参考样图（examples）</strong>：可为任意问题配置「档位值 → 样图路径」映射（如上例），
               标注时样图随 prompt 注入 VLM，帮助模型对齐评分尺度，尤其适合亮度/清晰度/人脸大小等主观连续量。
+              每个档位只保留一条路径，重复填写时以后写的为准。路径可以是单张图片，也可以是文件夹；
+              文件夹按文件名字典序最多读取 2 张合法图片。
               在「设置 → Questions」卡片内可直接增删样图行；路径支持绝对路径或相对{' '}
-              <code className={codeCls}>config.json</code> 目录的相对路径，保存后免重启生效。
+              <code className={codeCls}>config.json</code> 目录的相对路径。
             </p>
             <ul className="list-disc list-inside space-y-1 text-xs text-gray-400">
               <li>
