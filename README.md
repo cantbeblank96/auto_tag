@@ -61,7 +61,7 @@
 - **双击 bat 一闪而过 / 提示找不到 Python**  
   多半环境没装好。把黑窗口完整截图发给维护同学，不要反复乱点。
 - **浏览器打不开或一直转圈**  
-  先 `restart_web.bat`，仍不行再把 `%TEMP%\auto_tag_web_backend.log` 和 `auto_tag_web_frontend.log`（在用户临时目录）交给维护同学。
+  先 `restart_web.bat`，仍不行再把项目里的 `logs\auto_tag_web_backend.log` 和 `logs\auto_tag_web_frontend.log` 交给维护同学。
 - **提示端口被占用**  
   先 `stop_web.bat`，等几秒再 `start_web.bat`。
 
@@ -128,6 +128,8 @@ python -m auto_tag.main --input_dir D:\images --work_dir .\work
 | `scripts\windows\start_web.bat` | 一键启动前后端 |
 | `scripts\windows\stop_web.bat` | 一键关闭 |
 | `scripts\windows\restart_web.bat` | 一键重启 |
+
+日志与 Linux 相同，写在仓库 `logs\auto_tag_web_backend.log`、`logs\auto_tag_web_frontend.log`。
 
 > 说明：`.bat` 窗口提示为英文（避免 Windows 默认编码把中文 bat 解析乱）；实际关闭/启动逻辑在同目录的 `.ps1` 中，中文说明仍会正常显示。
 

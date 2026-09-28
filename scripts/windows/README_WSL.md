@@ -65,7 +65,7 @@ curl.exe -s http://127.0.0.1:5020/api/annotation_tools
 | 组件 | 路径 |
 |------|------|
 | WSL 后端 | `{仓库}/logs/wsl_backend.log` |
-| Windows 前端 | `%TEMP%\auto_tag_web_frontend.log` |
+| Windows 前端 | `{仓库}/logs/auto_tag_web_frontend.log` |
 
 前端由 `start_web_wsl.ps1` 启动时会设置环境变量 **`AUTO_TAG_API_PROXY=http://<WSL-IP>:8000`**，
 Vite 将 `/api` 代理到 WSL 后端（见 `auto_tag/web/vite.config.ts`）。  
@@ -84,4 +84,4 @@ A：是否误用了 `restart_web.bat`（Windows 原生后端）。请改用 `res
 A：查看 `logs/wsl_backend.log`；确认 WSL 内已执行 `install_kevin_sdk_wsl.sh`，且 `~/.venvs/kevin_auto_tag_wsl` 存在。
 
 **Q：前端 5020 打不开？**  
-A：确认 Node.js 在 PATH 或设置 `NODE_DIR`；查看 `%TEMP%\auto_tag_web_frontend.log`。
+A：确认 Node.js 在 PATH 或设置 `NODE_DIR`；查看 `logs/auto_tag_web_frontend.log`。

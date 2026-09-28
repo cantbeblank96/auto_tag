@@ -17,6 +17,7 @@ from auto_tag.core.utils.directory_dialog import (
     DirectoryDialogBusy,
     DirectoryDialogError,
     DirectoryPickResult,
+    _resolve_wsl_powershell,
     build_kdialog_argv,
     build_osascript_argv,
     build_windows_picker_argv,
@@ -68,6 +69,14 @@ class TestPosixPickerCommands(unittest.TestCase):
 
 
 class TestPickExistingDirectory(unittest.TestCase):
+    def setUp(self) -> None:
+        # 测试机若本身在 WSL 中，不能让宿主环境把 Linux 用例拐到 Windows 对话框。
+        self._wsl = mock.patch.object(dd, "_is_wsl", return_value=False)
+        self._wsl.start()
+
+    def tearDown(self) -> None:
+        self._wsl.stop()
+
     def test_linux_without_display(self) -> None:
         with mock.patch.object(sys, "platform", "linux"):
             with mock.patch.dict(os.environ, {}, clear=True):
@@ -169,6 +178,57 @@ class TestPickExistingDirectory(unittest.TestCase):
                         result = pick_existing_directory()
         self.assertIn("--backend", run.call_args.args[0])
         self.assertTrue(result.cancelled)
+
+    def test_wsl_uses_windows_dialog_not_tk(self) -> None:
+        with mock.patch.object(dd, "_is_wsl", return_value=True):
+            with mock.patch.object(sys, "platform", "linux"):
+                with mock.patch.object(dd, "_usable_initial", return_value="/mnt/d/data/images"):
+                    with mock.patch.object(dd, "_resolve_powershell", return_value="powershell.exe"):
+                        with mock.patch.object(dd, "_run_command", return_value=_proc(0, r"D:\data\images")) as run:
+                            with mock.patch.object(dd, "normalize_fs_path", return_value="/mnt/d/data/images"):
+                                with mock.patch("os.path.isdir", return_value=True):
+                                    result = pick_existing_directory(
+                                        "选择输入目录",
+                                        initial_dir="/mnt/d/data/images",
+                                    )
+        argv = run.call_args.args[0]
+        self.assertTrue(argv[0].lower().endswith("powershell.exe"))
+        self.assertNotIn("directory_dialog", argv)
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["AUTO_TAG_PICK_INITIAL"], r"D:\data\images")
+        self.assertFalse(result.cancelled)
+        self.assertEqual(result.path, r"D:\data\images")
+
+    def test_wsl_resolver_uses_windows_powershell_exe(self) -> None:
+        with mock.patch("auto_tag.core.utils.directory_dialog.shutil.which", return_value=None):
+            with mock.patch("os.path.isfile", return_value=True):
+                found = _resolve_wsl_powershell()
+        self.assertEqual(
+            found,
+            "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+        )
+
+        def which(name: str) -> str | None:
+            if name == "pwsh":
+                return "/usr/bin/pwsh"
+            if name == "powershell.exe":
+                return "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+            return None
+
+        with mock.patch("auto_tag.core.utils.directory_dialog.shutil.which", side_effect=which):
+            found = _resolve_wsl_powershell()
+        self.assertTrue(found.endswith("powershell.exe"))
+        self.assertNotIn("pwsh", found)
+
+    def test_wsl_does_not_fall_back_to_tk(self) -> None:
+        with mock.patch.object(dd, "_is_wsl", return_value=True):
+            with mock.patch.object(sys, "platform", "linux"):
+                with mock.patch.object(dd, "_resolve_powershell", return_value="powershell.exe"):
+                    with mock.patch.object(dd, "_tk_importable", return_value=True):
+                        with mock.patch.object(dd, "_run_command", return_value=_proc(1, stderr="boom")) as run:
+                            with self.assertRaises(DirectoryDialogError):
+                                pick_existing_directory()
+        self.assertNotIn("directory_dialog", run.call_args.args[0])
 
     def test_busy_when_dialog_already_open(self) -> None:
         self.assertTrue(dd._DIALOG_LOCK.acquire(blocking=False))

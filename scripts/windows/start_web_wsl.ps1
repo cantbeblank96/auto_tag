@@ -9,11 +9,19 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
 $BackendPort = if ($env:PORT) { [int]$env:PORT } else { 8000 }
 $FrontendPort = if ($env:FRONTEND_PORT) { [int]$env:FRONTEND_PORT } else { 5020 }
-$BackendLog = Join-Path $RepoRoot "logs\wsl_backend.log"
+$LogDir = Join-Path $RepoRoot "logs"
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
+$BackendLog = if ($env:AUTO_TAG_BACKEND_LOG) {
+    $env:AUTO_TAG_BACKEND_LOG
+} else {
+    Join-Path $LogDir "wsl_backend.log"
+}
 $FrontendLog = if ($env:AUTO_TAG_FRONTEND_LOG) {
     $env:AUTO_TAG_FRONTEND_LOG
 } else {
-    Join-Path $env:TEMP "auto_tag_web_frontend.log"
+    Join-Path $LogDir "auto_tag_web_frontend.log"
 }
 
 function Add-NodeDirToPath([string]$dir) {

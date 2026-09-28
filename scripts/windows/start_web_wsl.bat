@@ -7,7 +7,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0start_web_wsl.ps1"
 set ERR=%ERRORLEVEL%
 echo.
 if %ERR% NEQ 0 (
-  echo Start failed. Error code: %ERR%. See logs under repo logs\ or %%TEMP%%.
+  echo Start failed. Error code: %ERR%. See logs under repo logs\.
 ) else (
   echo OK. Open http://localhost:5020 in browser.
 )

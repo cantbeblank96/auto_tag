@@ -3,9 +3,13 @@
 浏览器的目录选择控件不会把绝对路径交给网页，因此由本机进程弹出系统对话框，
 再把选中的绝对路径返回给前端填入「输入目录」。
 
-- Windows：PowerShell + FolderBrowserDialog，根节点为「此电脑」，可选任意盘符
+- Windows 原生，以及 WSL 中的后端：powershell.exe + FolderBrowserDialog
+  （系统「浏览文件夹」，根节点为「此电脑」，可选任意盘符）
 - macOS：osascript choose folder，失败时回退 tkinter
-- Linux：zenity，其次 kdialog，再回退 tkinter
+- Linux 本机：zenity，其次 kdialog，再回退 tkinter
+
+WSL 里 sys.platform 仍是 linux。若按 Linux 回退到 tkinter，WSLg 会在 Windows
+桌面上画出 Linux 风格的目录窗口。因此 WSL 只打开 Windows 对话框。
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import threading
 from dataclasses import dataclass
 from typing import Optional
 
-from auto_tag.core.utils.path_utils import normalize_fs_path
+from auto_tag.core.utils.path_utils import normalize_fs_path, posix_mount_to_windows_drive_path
 
 _DIALOG_LOCK = threading.Lock()
 
@@ -152,7 +156,8 @@ def pick_existing_directory(
         path = normalize_fs_path(raw)
         if not path or not os.path.isdir(path):
             raise DirectoryDialogError(f"所选路径不是可用目录：{raw}")
-        return DirectoryPickResult(cancelled=False, path=path)
+        # 对话框是 Windows 的，填回页面也用盘符路径（D:\...），与窗口里看到的一致。
+        return DirectoryPickResult(cancelled=False, path=_path_for_client(path))
     finally:
         _DIALOG_LOCK.release()
 
@@ -170,12 +175,24 @@ def _usable_initial(initial_dir: Optional[str]) -> Optional[str]:
     return None
 
 
+def _is_wsl() -> bool:
+    """当前进程是否跑在 WSL 中。这种环境下目录窗口应使用 Windows 原生对话框。"""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read().lower()
+    except OSError:
+        return False
+    return "microsoft" in text
+
+
 def _has_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _pick_raw(title: str, initial: Optional[str]) -> Optional[str]:
-    if sys.platform == "win32":
+    if sys.platform == "win32" or _is_wsl():
         return _pick_windows(title, initial)
     if sys.platform == "darwin":
         return _pick_darwin(title, initial)
@@ -189,14 +206,14 @@ def _pick_windows(title: str, initial: Optional[str]) -> Optional[str]:
         argv[0] = _resolve_powershell()
         proc = _run_command(argv, env=env)
     except DirectoryDialogError:
-        if _tk_importable():
-            return _pick_tk(title, initial)
-        raise
+        if _is_wsl() or not _tk_importable():
+            raise
+        return _pick_tk(title, initial)
     outcome = _interpret(proc, kind="windows")
     if outcome.failed:
-        if _tk_importable():
-            return _pick_tk(title, initial)
-        raise DirectoryDialogError(outcome.path or "无法打开 Windows 目录窗口")
+        if _is_wsl() or not _tk_importable():
+            raise DirectoryDialogError(outcome.path or "无法打开 Windows 目录窗口")
+        return _pick_tk(title, initial)
     return outcome.path
 
 
@@ -224,6 +241,11 @@ def _pick_linux(title: str, initial: Optional[str]) -> Optional[str]:
 
 
 def _pick_tk(title: str, initial: Optional[str]) -> Optional[str]:
+    if _is_wsl():
+        raise DirectoryDialogError(
+            "当前是 WSL 后端，应打开 Windows 目录窗口。未找到 powershell.exe 时"
+            "请直接填写路径，例如 D:\\images。"
+        )
     if sys.platform != "win32" and not _has_display():
         raise DirectoryDialogError(
             "当前环境没有图形界面，无法打开目录窗口。请直接在文本框填写绝对路径。"
@@ -241,11 +263,28 @@ def _pick_tk(title: str, initial: Optional[str]) -> Optional[str]:
 def _picker_env(title: str, initial: Optional[str]) -> dict[str, str]:
     env = os.environ.copy()
     env["AUTO_TAG_PICK_TITLE"] = title or "选择目录"
-    env["AUTO_TAG_PICK_INITIAL"] = initial or ""
+    env["AUTO_TAG_PICK_INITIAL"] = _initial_for_windows_dialog(initial)
     return env
 
 
+def _initial_for_windows_dialog(initial: Optional[str]) -> str:
+    """WSL 上把 /mnt/d/... 转成 D:\\...，否则 Windows 对话框无法定位初始目录。"""
+    shown = initial or ""
+    if not shown or not _is_wsl():
+        return shown
+    return posix_mount_to_windows_drive_path(shown) or shown
+
+
+def _path_for_client(path: str) -> str:
+    """WSL 上把校验用的 /mnt/d/... 还原成对话框返回的盘符路径。"""
+    if not _is_wsl():
+        return path
+    return posix_mount_to_windows_drive_path(path) or path
+
+
 def _resolve_powershell() -> str:
+    if _is_wsl():
+        return _resolve_wsl_powershell()
     system_root = os.environ.get("SystemRoot", r"C:\Windows")
     candidate = os.path.join(
         system_root,
@@ -260,6 +299,19 @@ def _resolve_powershell() -> str:
     if found:
         return found
     raise DirectoryDialogError("未找到 powershell.exe，无法打开 Windows 目录窗口")
+
+
+def _resolve_wsl_powershell() -> str:
+    """只用 Windows 的 powershell.exe。Linux 上的 pwsh 打不开系统「浏览文件夹」。"""
+    found = shutil.which("powershell.exe")
+    if found:
+        return found
+    mounted = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    if os.path.isfile(mounted):
+        return mounted
+    raise DirectoryDialogError(
+        "未找到 powershell.exe，无法打开 Windows 目录窗口。请直接填写路径，例如 D:\\images。"
+    )
 
 
 def _tk_importable() -> bool:

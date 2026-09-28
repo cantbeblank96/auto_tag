@@ -253,8 +253,8 @@ class PickDirectoryBody(BaseModel):
 def pick_directory(body: PickDirectoryBody) -> Dict[str, Any]:
     """在运行后端的电脑上打开系统目录窗口，返回选中的绝对路径。
 
-    取消选择时 cancelled 为 true。Windows 使用系统文件夹对话框（可选任意盘符）；
-    Linux / macOS 使用各自的系统目录窗口。
+    取消选择时 cancelled 为 true。Windows 与 WSL 后端使用系统「浏览文件夹」（可选任意盘符）；
+    Linux 本机 / macOS 使用各自的系统目录窗口。
     """
     try:
         result = pick_existing_directory(title=body.title, initial_dir=body.initial_dir)

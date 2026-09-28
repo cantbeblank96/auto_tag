@@ -3,7 +3,7 @@
 # 或双击：start_web.bat
 #
 # 启动后浏览器打开：http://localhost:5020
-# 日志默认写到：%TEMP%\auto_tag_web_backend.log / auto_tag_web_frontend.log
+# 日志默认写到：仓库 logs\auto_tag_web_backend.log / auto_tag_web_frontend.log
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -11,15 +11,19 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 $BackendPort = if ($env:PORT) { [int]$env:PORT } else { 8000 }
 $FrontendPort = if ($env:FRONTEND_PORT) { [int]$env:FRONTEND_PORT } else { 5020 }
+$LogDir = Join-Path $RepoRoot "logs"
+if (-not (Test-Path -LiteralPath $LogDir)) {
+    New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+}
 $BackendLog = if ($env:AUTO_TAG_BACKEND_LOG) {
     $env:AUTO_TAG_BACKEND_LOG
 } else {
-    Join-Path $env:TEMP "auto_tag_web_backend.log"
+    Join-Path $LogDir "auto_tag_web_backend.log"
 }
 $FrontendLog = if ($env:AUTO_TAG_FRONTEND_LOG) {
     $env:AUTO_TAG_FRONTEND_LOG
 } else {
-    Join-Path $env:TEMP "auto_tag_web_frontend.log"
+    Join-Path $LogDir "auto_tag_web_frontend.log"
 }
 
 function Test-ListenPort([int]$Port) {

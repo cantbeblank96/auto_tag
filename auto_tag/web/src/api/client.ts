@@ -13,7 +13,27 @@ async function fetchJSON<T>(url: string, init?: RequestInit, signal?: AbortSigna
   return res.json()
 }
 
-async function fetchBlob(url: string, params?: Record<string, any>, signal?: AbortSignal): Promise<Blob> {
+function filenameFromContentDisposition(header: string | null): string | undefined {
+  if (!header) return undefined
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;\s]+)/i.exec(header)
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].replace(/["']/g, ''))
+    } catch {
+      /* 回退普通 filename */
+    }
+  }
+  const quoted = /filename\s*=\s*"([^"]+)"/i.exec(header)
+  if (quoted?.[1]) return quoted[1]
+  const plain = /filename\s*=\s*([^;\s]+)/i.exec(header)
+  return plain?.[1]
+}
+
+async function fetchAttachment(
+  url: string,
+  params?: Record<string, any>,
+  signal?: AbortSignal,
+): Promise<{ blob: Blob; filename?: string }> {
   const qs = params ? '?' + new URLSearchParams(
     Object.entries(params).filter(([_, v]) => v != null).map(([k, v]) => [k, String(v)])
   ).toString() : ''
@@ -22,14 +42,22 @@ async function fetchBlob(url: string, params?: Record<string, any>, signal?: Abo
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(typeof err.detail === 'string' ? err.detail : res.statusText)
   }
-  return res.blob()
+  return {
+    blob: await res.blob(),
+    filename: filenameFromContentDisposition(res.headers.get('Content-Disposition')),
+  }
+}
+
+async function fetchBlob(url: string, params?: Record<string, any>, signal?: AbortSignal): Promise<Blob> {
+  const { blob } = await fetchAttachment(url, params, signal)
+  return blob
 }
 
 async function downloadJSON(url: string, params?: Record<string, any>, filename?: string): Promise<void> {
-  const blob = await fetchBlob(url, params)
+  const { blob, filename: fromHeader } = await fetchAttachment(url, params)
   const a = document.createElement('a')
   a.href = URL.createObjectURL(blob)
-  a.download = filename || 'export.json'
+  a.download = filename || fromHeader || 'export.json'
   document.body.appendChild(a)
   a.click()
   document.body.removeChild(a)
