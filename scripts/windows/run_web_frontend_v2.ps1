@@ -1,4 +1,4 @@
-# 启动 Vite 前端（v2）
+﻿# 启动 Vite 前端（v2）
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/run_web_frontend_v2.ps1
 # 可选：$env:NODE_DIR 指向 Node 安装目录（含 npm.cmd / node.exe），例如 D:\dev\node
 

@@ -1,4 +1,4 @@
-# 一键重启 Web 控制台（先关后开）
+﻿# 一键重启 Web 控制台（先关后开）
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/restart_web.ps1
 # 或双击：restart_web.bat
 

@@ -12,11 +12,11 @@ $BackendLog = Join-Path $RepoRoot "logs\wsl_backend.log"
 
 Write-Host "==> Free backend port $BackendPort (Windows listeners + WSL) ..."
 if (Test-ListenPort $BackendPort) {
-    $pids = @(
+    $listenPids = @(
         Get-NetTCPConnection -LocalPort $BackendPort -State Listen -ErrorAction SilentlyContinue |
             ForEach-Object { $_.OwningProcess }
     ) | Where-Object { $_ -and $_ -gt 0 } | Select-Object -Unique
-    foreach ($procId in $pids) {
+    foreach ($procId in $listenPids) {
         Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         Write-Host "  Stopped Windows PID=$procId on port $BackendPort"
     }

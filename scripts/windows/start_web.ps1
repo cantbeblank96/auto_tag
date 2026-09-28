@@ -1,4 +1,4 @@
-# 后台启动 Web 控制台（后端 + 前端）
+﻿# 后台启动 Web 控制台（后端 + 前端）
 # 用法：powershell -ExecutionPolicy Bypass -File scripts/windows/start_web.ps1
 # 或双击：start_web.bat
 #
