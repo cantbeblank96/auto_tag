@@ -28,10 +28,12 @@ router = APIRouter(prefix="/database", tags=["database"])
 _EXPORT_MAX = 200_000
 
 
-def _finalize_json_export(
+def _finalize_file_export(
     payload_bytes: bytes,
     filename: str,
     output_dir: Optional[str],
+    *,
+    media_type: str,
 ) -> Response | Dict[str, Any]:
     """浏览器附件下载，或写入 output_dir 后返回 JSON。"""
     od = (output_dir or "").strip()
@@ -42,10 +44,20 @@ def _finalize_json_export(
             raise HTTPException(status_code=400, detail=str(e)) from e
     return Response(
         content=payload_bytes,
-        media_type="application/json; charset=utf-8",
+        media_type=media_type,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
         },
+    )
+
+
+def _finalize_json_export(
+    payload_bytes: bytes,
+    filename: str,
+    output_dir: Optional[str],
+) -> Response | Dict[str, Any]:
+    return _finalize_file_export(
+        payload_bytes, filename, output_dir, media_type="application/json; charset=utf-8"
     )
 
 
@@ -503,6 +515,26 @@ def export_compact_chunk(
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     return _finalize_json_export(
         body, f"auto_tag_compact_chunk_{chunk_index}.json", output_dir
+    )
+
+
+@router.get("/export_labels_csv", response_model=None)
+def export_labels_csv(
+    work_dir: Optional[str] = Query(None),
+    output_dir: Optional[str] = Query(None, description="若指定则写入该目录，否则浏览器下载"),
+) -> Response | Dict[str, Any]:
+    """全量可读 CSV：图片完整路径、文件名、标签 ID，以及展开后的每个标签值。"""
+    from auto_tag.core.compact_labels_export import build_compact_export
+    from auto_tag.core.labels_csv_export import compact_labels_csv
+
+    wr, _, _ = _resolve_paths(work_dir)
+    try:
+        full = build_compact_export(wr)
+        body = compact_labels_csv(full, question_keys=settings.questions or {})
+    except (FileNotFoundError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return _finalize_file_export(
+        body, "auto_tag_labels.csv", output_dir, media_type="text/csv; charset=utf-8"
     )
 
 

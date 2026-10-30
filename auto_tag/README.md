@@ -177,6 +177,42 @@ FastAPI（`auto_tag/backend`）与 React 前端（`auto_tag/web/`）分进程，
 * **数据库**：统计与 config 快照差异比对；重算关系 / 完全重建 / 更新标注；多种导出（默认 `limit` **200000**）。「更新」区内 JSON 详情默认折叠。
 * **设置**：`vlm_models`（含 **`id`** 端点标识）、熔断器、Questions 在线编辑；保存后可重启后端生效。
 
+### Windows 目录选择体验
+
+任务页“添加目录”和设置页样图“选目录”在 Windows 原生或 WSL 后端下，均打开 Windows 原生现代目录选择窗口（`IFileOpenDialog`），支持地址栏、搜索、侧栏导航和盘符选择，选中后仍回填绝对路径。窗口使用系统原生样式。
+
+Windows 以 auto_tag 独立标识保存上次访问目录及窗口位置/大小；页面传来的初始路径只作为没有历史记录时的默认位置。WSL 会显式共享所需子进程变量，并处理 `D:\...` 与 `/mnt/d/...` 转换。现代窗口无法启动时显示错误，可直接在输入框粘贴路径。
+
+更新后请重启后端再使用。当前 Linux 验证环境无法显示 Windows 窗口；Windows / WSL 上运行 `python -m unittest auto_tag.test.test_directory_dialog -v` 会额外编译真实 C# 组件并执行不弹窗的 COM 检查。实际外观、系统历史恢复和深色模式效果仍需在 Windows 实机确认。
+
+### Questions 配置导入与导出
+
+设置页的 **Questions 管理** 提供两个入口：
+
+- **导出配置**：下载 `auto_tag_questions.json`，包含当前全部问题（包括未保存和停用项）、工具绑定、参考样图路径以及自由 JSON 的自定义字段。使用带缩进的 UTF-8 JSON，可直接阅读和修改；搜索筛选不影响导出范围，样图文件本身不打包。
+- **导入并生效**：选择相同格式的 JSON，完整校验后替换 Questions、写入配置并热加载，无需再次点击保存或重启后端。其他磁盘配置和页面上尚未保存的其他设置保持原状。空 `questions` 对象表示清空全部问题。
+
+文件使用 `format: "auto_tag.questions"`、`version: 1`；`questions` 沿用现有问题定义结构，`editor` 保存每个问题的 `enabled` 和 `mode`（`template` / `freeform`）：
+
+```json
+{
+  "format": "auto_tag.questions",
+  "version": 1,
+  "questions": {
+    "scene": {
+      "description": "描述图片场景",
+      "type": "category",
+      "choices": ["室内", "室外"]
+    }
+  },
+  "editor": {
+    "scene": { "enabled": true, "mode": "template" }
+  }
+}
+```
+
+导入配置的 `questions_editor` 段保留完整编辑状态，刷新后可恢复停用问题；运行时 `questions` 仍只包含启用的问题，并遵循全局工具开关。格式错误不会覆盖当前问题；若写盘成功但热加载失败，页面会明确提示“已保存但未生效”，可重试导入或重启后端。前端回归测试运行 `cd auto_tag/web && npm test`（Node.js 22.18+）。
+
 ### REST 要点
 
 | 能力 | 方法 | 路径 |
@@ -195,6 +231,7 @@ FastAPI（`auto_tag/backend`）与 React 前端（`auto_tag/web/`）分进程，
 | 紧凑导出（共享字典） | GET | `/api/database/export_compact_shared` |
 | 紧凑导出（平行字段切片） | GET | `/api/database/export_compact_slice?offset=&limit=` |
 | 紧凑导出（平行字段分块） | GET | `/api/database/export_compact_chunk?chunk_index=&chunk_size=` |
+| 可读标签 CSV（全部图片） | GET | `/api/database/export_labels_csv` |
 | 仅重算关系（复用向量与 labels，按当前 τ 重算簇） | POST | `/api/database/recompute_relations`（与 `/api/jobs` 互斥） |
 | 完全重建索引（快照 `input_dirs` 全量重跑流水线） | POST | `/api/database/rebuild_relations`（与 `/api/jobs` 互斥） |
 | 更新标注（VLM 全量或增量） | POST | `/api/database/reannotate`（body：`full_refresh` / `incremental` 二选一，`centers_only` 可选） |
@@ -208,6 +245,22 @@ FastAPI（`auto_tag/backend`）与 React 前端（`auto_tag/web/`）分进程，
 ### 索引元数据扩展
 
 新写入记录优先使用 **`path_prefix_id` + `image_rel_path`**；查询与 HTTP API 仍会解析为绝对路径。旧数据仅含 **`image_path`** 时仍可查询。另写入 **`media_kind`**（`rgb`/`yuv`）、**`pix_w`**、**`pix_h`**、**`yuv_layout`**，便于预览与 YUV 解码。
+
+### 可读标签 CSV 导出
+
+在 **数据库 → 导出 → 紧凑标注 → 可读标签 CSV** 点击 **导出全部图片 CSV**，下载 `auto_tag_labels.csv`；也支持现有的“保存到本机目录”方式。无需先下载或上传两份 JSON。
+
+CSV 直接复用生成共享字典和数据切片的同一套完整数据，将 `labels_id` 映射到实际标签值。每张图片一行，前三列固定为：
+
+| 列 | 内容 |
+|---|---|
+| `origin_path` | 图片完整路径，包含文件名 |
+| `image_name` | 图片文件名，包含扩展名 |
+| `label_id` | 紧凑 JSON 中该行的 `labels_id`，可用于定位共享字典中的标签组合 |
+
+之后每个标签 key 独占一列，单元格保存其 value；当前 Questions 的顺序优先，历史数据中的额外标签按字典序追加。空标签的图片仍保留行和 ID，缺失值或 `null` 留空，数值 `0`、布尔值 `false` 正常保留，数组/对象以单行 JSON 存储。若标签名与前三列或其他列重名，会追加 `label.` 前缀直到唯一，避免覆盖。
+
+文件使用带 BOM 的 UTF-8 和标准 CSV 转义，支持 Excel 中文、逗号、引号及换行。CSV 导出全部图片，不受 JSON 切片 20 万条上限限制。ID 对应导出时的数据状态；数据库更新后，请重新导出需要对照的 CSV 和 JSON。
 
 ### 紧凑标注导出（CLI）
 

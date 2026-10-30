@@ -556,7 +556,7 @@ export default function Tasks() {
                   rows={4}
                 />
                 <p className="text-xs text-gray-400 mt-1">
-                  「添加目录」会在运行后端的电脑上弹出系统目录窗口，选中后把绝对路径追加到上面。Windows 下可选任意盘符（如 D:\images）；也可以直接粘贴路径。
+                  「添加目录」会在运行后端的电脑上弹出系统目录窗口，选中后把绝对路径追加到上面。Windows / WSL 使用资源管理器式窗口并记忆上次浏览位置；也可以直接粘贴路径，如 D:\images。
                 </p>
               </div>
             </>

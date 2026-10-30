@@ -31,26 +31,87 @@ def _proc(code: int, stdout: str = "", stderr: str = "") -> subprocess.Completed
 
 
 class TestWindowsPickerCommand(unittest.TestCase):
-    def test_encoded_script_uses_any_drive_dialog(self) -> None:
+    def test_windows_command_uses_sta_and_fits_command_line_limit(self) -> None:
         argv = build_windows_picker_argv()
         self.assertEqual(argv[0], "powershell.exe")
         self.assertIn("-STA", argv)
         self.assertIn("-EncodedCommand", argv)
-        encoded = argv[-1]
-        script = base64.b64decode(encoded).decode("utf-16le")
-        self.assertIn("FolderBrowserDialog", script)
-        self.assertIn("MyComputer", script)
-        self.assertIn("ShowNewFolderButton = $false", script)
-        self.assertIn("AUTO_TAG_PICK_TITLE", script)
-        self.assertIn("AUTO_TAG_PICK_INITIAL", script)
-        self.assertIn("exit 0", script)
-        self.assertIn("exit 2", script)
+        self.assertLess(len(subprocess.list2cmdline(argv)), 32767)
+
+    def test_picker_carries_native_source_and_unicode_inputs_in_environment(self) -> None:
+        with mock.patch.object(dd, "_is_wsl", return_value=False):
+            env = dd._picker_env("选择训练图片", r"D:\含空格的目录\训练集")
+        self.assertEqual(env["AUTO_TAG_PICK_TITLE"], "选择训练图片")
+        self.assertEqual(env["AUTO_TAG_PICK_INITIAL"], r"D:\含空格的目录\训练集")
+        self.assertTrue(env["AUTO_TAG_PICK_SOURCE"])
+        # 源文件走环境而非 EncodedCommand，给真实 Windows 路径和参数留足空间。
+        self.assertLess(len(env["AUTO_TAG_PICK_SOURCE"]), 32767)
 
     def test_title_is_not_embedded_in_the_command(self) -> None:
         argv = build_windows_picker_argv()
         joined = " ".join(argv)
         self.assertNotIn("选择输入目录", joined)
         self.assertNotIn("D:\\", joined)
+
+    def test_wsl_forwards_picker_variables_without_path_conversion(self) -> None:
+        original = "KEEP_ME/p:AUTO_TAG_PICK_SOURCE/lp:AUTO_TAG_PICK_TITLE/u"
+        with mock.patch.object(dd, "_is_wsl", return_value=True), \
+             mock.patch.dict(os.environ, {"WSLENV": original}):
+            env = dd._picker_env("选择目录", "/mnt/d/训练图")
+            self.assertEqual(os.environ["WSLENV"], original)
+        self.assertEqual(env["AUTO_TAG_PICK_INITIAL"], "D:\\训练图")
+        self.assertEqual(set(env["WSLENV"].split(":")), {
+            "KEEP_ME/p", "AUTO_TAG_PICK_TITLE/w", "AUTO_TAG_PICK_INITIAL/w", "AUTO_TAG_PICK_SOURCE/w",
+        })
+
+    def test_missing_native_component_reports_actionable_error(self) -> None:
+        with mock.patch("builtins.open", side_effect=OSError("missing source")), \
+             mock.patch.object(dd, "_is_wsl", return_value=False):
+            with self.assertRaisesRegex(DirectoryDialogError, "Windows 目录选择组件"):
+                dd._picker_env("选择目录", None)
+
+    @unittest.skipUnless(sys.platform == "win32" or dd._is_wsl(), "需要 Windows PowerShell 和原生 COM")
+    def test_native_com_options_work_without_showing_dialog(self) -> None:
+        # 编译真实 C# 源并调用真实 COM 方法；不弹窗、不修改 auto_tag 的历史 GUID。
+        script = r'''
+$ErrorActionPreference = "Stop"
+try {
+    Add-Type -TypeDefinition $env:AUTO_TAG_PICK_SOURCE -Language CSharp
+    $assembly = [AutoTag.WindowsFolderPicker].Assembly
+    $dialogType = $assembly.GetType("AutoTag.FileOpenDialog")
+    $interfaceType = $assembly.GetType("AutoTag.IFileOpenDialog")
+    $dialog = [Activator]::CreateInstance($dialogType)
+    try {
+        $guidArgs = [object[]]@([Guid]::NewGuid())
+        $hr = $interfaceType.GetMethod("SetClientGuid").Invoke($dialog, $guidArgs)
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([int]$hr)
+        $getArgs = [object[]]@([uint32]0)
+        $hr = $interfaceType.GetMethod("GetOptions").Invoke($dialog, $getArgs)
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([int]$hr)
+        $options = [uint32]$getArgs[0] -bor 0x20 -bor 0x40 -bor 0x800
+        $setArgs = [object[]]@([uint32]$options)
+        $hr = $interfaceType.GetMethod("SetOptions").Invoke($dialog, $setArgs)
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([int]$hr)
+        $hr = $interfaceType.GetMethod("GetOptions").Invoke($dialog, $getArgs)
+        [Runtime.InteropServices.Marshal]::ThrowExceptionForHR([int]$hr)
+        if (($getArgs[0] -band 0x860) -ne 0x860) { throw "Folder options were not applied" }
+        [Console]::Out.WriteLine("COM_OK")
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($dialog)
+    }
+    exit 0
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
+    exit 1
+}
+'''
+        argv = build_windows_picker_argv()
+        argv[0] = dd._resolve_powershell()
+        argv[-1] = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+        proc = subprocess.run(argv, env=dd._picker_env("测试", None), capture_output=True,
+                              encoding="utf-8", errors="replace", timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("COM_OK", proc.stdout)
 
 
 class TestPosixPickerCommands(unittest.TestCase):
@@ -170,14 +231,28 @@ class TestPickExistingDirectory(unittest.TestCase):
         self.assertEqual(env["AUTO_TAG_PICK_INITIAL"], "")
         self.assertTrue(result.cancelled)
 
-    def test_windows_powershell_failure_falls_back_to_tk(self) -> None:
+    def test_windows_powershell_failure_is_reported_without_legacy_fallback(self) -> None:
         with mock.patch.object(sys, "platform", "win32"):
             with mock.patch.object(dd, "_resolve_powershell", side_effect=DirectoryDialogError("no ps")):
                 with mock.patch.object(dd, "_tk_importable", return_value=True):
                     with mock.patch.object(dd, "_run_command", return_value=_proc(2)) as run:
-                        result = pick_existing_directory()
-        self.assertIn("--backend", run.call_args.args[0])
-        self.assertTrue(result.cancelled)
+                        with self.assertRaises(DirectoryDialogError):
+                            pick_existing_directory()
+        run.assert_not_called()
+
+    def test_windows_unexpected_exit_is_an_error_and_releases_dialog_lock(self) -> None:
+        for proc in (_proc(1), _proc(1, stderr="COM failed"), _proc(2, stderr="bad command"), _proc(0)):
+            with self.subTest(returncode=proc.returncode, stderr=proc.stderr):
+                with mock.patch.object(sys, "platform", "win32"), \
+                     mock.patch.object(dd, "_resolve_powershell", return_value="powershell.exe"), \
+                     mock.patch.object(dd, "_tk_importable", return_value=True), \
+                     mock.patch.object(dd, "_run_command", return_value=proc), \
+                     mock.patch.object(dd, "_pick_tk", return_value=None) as fallback:
+                    with self.assertRaises(DirectoryDialogError):
+                        pick_existing_directory()
+                fallback.assert_not_called()
+                self.assertTrue(dd._DIALOG_LOCK.acquire(blocking=False))
+                dd._DIALOG_LOCK.release()
 
     def test_wsl_uses_windows_dialog_not_tk(self) -> None:
         with mock.patch.object(dd, "_is_wsl", return_value=True):

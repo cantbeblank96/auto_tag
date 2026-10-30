@@ -399,6 +399,11 @@ export const api = {
     params: { work_dir?: string; chunk_index?: number; chunk_size?: number },
     options?: ExportOptions,
   ) => runDatabaseExport('/database/export_compact_chunk', params, options),
+  exportLabelsCSV: (params?: { work_dir?: string }, options?: ExportOptions) =>
+    runDatabaseExport(
+      '/database/export_labels_csv', params,
+      { browserFilename: 'auto_tag_labels.csv', ...options },
+    ),
   recomputeRelations: (body: { work_dir?: string }) =>
     fetchJSON<any>('/database/recompute_relations', {
       method: 'POST',

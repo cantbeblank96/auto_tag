@@ -13,7 +13,7 @@ const MODE_INTRO: Record<ExportMode, string> = {
   metadata:
     '原始分片导出：向量索引与近重复侧车各存一份，合起来才覆盖流水线处理过的全部图片（Stage1 近重复只在侧车）。适合备份 Chroma、审计 metadata。',
   compact:
-    '合并视图导出：由索引 + 侧车现场拼装，先下载共享字典，再下载数据切片（slice 或 chunk）。适合训练与下游消费。',
+    '合并视图导出：由索引 + 侧车现场拼装。可直接导出 CSV 查看每张图片的标签；紧凑 JSON 分为共享字典和数据切片（slice 或 chunk），适合训练与下游消费。',
 }
 
 function NumInput({
@@ -187,7 +187,7 @@ export default function DatabaseExportPanel({
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <ModeSwitch mode={exportMode} onChange={setExportMode} />
         <p className="text-xs text-gray-400 dark:text-gray-500">
-          单次上限 {EXPORT_MAX.toLocaleString()} 条 · 超出请用 range 或 chunk 多次下载
+          JSON 单次切片上限 {EXPORT_MAX.toLocaleString()} 条 · CSV 导出全部图片
         </p>
       </div>
 
@@ -405,6 +405,24 @@ export default function DatabaseExportPanel({
           role="tabpanel"
           aria-label="紧凑标注导出"
         >
+          <div className="md:col-span-2">
+            <ExportCard
+              title="可读标签 CSV"
+              subtitle="每张图片一行：完整路径 origin_path、文件名 image_name、标签编号 label_id，随后每个标签各占一列。可直接用 Excel 查看或按标签编号筛选。"
+              endpoint="GET /api/database/export_labels_csv"
+            >
+              <ActionButton
+                label="导出全部图片 CSV"
+                variant="primary"
+                busy={busy('labels-csv')}
+                onClick={() => run('labels-csv', () => api.exportLabelsCSV({}, exportOptions()))}
+              />
+              <p className="text-xs leading-relaxed text-gray-600 dark:text-gray-300">
+                包含近重复图片；未取得标签的图片保留行和标签编号，标签值留空。CSV 已展开路径与标签映射，支持中文，无需另外下载共享字典。
+              </p>
+            </ExportCard>
+          </div>
+
           <ExportCard
             title="共享字典"
             subtitle="labels / prefix / cluster / cluster_to_labels 字典。数据切片依赖本文件解析 id，请先下载（全库只需一份）。"

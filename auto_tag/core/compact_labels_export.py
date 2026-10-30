@@ -89,18 +89,19 @@ def build_compact_export(work_dir: str) -> Dict[str, Any]:
     dup_rows = load_all_duplicate_rows(dup_file, log_dir=log_d)
 
     dup_to_anchor: Dict[str, str] = {}
+    all_paths: Set[str] = set(path_to_meta.keys())
     for row in dup_rows:
         dp = str(row.get("dup_path") or "").strip()
         ap = str(row.get("anchor_path") or "").strip()
+        # 旧格式侧车可能保留相对路径或 .. 等别名；先与索引统一再去重。
+        if dp:
+            dp = reg.compose("0", dp)
+            all_paths.add(dp)
+        if ap:
+            ap = reg.compose("0", ap)
+            all_paths.add(ap)
         if dp and ap:
             dup_to_anchor[dp] = ap
-
-    all_paths: Set[str] = set(path_to_meta.keys())
-    for row in dup_rows:
-        for k in ("anchor_path", "dup_path"):
-            v = str(row.get(k) or "").strip()
-            if v:
-                all_paths.add(v)
 
     sorted_paths = sorted(all_paths)
 

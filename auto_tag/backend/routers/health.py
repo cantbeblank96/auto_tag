@@ -42,11 +42,13 @@ def health():
 
 @router.get("/utils/paths")
 def utils_paths() -> Dict[str, Any]:
-    """返回后端所在机器上的 auto_tag 包路径与默认 config.json 绝对路径。"""
+    """返回 auto_tag 包路径与后端实际加载的配置路径。"""
+    from auto_tag.core.config import config_json_path
+
     project_path = os.path.realpath(_AUTO_TAG_DIR)
     return {
         "project_path": project_path,
-        "config_path": os.path.join(project_path, "config.json"),
+        "config_path": config_json_path,
         "project_path_macro": "{PROJECT_PATH}",
     }
 
@@ -253,7 +255,7 @@ class PickDirectoryBody(BaseModel):
 def pick_directory(body: PickDirectoryBody) -> Dict[str, Any]:
     """在运行后端的电脑上打开系统目录窗口，返回选中的绝对路径。
 
-    取消选择时 cancelled 为 true。Windows 与 WSL 后端使用系统「浏览文件夹」（可选任意盘符）；
+    取消选择时 cancelled 为 true。Windows 与 WSL 使用现代原生目录窗口并记忆上次位置；
     Linux 本机 / macOS 使用各自的系统目录窗口。
     """
     try:

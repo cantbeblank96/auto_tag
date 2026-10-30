@@ -8,24 +8,14 @@ import {
 } from '../constants/config'
 import { waitForBackendHealthy } from '../utils/backendHealth'
 import ConfirmDialog from '../components/ConfirmDialog'
+import {
+  questionsToObject, detailToQuestion, emptyQuestion,
+  mergeExamplesIntoFreeform, createQuestionsDocument, parseQuestionsDocument,
+  questionsFromConfig, saveImportedQuestions, QuestionsImportSavedError, stableStringify,
+} from '../utils/questionsConfig'
+import type { QuestionEntry, SavedQuestions } from '../utils/questionsConfig'
 
 // ── Types ──────────────────────────────────────────────
-
-interface QuestionEntry {
-  key: string
-  enabled: boolean
-  _mode: 'template' | 'freeform'
-  description: string
-  type: string
-  choices: string
-  min: string
-  max: string
-  step: string
-  freeformJson: string
-  tools: string[]
-  /** 参考样图：档位值 → 样图路径（模版模式下的编辑态） */
-  examples: { value: string; path: string }[]
-}
 
 interface AnnotationToolStatus {
   name: string
@@ -66,118 +56,7 @@ function normalizeModelEntry(m: Partial<ModelEntry>, index: number): ModelEntry 
   }
 }
 
-type QuestionDetail = Record<string, any>
-
 // ── Helpers ────────────────────────────────────────────
-
-function questionToDetail(q: QuestionEntry): QuestionDetail | null {
-  if (!q.enabled) return null
-  if (q._mode === 'freeform') {
-    try {
-      const obj = JSON.parse(q.freeformJson)
-      if (Array.isArray(q.tools) && q.tools.length) {
-        const existing = Array.isArray(obj.tools) ? obj.tools : []
-        obj.tools = Array.from(new Set([...existing, ...q.tools]))
-      }
-      return obj
-    } catch { return null }
-  }
-  const d: QuestionDetail = { description: q.description, type: q.type }
-  if (q.type === 'category' && q.choices.trim()) {
-    d.choices = q.choices.split('\n').map(s => s.trim()).filter(Boolean)
-  }
-  if (q.type === 'int' || q.type === 'float') {
-    if (q.min) d.min = Number(q.min)
-    if (q.max) d.max = q.max ? Number(q.max) : null
-    if (q.type === 'float' && q.step) d.step = Number(q.step)
-  }
-  if (Array.isArray(q.tools) && q.tools.length) d.tools = q.tools
-  const ex = examplesToObject(q.examples || [])
-  if (Object.keys(ex).length) d.examples = ex
-  return d
-}
-
-function questionsToObject(
-  entries: QuestionEntry[],
-  enabledTools?: Set<string>,
-): Record<string, any> {
-  const questionsObj: Record<string, any> = {}
-  for (const q of entries) {
-    if (!q.key.trim()) continue
-    const detail = questionToDetail(q)
-    if (!detail) continue
-    // 全局关闭的工具：从所有问题绑定中移除
-    if (enabledTools && Array.isArray(detail.tools)) {
-      detail.tools = detail.tools.filter((t: any) => enabledTools.has(String(t)))
-      if (!detail.tools.length) delete detail.tools
-    }
-    questionsObj[q.key.trim()] = detail
-  }
-  return questionsObj
-}
-
-function detailToQuestion(key: string, detail: QuestionDetail): QuestionEntry {
-  const t = String(detail.type || 'string')
-  return {
-    key, enabled: true, _mode: 'template',
-    description: String(detail.description || ''),
-    type: t,
-    choices: Array.isArray(detail.choices) ? detail.choices.join('\n') : '',
-    min: detail.min != null ? String(detail.min) : '',
-    max: detail.max != null ? String(detail.max) : '',
-    step: detail.step != null ? String(detail.step) : '',
-    freeformJson: JSON.stringify(detail, null, 2),
-    tools: Array.isArray(detail.tools) ? detail.tools.map(String) : [],
-    examples: examplesFromConfig(detail.examples),
-  }
-}
-
-function emptyQuestion(): QuestionEntry {
-  return { key: '', enabled: true, _mode: 'template', description: '', type: 'string', choices: '', min: '', max: '', step: '', freeformJson: '{}', tools: [], examples: [] }
-}
-
-/** 配置里的 examples 还原成行。一个档位一行；若曾存成路径列表，只保留最后一条。 */
-function examplesFromConfig(raw: unknown): { value: string; path: string }[] {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return []
-  const rows: { value: string; path: string }[] = []
-  for (const [value, path] of Object.entries(raw as Record<string, unknown>)) {
-    let text = ''
-    if (typeof path === 'string') text = path.trim()
-    else if (Array.isArray(path)) {
-      for (const item of path) {
-        const next = String(item ?? '').trim()
-        if (next) text = next
-      }
-    }
-    if (text) rows.push({ value, path: text })
-  }
-  return rows
-}
-
-/** 模版态 examples 行 → config。同一档位只保留最后一行。 */
-function examplesToObject(rows: { value: string; path: string }[]): Record<string, string> {
-  const ex: Record<string, string> = {}
-  for (const e of rows || []) {
-    const v = e.value.trim()
-    const p = e.path.trim()
-    if (v && p) ex[v] = p
-  }
-  return ex
-}
-
-/** 将 examples 对象合并进 freeform JSON 文本（空则移除该键）。 */
-function mergeExamplesIntoFreeform(freeformJson: string, rows: { value: string; path: string }[]): string {
-  let obj: Record<string, any> = {}
-  try { obj = JSON.parse(freeformJson) } catch { /* JSON 不合法时重建 */ }
-  const ex = examplesToObject(rows)
-  if (Object.keys(ex).length) obj.examples = ex
-  else delete obj.examples
-  return JSON.stringify(obj, null, 2)
-}
-
-function stableStringify(value: unknown): string {
-  return JSON.stringify(value, (_, v) => v, 0)
-}
 
 interface RestartDialogState {
   open: boolean
@@ -224,6 +103,9 @@ export default function Settings() {
 
   // Questions
   const [questions, setQuestions] = useState<QuestionEntry[]>([])
+  const [importingQuestions, setImportingQuestions] = useState(false)
+  const [questionTransferMessage, setQuestionTransferMessage] = useState<{ text: string; error: boolean } | null>(null)
+  const questionFileRef = useRef<HTMLInputElement>(null)
   const [pickingExampleKey, setPickingExampleKey] = useState<string | null>(null)
   const [questionSearch, setQuestionSearch] = useState('')
   // 标注工具管理
@@ -283,7 +165,7 @@ export default function Settings() {
       .map(([k]) => k),
   )
 
-  const buildConfigPayload = useCallback(() => {
+  const buildConfigPayload = useCallback((questionEntries: QuestionEntry[] = questions) => {
     return {
       work_dir: workDir,
       batch_size: batchSize,
@@ -297,7 +179,8 @@ export default function Settings() {
         name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
         max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
       })),
-      questions: questionsToObject(questions, enabledToolNames),
+      questions: questionsToObject(questionEntries, enabledToolNames),
+      questions_editor: createQuestionsDocument(questionEntries),
       annotation_tools: annotationToolsCfg,
       vlm_strategy: vlmStrategy,
       vlm_concurrency: vlmConcurrency,
@@ -359,8 +242,7 @@ export default function Settings() {
         setVlmExampleImageMaxSide(cfg.vlm_example_image_max_side ?? 512)
         setExampleTools(cfg.annotation_tools_on_examples ?? false)
         // Load questions
-        const qs = cfg.questions || {}
-        const loadedQuestions = Object.entries(qs).map(([k, v]) => detailToQuestion(k, v as QuestionDetail))
+        const loadedQuestions = questionsFromConfig(cfg)
         setQuestions(loadedQuestions)
         // Load annotation tools：开关以磁盘 config 为准，状态/描述从后端 API 合并
         const rawToolsCfg = cfg.annotation_tools && typeof cfg.annotation_tools === 'object' ? cfg.annotation_tools : {}
@@ -439,6 +321,7 @@ export default function Settings() {
             max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
           })),
           questions: questionsToObject(loadedQuestions, loadedEnabledTools),
+          questions_editor: createQuestionsDocument(loadedQuestions),
           annotation_tools: rawToolsCfg,
           vlm_strategy: cfg.vlm_strategy || 'round_robin',
           vlm_concurrency: cfg.vlm_concurrency ?? 3,
@@ -451,7 +334,9 @@ export default function Settings() {
           },
         })
       }
-    } catch { /* ignore */ }
+    } catch (error) {
+      showMsg(`加载设置失败：${error instanceof Error ? error.message : String(error)}`, 'error')
+    }
   }
 
   const writeConfigToDisk = async (cfg: Record<string, any>) => {
@@ -479,9 +364,9 @@ export default function Settings() {
   }
 
   const saveAll = async () => {
-    const cfg = buildConfigPayload()
-    const effectiveChange = stableStringify(cfg) !== baselineConfigRef.current
     try {
+      const cfg = buildConfigPayload()
+      const effectiveChange = stableStringify(cfg) !== baselineConfigRef.current
       await writeConfigToDisk(cfg)
       baselineConfigRef.current = stableStringify(cfg)
       setIsDirty(false)
@@ -500,6 +385,57 @@ export default function Settings() {
   }
 
   // Questions handlers
+  const showQuestionTransferMessage = (text: string, error = false) => {
+    setQuestionTransferMessage({ text, error })
+    showMsg(text, error ? 'error' : 'success')
+  }
+
+  const exportQuestions = () => {
+    try {
+      const document = createQuestionsDocument(questions)
+      const blob = new Blob([JSON.stringify(document, null, 2) + '\n'], { type: 'application/json;charset=utf-8' })
+      const link = window.document.createElement('a')
+      link.href = URL.createObjectURL(blob)
+      link.download = 'auto_tag_questions.json'
+      window.document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(link.href)
+      showQuestionTransferMessage(`已导出 ${questions.length} 个问题（含停用项）`)
+    } catch (error) {
+      showQuestionTransferMessage(error instanceof Error ? error.message : 'Questions 导出失败', true)
+    }
+  }
+
+  const importQuestions = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file || importingQuestions) return
+    setImportingQuestions(true)
+    setQuestionTransferMessage(null)
+    let imported: QuestionEntry[] = []
+    const applySavedQuestions = (saved: SavedQuestions) => {
+      setQuestions(imported)
+      setQuestionSearch('')
+      const baseline = { ...JSON.parse(baselineConfigRef.current || '{}'), questions: saved.questions, questions_editor: saved.document }
+      baselineConfigRef.current = stableStringify(baseline)
+      // 只更新 Questions；其他未保存的设置仍保留在页面并保持未保存状态。
+      setIsDirty(stableStringify(buildConfigPayload(imported)) !== baselineConfigRef.current)
+    }
+    try {
+      imported = parseQuestionsDocument(await file.text())
+      const path = await resolveMacroPath(configPath)
+      const saved = await saveImportedQuestions(path, imported)
+      applySavedQuestions(saved)
+      showQuestionTransferMessage(`已导入 ${imported.length} 个问题并保存生效（${imported.filter(q => q.enabled).length} 个启用）`)
+    } catch (error) {
+      if (error instanceof QuestionsImportSavedError) applySavedQuestions(error.saved)
+      showQuestionTransferMessage(error instanceof Error ? error.message : 'Questions 导入失败，请重试', true)
+    } finally {
+      setImportingQuestions(false)
+    }
+  }
+
   const addQuestion = () => {
     setQuestions([...questions, emptyQuestion()])
     markDirty()
@@ -659,7 +595,7 @@ export default function Settings() {
         </div>
       )}
 
-      <div className="space-y-6 max-w-3xl">
+      <fieldset disabled={importingQuestions} className="space-y-6 max-w-3xl min-w-0">
         {/* ═══ VLM 模型管理 ═══ */}
         <section className={sectionCls}>
           <div className="flex items-center justify-between mb-3">
@@ -850,14 +786,25 @@ export default function Settings() {
 
         {/* ═══ Questions 管理 ═══ */}
         <section className={sectionCls}>
-          <div className="flex items-center justify-between mb-3">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
             <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">Questions 管理</h3>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
+              <button type="button" onClick={exportQuestions} disabled={importingQuestions} className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 rounded hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">导出配置</button>
+              <button type="button" onClick={() => questionFileRef.current?.click()} disabled={importingQuestions || analyzing || !!pickingExampleKey} className="px-3 py-1.5 text-xs border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 rounded hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600">{importingQuestions ? '正在导入…' : '导入并生效'}</button>
+              <input ref={questionFileRef} type="file" accept=".json,application/json" onChange={importQuestions} aria-label="导入 Questions 配置文件" className="hidden" />
               <button onClick={handleAnalyzeTools} disabled={analyzing} title="由 VLM 分析当前问题定义，建议每个问题应绑定的标注工具" className="px-3 py-1.5 text-xs border border-blue-300 dark:border-blue-700 text-blue-600 dark:text-blue-300 rounded hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50">{analyzing ? '分析中…' : '智能分析工具'}</button>
               <button onClick={addQuestion} className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">+ 添加问题</button>
             </div>
           </div>
           <p className="text-xs text-gray-400 dark:text-gray-500 mb-3">每个问题定义一条 VLM 标注结构中需要生成的字段。可按模版填写或自由输入 JSON。</p>
+          <p className="text-xs leading-relaxed text-gray-600 dark:text-gray-300 mb-3" aria-live="polite">
+            {importingQuestions ? '正在读取、保存并加载 Questions 配置，请稍候…' : '导出包含停用问题、工具绑定、样图路径和自由 JSON。导入会替换全部 Questions 并立即保存生效；其他设置草稿会保留。样图文件不包含在配置中。'}
+          </p>
+          {questionTransferMessage && (
+            <p role={questionTransferMessage.error ? 'alert' : 'status'} className={`text-sm mb-3 ${questionTransferMessage.error ? 'text-red-700 dark:text-red-300' : 'text-green-800 dark:text-green-300'}`}>
+              {questionTransferMessage.text}
+            </p>
+          )}
 
           <input
             type="text"
@@ -1033,7 +980,7 @@ export default function Settings() {
             </div>
           </div>
         </section>
-      </div>
+      </fieldset>
 
       {restartDialog.open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">

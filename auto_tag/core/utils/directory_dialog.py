@@ -3,8 +3,8 @@
 浏览器的目录选择控件不会把绝对路径交给网页，因此由本机进程弹出系统对话框，
 再把选中的绝对路径返回给前端填入「输入目录」。
 
-- Windows 原生，以及 WSL 中的后端：powershell.exe + FolderBrowserDialog
-  （系统「浏览文件夹」，根节点为「此电脑」，可选任意盘符）
+- Windows 原生，以及 WSL 中的后端：powershell.exe + IFileOpenDialog
+  （系统现代目录窗口，保留导航与 auto_tag 独立的历史位置）
 - macOS：osascript choose folder，失败时回退 tkinter
 - Linux 本机：zenity，其次 kdialog，再回退 tkinter
 
@@ -30,42 +30,42 @@ _DIALOG_LOCK = threading.Lock()
 # 由环境变量传入标题和初始目录，避免把用户路径拼进命令行。
 _WINDOWS_PICKER_SCRIPT = r"""
 $ErrorActionPreference = "Stop"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.Application]::EnableVisualStyles()
-$dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-$title = [string]$env:AUTO_TAG_PICK_TITLE
-if (-not $title) { $title = "选择目录" }
-$dlg.Description = $title
-$dlg.ShowNewFolderButton = $false
-# MyComputer = 此电脑，展开后可选任意本地盘符与已映射磁盘
-$dlg.RootFolder = [System.Environment+SpecialFolder]::MyComputer
-$initial = [string]$env:AUTO_TAG_PICK_INITIAL
-if ($initial -and (Test-Path -LiteralPath $initial -PathType Container)) {
-    $dlg.SelectedPath = $initial
-}
-# 用置顶的空窗体当 owner，避免对话框被浏览器挡在后面；不要最小化，否则对话框可能一起看不见
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$owner.ShowInTaskbar = $false
-$owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-$owner.StartPosition = "CenterScreen"
-$owner.Width = 1
-$owner.Height = 1
-$owner.Show()
-$owner.Activate()
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = $utf8
+$owner = $null
+$exitCode = 1
 try {
-    $result = $dlg.ShowDialog($owner)
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -TypeDefinition $env:AUTO_TAG_PICK_SOURCE -Language CSharp
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+    $title = [string]$env:AUTO_TAG_PICK_TITLE
+    if (-not $title) { $title = "选择目录" }
+    # 置顶 owner 避免目录窗口被浏览器挡住，真正的选择窗口由 Windows Shell 绘制。
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.TopMost = $true
+    $owner.ShowInTaskbar = $false
+    $owner.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $owner.StartPosition = "CenterScreen"
+    $owner.Width = 1
+    $owner.Height = 1
+    $owner.Show()
+    $owner.Activate()
+    $path = [AutoTag.WindowsFolderPicker]::Pick($title, [string]$env:AUTO_TAG_PICK_INITIAL, $owner.Handle)
+    if ($null -ne $path) {
+        [Console]::Out.WriteLine($path)
+        $exitCode = 0
+    } else {
+        $exitCode = 2
+    }
+} catch {
+    [Console]::Error.WriteLine($_.Exception.Message)
 } finally {
-    $owner.Close()
-    $owner.Dispose()
+    if ($null -ne $owner) {
+        $owner.Close()
+        $owner.Dispose()
+    }
 }
-if ($result -eq [System.Windows.Forms.DialogResult]::OK -and $dlg.SelectedPath) {
-    $utf8 = New-Object System.Text.UTF8Encoding $false
-    [Console]::OutputEncoding = $utf8
-    [Console]::Out.WriteLine($dlg.SelectedPath)
-    exit 0
-}
-exit 2
+exit $exitCode
 """
 
 
@@ -201,20 +201,10 @@ def _pick_raw(title: str, initial: Optional[str]) -> Optional[str]:
 
 def _pick_windows(title: str, initial: Optional[str]) -> Optional[str]:
     env = _picker_env(title, initial)
-    try:
-        argv = build_windows_picker_argv()
-        argv[0] = _resolve_powershell()
-        proc = _run_command(argv, env=env)
-    except DirectoryDialogError:
-        if _is_wsl() or not _tk_importable():
-            raise
-        return _pick_tk(title, initial)
-    outcome = _interpret(proc, kind="windows")
-    if outcome.failed:
-        if _is_wsl() or not _tk_importable():
-            raise DirectoryDialogError(outcome.path or "无法打开 Windows 目录窗口")
-        return _pick_tk(title, initial)
-    return outcome.path
+    argv = build_windows_picker_argv()
+    argv[0] = _resolve_powershell()
+    proc = _run_command(argv, env=env)
+    return _interpret(proc, kind="windows").unwrap()
 
 
 def _pick_darwin(title: str, initial: Optional[str]) -> Optional[str]:
@@ -264,6 +254,19 @@ def _picker_env(title: str, initial: Optional[str]) -> dict[str, str]:
     env = os.environ.copy()
     env["AUTO_TAG_PICK_TITLE"] = title or "选择目录"
     env["AUTO_TAG_PICK_INITIAL"] = _initial_for_windows_dialog(initial)
+    # Windows PowerShell 不一定能访问 WSL 中的 Python 文件路径；传源码而不是路径。
+    source = os.path.join(os.path.dirname(__file__), "windows_folder_picker.cs")
+    try:
+        with open(source, "r", encoding="utf-8") as fh:
+            env["AUTO_TAG_PICK_SOURCE"] = fh.read()
+    except OSError as exc:
+        raise DirectoryDialogError(f"无法加载 Windows 目录选择组件：{exc}") from exc
+    if _is_wsl():
+        # WSL -> Win32 需显式共享变量；这些值已转换或不是路径，不能再加 /p、/l。
+        shared = ("AUTO_TAG_PICK_TITLE", "AUTO_TAG_PICK_INITIAL", "AUTO_TAG_PICK_SOURCE")
+        entries = [entry for entry in env.get("WSLENV", "").split(":")
+                   if entry and entry.split("/", 1)[0] not in shared]
+        env["WSLENV"] = ":".join(entries + [name + "/w" for name in shared])
     return env
 
 
@@ -302,7 +305,7 @@ def _resolve_powershell() -> str:
 
 
 def _resolve_wsl_powershell() -> str:
-    """只用 Windows 的 powershell.exe。Linux 上的 pwsh 打不开系统「浏览文件夹」。"""
+    """只用 Windows 的 powershell.exe。Linux 上的 pwsh 无法使用 Windows Shell。"""
     found = shutil.which("powershell.exe")
     if found:
         return found
@@ -347,7 +350,9 @@ def _interpret(proc: subprocess.CompletedProcess[str], *, kind: str) -> _Outcome
             path="无法打开图形目录窗口（未检测到可用显示器）。请直接在文本框填写绝对路径。",
             failed=True,
         )
-    if _looks_like_cancel(stderr) or code == 2 or (code == 1 and not stderr):
+    if (_looks_like_cancel(stderr)
+            or (code == 2 and (kind != "windows" or not stderr))
+            or (code == 1 and not stderr and kind != "windows")):
         return _Outcome(path=None)
     if kind in {"zenity", "kdialog", "osascript"} and code == 1 and not stdout:
         return _Outcome(path=None)
