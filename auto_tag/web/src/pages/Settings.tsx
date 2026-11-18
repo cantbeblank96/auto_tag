@@ -9,7 +9,7 @@ import {
 import { waitForBackendHealthy } from '../utils/backendHealth'
 import ConfirmDialog from '../components/ConfirmDialog'
 import {
-  questionsToObject, detailToQuestion, emptyQuestion,
+  questionsToObject, questionsHaveExamples, detailToQuestion, emptyQuestion,
   mergeExamplesIntoFreeform, createQuestionsDocument, parseQuestionsDocument,
   questionsFromConfig, saveImportedQuestions, QuestionsImportSavedError, stableStringify,
 } from '../utils/questionsConfig'
@@ -97,7 +97,6 @@ export default function Settings() {
   const [pipelineDebug, setPipelineDebug] = useState(false)
   const [chainDump, setChainDump] = useState(false)
   const [chainDumpPath, setChainDumpPath] = useState('logs/vlm_validation_chain.jsonl')
-  const [exampleTools, setExampleTools] = useState(false)
   const [vlmImageMaxSide, setVlmImageMaxSide] = useState(0)
   const [vlmExampleImageMaxSide, setVlmExampleImageMaxSide] = useState(512)
 
@@ -166,6 +165,7 @@ export default function Settings() {
   )
 
   const buildConfigPayload = useCallback((questionEntries: QuestionEntry[] = questions) => {
+    const questionsObj = questionsToObject(questionEntries, enabledToolNames)
     return {
       work_dir: workDir,
       batch_size: batchSize,
@@ -179,7 +179,7 @@ export default function Settings() {
         name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
         max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
       })),
-      questions: questionsToObject(questionEntries, enabledToolNames),
+      questions: questionsObj,
       questions_editor: createQuestionsDocument(questionEntries),
       annotation_tools: annotationToolsCfg,
       vlm_strategy: vlmStrategy,
@@ -192,7 +192,7 @@ export default function Settings() {
       vlm_chain_dump_path: chainDumpPath.trim() || 'logs/vlm_validation_chain.jsonl',
       vlm_image_max_side: Math.max(0, Math.floor(vlmImageMaxSide || 0)),
       vlm_example_image_max_side: Math.min(1024, Math.max(128, Math.floor(vlmExampleImageMaxSide || 512))),
-      annotation_tools_on_examples: exampleTools,
+      annotation_tools_on_examples: questionsHaveExamples(questionsObj),
       circuit_breaker: {
         time_window_seconds: cbTimeWindow,
         failure_rate_threshold: cbFailureThreshold,
@@ -201,7 +201,7 @@ export default function Settings() {
     }
   }, [
     questions, workDir, batchSize, tauDup, tauCls, recDup, models,
-    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, vlmImageMaxSide, vlmExampleImageMaxSide, exampleTools, cbTimeWindow, cbFailureThreshold, cbCooldown,
+    vlmStrategy, vlmConcurrency, vlmHttpTimeout, vlmValidationMaxCorrections, clipDevice, pipelineDebug, chainDump, chainDumpPath, vlmImageMaxSide, vlmExampleImageMaxSide, cbTimeWindow, cbFailureThreshold, cbCooldown,
     annotationToolsCfg,
   ])
 
@@ -240,7 +240,6 @@ export default function Settings() {
         setChainDumpPath(cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl')
         setVlmImageMaxSide(cfg.vlm_image_max_side ?? 0)
         setVlmExampleImageMaxSide(cfg.vlm_example_image_max_side ?? 512)
-        setExampleTools(cfg.annotation_tools_on_examples ?? false)
         // Load questions
         const loadedQuestions = questionsFromConfig(cfg)
         setQuestions(loadedQuestions)
@@ -266,6 +265,7 @@ export default function Settings() {
             .filter(([k, v]) => k !== 'align_model_paths' && v && typeof v === 'object' && (v as any).enabled === true)
             .map(([k]) => k),
         )
+        const loadedQuestionsObj = questionsToObject(loadedQuestions, loadedEnabledTools)
         // Load models from config.json（id 以磁盘为准；熔断状态从后端 API 合并）
         const rawModels = cfg.vlm_models || []
         let loadedModels: ModelEntry[] = rawModels.length > 0
@@ -313,14 +313,14 @@ export default function Settings() {
           vlm_chain_dump_path: cfg.vlm_chain_dump_path ?? 'logs/vlm_validation_chain.jsonl',
           vlm_image_max_side: cfg.vlm_image_max_side ?? 0,
           vlm_example_image_max_side: cfg.vlm_example_image_max_side ?? 512,
-          annotation_tools_on_examples: cfg.annotation_tools_on_examples ?? false,
+          annotation_tools_on_examples: questionsHaveExamples(loadedQuestionsObj),
           duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
           vlm_models: loadedModels.map((m) => ({
             id: m.id,
             name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
             max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
           })),
-          questions: questionsToObject(loadedQuestions, loadedEnabledTools),
+          questions: loadedQuestionsObj,
           questions_editor: createQuestionsDocument(loadedQuestions),
           annotation_tools: rawToolsCfg,
           vlm_strategy: cfg.vlm_strategy || 'round_robin',
@@ -706,8 +706,9 @@ export default function Settings() {
             <div><label className={labelCls}>vlm_example_image_max_side（参考样图最长边）</label><input type="number" value={vlmExampleImageMaxSide} onChange={e => { setVlmExampleImageMaxSide(Number(e.target.value)); markDirty() }} min={128} max={1024} className={inputCls} />
               <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">questions 中 examples 参考样图送入 VLM 前的最长边上限（128~1024）</p>
             </div>
-            <div className="col-span-2"><label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"><input type="checkbox" checked={exampleTools} onChange={e => { setExampleTools(e.target.checked); markDirty() }} className="rounded" /> annotation_tools_on_examples（参考样图也跑标注工具，实验性增强）</label>
-              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 ml-6">开启后对 examples 参考样图也执行其绑定维度的标注工具，测量结果以 [Reference measurement: ...] 随样图注入，供模型与待标注图的工具结果对比校准；需已启用对应工具且问题已绑定</p>
+            <div className="col-span-2">
+              <p className="text-sm text-gray-700 dark:text-gray-300">参考样图测量（自动）</p>
+              <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">某个问题写了 examples，并且勾选了标注工具时，会自动对这些样图执行已绑定的工具。测量结果以 [Reference measurement: ...] 随对应样图注入，用来和待标注图的测量对比。不再单独开关。</p>
             </div>
             <div className="col-span-2"><label className={labelCls}>work_dir（工作根目录）</label>
               <input type="text" value={workDir} onChange={e => { setWorkDir(e.target.value); markDirty() }} className={inputCls} />
@@ -932,7 +933,7 @@ export default function Settings() {
                   <button onClick={() => updateQuestion(idx, { examples: [...q.examples, { value: '', path: '' }] })}
                     className="mt-1.5 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700">+ 添加样图</button>
                   <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">
-                    每个档位只保留一行，重复档位以后填的路径为准。路径可以是单张图片，也可以是文件夹；文件夹按文件名字典序最多读取 2 张合法图片（png/jpg/jpeg/bmp/webp/gif/tif，含子目录）。档位值需符合本问题类型（category 用类别名）。
+                    每个档位只保留一行，重复档位以后填的路径为准。路径可以是单张图片，也可以是文件夹；文件夹按文件名字典序最多读取 1 张合法图片（png/jpg/jpeg/bmp/webp/gif/tif，含子目录）。档位值需符合本问题类型（category 用类别名）。写了样图并勾选标注工具后，样图会自动跑这些工具。
                   </p>
                 </div>
                 {annotationTools.filter(t => t.enabled && t.available).length > 0 && (

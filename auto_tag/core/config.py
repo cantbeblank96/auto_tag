@@ -226,8 +226,8 @@ class Settings(BaseSettings):
     annotation_tools_on_examples: bool = Field(
         default=bool(cfg.get("annotation_tools_on_examples", False)),
         description=(
-            "实验性增强：对 examples 参考样图也执行其绑定维度的标注工具，并将测量结果以 "
-            "[Reference measurement: ...] 随样图注入，供模型校准时对比；默认关"
+            "兼容字段。运行时不再读取：只要某个问题配置了 examples 且绑定了可用工具，"
+            "就会对这些参考样图执行对应工具。保存设置时按「是否有问题写了样图」回写。"
         ),
     )
 

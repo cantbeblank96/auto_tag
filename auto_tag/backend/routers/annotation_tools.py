@@ -109,8 +109,7 @@ Only use tool names from the list above. Do not include any other text."""
             api_key=model.get("api_key"),
             base_url=model.get("base_url"),
             timeout=60,
-            # 与设置页配置一致：模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询；
-            # thinking 模型的 reasoning 与 content 共用预算，防截断
+            # 与设置页配置一致：模型条目 max_tokens > 全局 vlm_max_tokens > 模型上限的 1/4
             max_tokens=resolve_max_tokens_for_model(model),
         )
     except HTTPException:

@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import cv2
-from PIL import Image
+from PIL import Image, ImageOps
 from typing import Optional
 
 # 定义旋转映射
@@ -10,6 +10,20 @@ ROTATION_MAP = {
     "ROTATE_180": cv2.ROTATE_180,
     "ROTATE_90_COUNTERCLOCKWISE": cv2.ROTATE_90_COUNTERCLOCKWISE,
 }
+
+
+def apply_exif_orientation(image: Image.Image) -> Image.Image:
+    """按 EXIF Orientation 把像素转到看图软件的显示方向。
+
+    没有方向标记、标记为正向，或 EXIF 损坏时返回原图像素的副本，不抛错。
+    """
+    try:
+        oriented = ImageOps.exif_transpose(image)
+    except Exception:
+        oriented = None
+    if oriented is None:
+        oriented = image
+    return oriented.copy()
 
 
 def _imread_bgr(path: str) -> Optional[np.ndarray]:

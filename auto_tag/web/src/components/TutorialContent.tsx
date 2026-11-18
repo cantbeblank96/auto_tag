@@ -425,7 +425,7 @@ bash scripts/linux/run_web_frontend_v2.sh`}
               <strong>参考样图（examples）</strong>：可为任意问题配置「档位值 → 样图路径」映射（如上例），
               标注时样图随 prompt 注入 VLM，帮助模型对齐评分尺度，尤其适合亮度/清晰度/人脸大小等主观连续量。
               每个档位只保留一条路径，重复填写时以后写的为准。路径可以是单张图片，也可以是文件夹；
-              文件夹按文件名字典序最多读取 2 张合法图片。
+              文件夹按文件名字典序最多读取 1 张合法图片。
               在「设置 → Questions」卡片内可直接增删样图行；路径支持绝对路径或相对{' '}
               <code className={codeCls}>config.json</code> 目录的相对路径。
             </p>
@@ -435,7 +435,7 @@ bash scripts/linux/run_web_frontend_v2.sh`}
               </li>
               <li>样图加载失败仅告警跳过，不影响标注</li>
               <li>
-                实验性增强：开启 <code className={codeCls}>annotation_tools_on_examples</code> 后，样图也会执行其维度绑定的标注工具，
+                问题写了参考样图并绑定了标注工具时，样图会自动执行这些工具，
                 测量结果随样图注入供对比校准（见下节）
               </li>
             </ul>

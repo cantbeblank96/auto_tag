@@ -1,7 +1,9 @@
 """把 questions.examples 里的一条路径展开成实际参考样图。
 
 每个档位只保存一条路径，后写的覆盖先写的。路径是图片时用这一张；
-路径是文件夹时，按文件名字典序最多读取 2 张合法图片（先当前目录，再子目录）。
+路径是文件夹时，按文件名字典序读取候选（先当前目录，再子目录）。
+未绑定标注工具时只用第一张。绑定了工具时，检测失败会换下一张，
+最终仍只放一张进标注流程。
 """
 from __future__ import annotations
 
@@ -21,9 +23,6 @@ EXAMPLE_IMAGE_SUFFIXES = (
     ".tif",
     ".tiff",
 )
-
-EXAMPLE_IMAGES_PER_VALUE = 2
-
 
 def resolve_example_path(path: str) -> str:
     """解析样图路径：绝对路径直接用；相对路径基于 config.json 所在目录。
@@ -104,7 +103,7 @@ def planned_example_rows(questions: Any) -> List[Tuple[str, str, str, List[str]]
     """按 questions 整理本次会用到的参考图。
 
     每项为 (问题键, 档位值, 配置路径, 实际选用的图片路径)。
-    文件夹只保留最多 2 张合法图片，与标注时的选取规则一致。
+    文件夹只保留最多 1 张合法图片，与标注时的选取规则一致。
     """
     rows: List[Tuple[str, str, str, List[str]]] = []
     if not isinstance(questions, dict):
@@ -125,13 +124,12 @@ def planned_example_rows(questions: Any) -> List[Tuple[str, str, str, List[str]]
 def take_example_images(
     sources: Sequence[str],
     *,
-    limit: int = EXAMPLE_IMAGES_PER_VALUE,
     accept: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[List[str], bool]:
-    """按添加顺序取最多 limit 张。
+    """按添加顺序取第一张可用图。
 
-    accept 返回 False 的路径（例如文件损坏、读不出来）不占名额，继续往后取。
-    第二个返回值表示后面还有能用的图，但已被上限截掉。
+    accept 返回 False 的路径（例如文件损坏、读不出来）跳过，继续往后取。
+    第二个返回值表示后面还有图，这次没有放进结果。
     """
     chosen: List[str] = []
     seen = set()
@@ -144,7 +142,7 @@ def take_example_images(
         seen.add(key)
         if accept is not None and not accept(image):
             continue
-        if len(chosen) >= limit:
+        if chosen:
             return chosen, True
         chosen.append(image)
     return chosen, False

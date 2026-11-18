@@ -50,6 +50,16 @@ export function questionToDetail(q: QuestionEntry): QuestionDetail | null {
   return d
 }
 
+/** 任一已启用问题写了参考样图时，样图测量视为开启。 */
+export function questionsHaveExamples(questions: Record<string, any>): boolean {
+  return Object.values(questions).some((detail) => {
+    if (!isObject(detail)) return false
+    const examples = detail.examples
+    if (!isObject(examples)) return false
+    return Object.values(examples).some((path) => String(path ?? '').trim() !== '')
+  })
+}
+
 export function questionsToObject(
   entries: QuestionEntry[],
   enabledTools?: Set<string>,

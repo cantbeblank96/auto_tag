@@ -26,12 +26,10 @@ from auto_tag.core.vlm_timing_collector import is_enabled as timing_enabled
 
 from auto_tag.core.circuit_breaker import CircuitBreaker, get_circuit_breaker
 from auto_tag.core.example_sources import (
-    EXAMPLE_IMAGES_PER_VALUE,
     example_source_path,
     iter_example_candidates,
-    resolve_example_path,
-    take_example_images,
 )
+from auto_tag.core.utils.load_image import apply_exif_orientation
 from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
 
 if TYPE_CHECKING:
@@ -69,45 +67,57 @@ def resize_image_for_vlm(image: Image.Image, max_side: int) -> Image.Image:
 # ── image-in-prompt：questions 中 examples 参考样图 ────────────────
 
 # 样图 PIL 缓存：(绝对路径, mtime, max_side) -> PIL（加载失败的负结果也缓存，避免重复警告）
-_EXAMPLE_PIL_CACHE: Dict[Tuple[str, float, int], Optional[Image.Image]] = {}
+_EXAMPLE_PIL_CACHE: Dict[Tuple, Optional[Image.Image]] = {}
 # 样图 base64 缓存：同上键 -> JPEG base64
-_EXAMPLE_IMAGE_CACHE: Dict[Tuple[str, float, int], Optional[str]] = {}
-# 样图工具测量结果缓存：(路径, mtime, max_side, 工具签名) -> 结果（None = 无可用结果）
-_EXAMPLE_TOOL_RESULTS_CACHE: Dict[Tuple[str, float, int, str], Optional[Dict[str, Any]]] = {}
+_EXAMPLE_IMAGE_CACHE: Dict[Tuple, Optional[str]] = {}
+# 样图工具测量结果缓存：(路径, mtime, 尺寸标记, 工具签名) -> 结果（None = 无可用结果）
+_EXAMPLE_TOOL_RESULTS_CACHE: Dict[Tuple, Optional[Dict[str, Any]]] = {}
 _EXAMPLE_IMAGE_CACHE_LOCK = threading.Lock()
 # 缺失样图告警去重：每路径仅告警一次，避免大批量任务刷屏
 _EXAMPLE_IMAGE_WARNED: set = set()
 
 
-def _example_cache_key(path: str, max_side: int) -> Tuple[str, float, int]:
+def _example_cache_key(path: str, max_side: int, half: bool = False) -> Tuple[str, float, int, int]:
     try:
         mtime = os.path.getmtime(path)
     except OSError:
         mtime = 0.0
-    return (path, mtime, int(max_side))
+    return (path, mtime, int(max_side), 1 if half else 0)
 
 
-def load_example_image_pil(path: str, max_side: int) -> Optional[Image.Image]:
-    """加载参考样图 → RGB → 最长边缩放到 max_side（缓存）；失败返回 None。"""
+def _resize_example_half(image: Image.Image) -> Image.Image:
+    """长宽各缩为当前图的一半，只降不升。"""
+    w, h = image.size
+    nw, nh = max(1, w // 2), max(1, h // 2)
+    if (nw, nh) == (w, h):
+        return image
+    return image.resize((nw, nh), Image.LANCZOS)
+
+
+def load_example_image_pil(
+    path: str, max_side: int = 0, *, half: bool = False
+) -> Optional[Image.Image]:
+    """加载参考样图：先按 EXIF 转到显示方向。
+
+    half 为真时，长宽各缩为转正后原图的一半，供勾选了标注工具时送给大模型。
+    否则 max_side>0 时把最长边缩到该值。max_side<=0 且 half 为假时保持转正后的原尺寸，
+    给标注工具使用。失败返回 None。
+    """
     if not path or not os.path.isfile(path):
         return None
-    key = _example_cache_key(path, max_side)
+    key = _example_cache_key(path, max_side, half)
     with _EXAMPLE_IMAGE_CACHE_LOCK:
         if key in _EXAMPLE_PIL_CACHE:
             return _EXAMPLE_PIL_CACHE[key]
     im_out: Optional[Image.Image] = None
     try:
         with Image.open(path) as im:
-            im = im.convert("RGB")
-            w, h = im.size
-            side = max(w, h)
-            if side > max_side:
-                scale = float(max_side) / float(side)
-                im = im.resize(
-                    (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-                    Image.LANCZOS,
-                )
-            im_out = im
+            im = apply_exif_orientation(im).convert("RGB")
+            if half:
+                im = _resize_example_half(im)
+            elif int(max_side or 0) > 0:
+                im = resize_image_for_vlm(im, int(max_side))
+            im_out = im.copy()
     except Exception as e:
         logger.warning("Failed to load reference example image %s: %s", path, e)
     with _EXAMPLE_IMAGE_CACHE_LOCK:
@@ -115,12 +125,14 @@ def load_example_image_pil(path: str, max_side: int) -> Optional[Image.Image]:
     return im_out
 
 
-def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
-    """参考样图 → JPEG base64（缓存）；失败返回 None。"""
-    im = load_example_image_pil(path, max_side)
+def load_example_image_base64(
+    path: str, max_side: int, *, half: bool = False
+) -> Optional[str]:
+    """参考样图转正并按需缩小后 → JPEG base64（缓存）；失败返回 None。"""
+    im = load_example_image_pil(path, max_side, half=half)
     if im is None:
         return None
-    key = _example_cache_key(path, max_side)
+    key = _example_cache_key(path, max_side, half)
     with _EXAMPLE_IMAGE_CACHE_LOCK:
         if key in _EXAMPLE_IMAGE_CACHE:
             return _EXAMPLE_IMAGE_CACHE[key]
@@ -134,6 +146,26 @@ def load_example_image_base64(path: str, max_side: int) -> Optional[str]:
     with _EXAMPLE_IMAGE_CACHE_LOCK:
         _EXAMPLE_IMAGE_CACHE[key] = b64
     return b64
+
+
+def reference_detection_ok(results: Optional[Dict[str, Any]]) -> bool:
+    """样图上的标注工具是否检出了可用人脸。
+
+    纯 error、没有结果，或 face_count 为 0，都算检测失败。
+    head_pose 成功时只有角度、没有 face_count，视为成功。
+    """
+    if not results:
+        return False
+    saw_payload = False
+    for payload in results.values():
+        if not isinstance(payload, dict):
+            return False
+        if set(payload.keys()) == {"error"}:
+            return False
+        if "face_count" in payload and int(payload.get("face_count") or 0) <= 0:
+            return False
+        saw_payload = True
+    return saw_payload
 
 
 def _example_value_sort_key(value: Any) -> Tuple[int, float, str]:
@@ -240,6 +272,8 @@ def _build_chat_url(base_url: Optional[str]) -> str:
 _MAX_OUTPUT_CACHE: Dict[Tuple[str, str], Tuple[Optional[int], float]] = {}
 _MAX_OUTPUT_CACHE_LOCK = threading.Lock()
 _MAX_OUTPUT_FALLBACK = 8192
+# 自动查询到的模型输出上限只取 1/4。标注结果是短 JSON，按满额预留会打满 TPM。
+_AUTO_MAX_TOKENS_FRACTION = 4
 
 
 def _lookup_model_max_output_tokens(model: Dict[str, Any]) -> Optional[int]:
@@ -309,10 +343,9 @@ def resolve_model_max_output_tokens(
 
 
 def resolve_max_tokens_for_model(model: Dict[str, Any]) -> int:
-    """max_tokens 预算解析：优先级 模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限。
+    """max_tokens 预算解析：优先级 模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限的 1/4。
 
-    thinking 模型的 reasoning 与 content 共用预算，调用方应给足余量防截断；
-    智能分析等辅助调用与标注主链路使用同一解析逻辑，保持与设置页配置一致。
+    显式配置按填写值使用。未配置时，查询到的模型上限除以 4，避免按满额预留打满 TPM。
     """
     from auto_tag.core.config import settings as _settings
 
@@ -325,7 +358,8 @@ def resolve_max_tokens_for_model(model: Dict[str, Any]) -> int:
     cfg_max_tokens = getattr(_settings, "vlm_max_tokens", None)
     if cfg_max_tokens:
         return max(1, min(131072, int(cfg_max_tokens)))
-    return resolve_model_max_output_tokens(model)
+    ceiling = resolve_model_max_output_tokens(model)
+    return max(1, int(ceiling) // _AUTO_MAX_TOKENS_FRACTION)
 
 
 def _extract_content(response_json: Dict[str, Any]) -> str:
@@ -611,7 +645,7 @@ class VLMClient:
                         "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
                     }
                 )
-                # 样图工具测量结果（annotation_tools_on_examples 开启时）：
+                # 样图工具测量结果：问题配置了 examples 且绑定了工具时自动产出，
                 # 紧随对应样图之后注入，供模型与待标注图的工具结果对比校准
                 if ex_tools:
                     for tool_name, result in ex_tools.items():
@@ -815,8 +849,7 @@ class VLMClient:
 
         http_timeout = float(getattr(_settings, "vlm_http_timeout", 60) or 60)
         http_timeout = max(5.0, min(600.0, http_timeout))
-        # thinking 模型的 reasoning 与 content 共用 max_tokens 预算，给足余量防截断；
-        # 优先级：模型条目 max_tokens > 全局 vlm_max_tokens > 自动查询模型上限
+        # 未显式配置时，max_tokens 为模型输出上限的 1/4。
         max_tokens = resolve_max_tokens_for_model(model)
         t0 = _time.perf_counter()
         thread_name = __import__("threading").current_thread().name
@@ -1142,18 +1175,14 @@ class VLMClient:
     ) -> List[Tuple[str, str, str, Optional[Dict[str, Any]]]]:
         """从 questions 的 examples 字段收集 (维度, 档位值, base64, 样图工具测量结果)。
 
-        每个档位值只对应一条路径（后写覆盖先写）。路径是图片时使用这一张；
-        路径是文件夹时按文件名字典序最多读取 2 张合法图片（含子目录）。
-        读不出来的文件不占名额。加载失败仅告警，不阻断标注。
-        annotation_tools_on_examples 开启时对样图执行其绑定维度的工具，否则第四元素为 None。
+        每个档位只放一张图。未绑定工具时用文件名顺序的第一张。绑定了工具时，
+        第一张检测失败就换目录里的下一张；全部失败则仍用第一张，测量按失败结果注入。
+        大模型看到的是转正后再缩小的 JPEG；工具测量用转正后的原尺寸。
         """
         from auto_tag.core.config import settings
 
         max_side = max(
             128, int(getattr(settings, "vlm_example_image_max_side", 512) or 512)
-        )
-        run_example_tools = bool(
-            getattr(settings, "annotation_tools_on_examples", False)
         )
         schema = cls._schema_dict_for_keys(keys)
         out: List[Tuple[str, str, str, Optional[Dict[str, Any]]]] = []
@@ -1163,49 +1192,75 @@ class VLMClient:
             examples = details.get("examples")
             if not isinstance(examples, dict) or not examples:
                 continue
+            tools = cls._question_bound_tools(details)
             for value in sorted(examples.keys(), key=_example_value_sort_key):
                 source = example_source_path(examples[value])
                 if not source:
                     continue
                 sources = [source]
+                candidates: List[str] = []
                 for src, image in iter_example_candidates(sources):
-                    if image is not None:
+                    if image is None:
+                        warn_key = f"{qkey}={value}:{src}"
+                        if warn_key not in _EXAMPLE_IMAGE_WARNED:
+                            _EXAMPLE_IMAGE_WARNED.add(warn_key)
+                            logger.warning(
+                                "Reference example source unavailable: %s=%s (path=%s)",
+                                qkey,
+                                value,
+                                src,
+                            )
                         continue
-                    warn_key = f"{qkey}={value}:{src}"
-                    if warn_key in _EXAMPLE_IMAGE_WARNED:
+                    if load_example_image_pil(image, 0) is None:
                         continue
-                    _EXAMPLE_IMAGE_WARNED.add(warn_key)
-                    logger.warning(
-                        "Reference example source unavailable: %s=%s (path=%s)",
-                        qkey,
-                        value,
-                        src,
-                    )
-
-                def _loadable(path: str, _max_side: int = max_side) -> bool:
-                    return load_example_image_base64(path, _max_side) is not None
-
-                paths, truncated = take_example_images(sources, accept=_loadable)
-                if not paths:
+                    candidates.append(image)
+                chosen = cls._choose_reference_candidate(
+                    qkey, str(value), candidates, details, bool(tools)
+                )
+                if chosen is None:
                     continue
-                if truncated:
-                    logger.info(
-                        "Reference examples for %s=%s capped at %d images; extra files ignored",
-                        qkey,
-                        value,
-                        EXAMPLE_IMAGES_PER_VALUE,
-                    )
-                for path in paths:
+                path, tool_results = chosen
+                # 勾选了标注工具时，参考图对大模型的作用有限，长宽各缩为一半。
+                # 未勾选时仍按最长边上限缩放。
+                if tools:
+                    b64 = load_example_image_base64(path, 0, half=True)
+                else:
                     b64 = load_example_image_base64(path, max_side)
-                    if not b64:
-                        continue
-                    tool_results = None
-                    if run_example_tools:
-                        tool_results = cls._example_tool_results(
-                            path, max_side, details
-                        )
-                    out.append((qkey, str(value), b64, tool_results))
+                if not b64:
+                    continue
+                out.append((qkey, str(value), b64, tool_results))
         return out
+
+    @classmethod
+    def _choose_reference_candidate(
+        cls,
+        qkey: str,
+        value: str,
+        candidates: List[str],
+        details: Dict[str, Any],
+        use_tools: bool,
+    ) -> Optional[Tuple[str, Optional[Dict[str, Any]]]]:
+        """选出这一档实际使用的一张参考图及其工具测量。"""
+        if not candidates:
+            return None
+        if not use_tools:
+            return candidates[0], None
+        first_path = candidates[0]
+        first_tools = cls._example_tool_results(first_path, details)
+        if reference_detection_ok(first_tools):
+            return first_path, first_tools
+        for path in candidates[1:]:
+            tools = cls._example_tool_results(path, details)
+            if reference_detection_ok(tools):
+                logger.info(
+                    "Reference example detection fallback: %s=%s %s -> %s",
+                    qkey,
+                    value,
+                    os.path.basename(first_path),
+                    path,
+                )
+                return path, tools
+        return first_path, first_tools
 
     @staticmethod
     def _examples_have_measurements(
@@ -1217,23 +1272,23 @@ class VLMClient:
     def _example_tool_results(
         cls,
         path: str,
-        max_side: int,
         details: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        """对样图执行其绑定工具（结果按路径+mtime+工具签名缓存）。
+        """对转正后的原尺寸样图执行其绑定工具（结果按路径+mtime+工具签名缓存）。
 
         剔除纯失败条目后仍无可用结果时返回 None；任何异常静默降级为仅注入样图。
+        缩放不发生在这里，只发生在送给大模型的 JPEG。
         """
         tools = cls._question_bound_tools(details)
         if not tools:
             return None
-        key = (*_example_cache_key(path, max_side), ",".join(tools))
+        key = (*_example_cache_key(path, 0), ",".join(tools))
         with _EXAMPLE_IMAGE_CACHE_LOCK:
             if key in _EXAMPLE_TOOL_RESULTS_CACHE:
                 return _EXAMPLE_TOOL_RESULTS_CACHE[key]
         results: Optional[Dict[str, Any]] = None
         try:
-            pil = load_example_image_pil(path, max_side)
+            pil = load_example_image_pil(path, 0)
             if pil is not None:
                 from auto_tag.core.annotation_tools import run_tools_for_image
 
