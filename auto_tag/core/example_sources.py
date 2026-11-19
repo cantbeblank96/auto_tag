@@ -10,7 +10,10 @@ from __future__ import annotations
 import os
 from typing import Any, Callable, Iterator, List, Optional, Sequence, Tuple
 
-from auto_tag.core.utils.path_utils import normalize_fs_path
+from auto_tag.core.utils.path_utils import (
+    normalize_fs_path,
+    windows_drive_path_to_posix_mount,
+)
 
 # 能作为 VLM 参考图直接打开的常见图片。原始 YUV 需要宽高，不在此列。
 EXAMPLE_IMAGE_SUFFIXES = (
@@ -27,12 +30,17 @@ EXAMPLE_IMAGE_SUFFIXES = (
 def resolve_example_path(path: str) -> str:
     """解析样图路径：绝对路径直接用；相对路径基于 config.json 所在目录。
 
-    随后按当前系统规范化（Windows 盘符与 /mnt/<盘> 互转）。
+    Linux/WSL 上 ``os.path.isabs("D:\\\\foo")`` 为假。盘符路径先转成
+    ``/mnt/<盘>/foo``，再判断要不要拼到配置目录，避免变成
+    ``<配置目录>/D:\\foo``。最后按当前系统规范化（Windows 盘符与 /mnt/<盘> 互转）。
     """
     raw = str(path or "").strip()
     if not raw:
         return ""
     p = os.path.expanduser(raw)
+    converted = windows_drive_path_to_posix_mount(p)
+    if converted is not None:
+        p = converted
     if not os.path.isabs(p):
         from auto_tag.core.config import config_json_path
 

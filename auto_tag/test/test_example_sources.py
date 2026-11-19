@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from auto_tag.core.example_sources import (
     example_source_path,
     planned_example_rows,
+    resolve_example_path,
     take_example_images,
 )
 
@@ -47,6 +50,41 @@ class TestPlannedExampleRows(unittest.TestCase):
         self.assertEqual(rows[0][1], "2.5")
         self.assertEqual([os.path.basename(p) for p in rows[0][3]], ["a.jpg"])
         self.assertEqual([os.path.basename(p) for p in rows[1][3]], ["one.png"])
+
+
+class TestResolveExamplePath(unittest.TestCase):
+    def test_windows_drive_converts_before_config_join_on_linux(self) -> None:
+        with mock.patch.object(sys, "platform", "linux"), \
+                mock.patch("os.path.realpath", side_effect=lambda p: p), \
+                mock.patch("os.path.abspath", side_effect=lambda p: p):
+            back = resolve_example_path(r"D:\dev\sample_image\indoor")
+            forward = resolve_example_path("D:/dev/sample_image/indoor")
+        self.assertEqual(back, "/mnt/d/dev/sample_image/indoor")
+        self.assertEqual(forward, "/mnt/d/dev/sample_image/indoor")
+
+    def test_windows_drive_directory_is_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            _touch(os.path.join(root, "a.jpg"))
+            with mock.patch(
+                "auto_tag.core.example_sources.windows_drive_path_to_posix_mount",
+                return_value=root,
+            ):
+                chosen, truncated = take_example_images(
+                    [r"D:\dev\sample_image\indoor"]
+                )
+        self.assertEqual([os.path.basename(p) for p in chosen], ["a.jpg"])
+        self.assertFalse(truncated)
+
+    def test_relative_path_still_joins_config_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            image = os.path.join(root, "only.jpg")
+            _touch(image)
+            with mock.patch(
+                "auto_tag.core.config.config_json_path",
+                os.path.join(root, "config.json"),
+            ):
+                got = resolve_example_path("only.jpg")
+        self.assertEqual(os.path.realpath(got), os.path.realpath(image))
 
 
 class TestTakeExampleImages(unittest.TestCase):
