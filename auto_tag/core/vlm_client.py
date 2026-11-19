@@ -14,7 +14,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from PIL import Image
 
@@ -75,6 +75,8 @@ _EXAMPLE_TOOL_RESULTS_CACHE: Dict[Tuple, Optional[Dict[str, Any]]] = {}
 _EXAMPLE_IMAGE_CACHE_LOCK = threading.Lock()
 # 缺失样图告警去重：每路径仅告警一次，避免大批量任务刷屏
 _EXAMPLE_IMAGE_WARNED: set = set()
+# 参考图注入策略日志去重：每个档位只记一次
+_EXAMPLE_POLICY_LOGGED: set = set()
 
 
 def _example_cache_key(path: str, max_side: int, half: bool = False) -> Tuple[str, float, int, int]:
@@ -146,6 +148,31 @@ def load_example_image_base64(
     with _EXAMPLE_IMAGE_CACHE_LOCK:
         _EXAMPLE_IMAGE_CACHE[key] = b64
     return b64
+
+
+def reference_payload_for_vlm(
+    tool_names: Sequence[str],
+    original_b64: str,
+    tool_results: Optional[Dict[str, Any]],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
+    """决定这一档参考图实际送给大模型的内容。
+
+    未绑定工具时上传参考原图。绑定了工具时不上传参考原图，只上传工具结果。
+    其中 face_crop 保留裁剪图，用来替代参考原图；其它工具去掉裁剪图，只留 JSON。
+    """
+    names = [str(name) for name in (tool_names or []) if name]
+    if not names:
+        return original_b64, None
+    if not tool_results:
+        return "", None
+    keep_crops = "face_crop" in names
+    cleaned: Dict[str, Any] = {}
+    for name, payload in tool_results.items():
+        if isinstance(payload, dict) and not keep_crops:
+            cleaned[name] = {k: v for k, v in payload.items() if k != "_images"}
+        else:
+            cleaned[name] = payload
+    return "", cleaned or None
 
 
 def reference_detection_ok(results: Optional[Dict[str, Any]]) -> bool:
@@ -639,25 +666,37 @@ class VLMClient:
                 content.append(
                     {"type": "text", "text": f"[Reference example: {example_label}]"}
                 )
-                content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    }
-                )
-                # 样图工具测量结果：问题配置了 examples 且绑定了工具时自动产出，
-                # 紧随对应样图之后注入，供模型与待标注图的工具结果对比校准
+                # 未绑定工具时这里是参考原图。绑定工具后原图不上传，b64 为空。
+                if b64:
+                    content.append(
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                        }
+                    )
+                # 样图工具测量结果紧随该档说明之后。face_crop 的裁剪图从 _images 取出，
+                # 替代参考原图；其它工具只保留 JSON。
                 if ex_tools:
                     for tool_name, result in ex_tools.items():
                         payload = dict(result) if isinstance(result, dict) else {"result": result}
                         ex_images = payload.pop("_images", None) or []
+                        if b64:
+                            measured_on = (
+                                f"of the reference example above ({example_label})"
+                            )
+                        elif ex_images:
+                            measured_on = (
+                                f"for reference value {example_label}; the cropped "
+                                "face below replaces the original reference photo"
+                            )
+                        else:
+                            measured_on = f"for reference value {example_label}"
                         content.append(
                             {
                                 "type": "text",
                                 "text": (
                                     f"[Reference measurement: {tool_name}] objective "
-                                    f"measurements of the reference example above "
-                                    f"({example_label}):\n"
+                                    f"measurements {measured_on}:\n"
                                     + json.dumps(payload, ensure_ascii=False)
                                 ),
                             }
@@ -1175,9 +1214,10 @@ class VLMClient:
     ) -> List[Tuple[str, str, str, Optional[Dict[str, Any]]]]:
         """从 questions 的 examples 字段收集 (维度, 档位值, base64, 样图工具测量结果)。
 
-        每个档位只放一张图。未绑定工具时用文件名顺序的第一张。绑定了工具时，
-        第一张检测失败就换目录里的下一张；全部失败则仍用第一张，测量按失败结果注入。
-        大模型看到的是转正后再缩小的 JPEG；工具测量用转正后的原尺寸。
+        每个档位只选一张候选。未绑定工具时上传这张参考原图。绑定了工具时不上传
+        参考原图，只上传工具结果；face_crop 额外上传裁剪图，替代参考原图。
+        检测失败会换目录里的下一张；全部失败则仍用第一张的工具结果。
+        未绑定工具的参考原图按最长边上限缩放。工具测量用转正后的原尺寸。
         """
         from auto_tag.core.config import settings
 
@@ -1220,15 +1260,31 @@ class VLMClient:
                 if chosen is None:
                     continue
                 path, tool_results = chosen
-                # 勾选了标注工具时，参考图对大模型的作用有限，长宽各缩为一半。
-                # 未勾选时仍按最长边上限缩放。
                 if tools:
-                    b64 = load_example_image_base64(path, 0, half=True)
-                else:
-                    b64 = load_example_image_base64(path, max_side)
+                    _b64, rendered = reference_payload_for_vlm(
+                        tools, "", tool_results
+                    )
+                    if not rendered:
+                        continue
+                    policy_key = f"{qkey}={value}"
+                    if policy_key not in _EXAMPLE_POLICY_LOGGED:
+                        _EXAMPLE_POLICY_LOGGED.add(policy_key)
+                        if "face_crop" in tools:
+                            logger.info(
+                                "参考档 %s=%s 使用裁剪图替代原图", qkey, value
+                            )
+                        else:
+                            logger.info(
+                                "参考档 %s=%s 只注入工具结果，不上传参考原图",
+                                qkey,
+                                value,
+                            )
+                    out.append((qkey, str(value), "", rendered))
+                    continue
+                b64 = load_example_image_base64(path, max_side)
                 if not b64:
                     continue
-                out.append((qkey, str(value), b64, tool_results))
+                out.append((qkey, str(value), b64, None))
         return out
 
     @classmethod

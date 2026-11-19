@@ -12,6 +12,7 @@ from auto_tag.core.vlm_client import (
     VLMClient,
     load_example_image_pil,
     reference_detection_ok,
+    reference_payload_for_vlm,
 )
 
 
@@ -109,6 +110,76 @@ class TestReferenceFallback(unittest.TestCase):
                 False,
             )
         self.assertEqual(chosen, ("/tmp/a.jpg", None))
+
+
+def _image_count(content: list) -> int:
+    return sum(1 for part in content if part.get("type") == "image_url")
+
+
+class TestReferencePayload(unittest.TestCase):
+    def test_unbound_question_keeps_the_original_photo(self) -> None:
+        b64, tools = reference_payload_for_vlm([], "orig", None)
+        self.assertEqual(b64, "orig")
+        self.assertIsNone(tools)
+
+    def test_bound_tool_drops_the_original_and_any_crop(self) -> None:
+        b64, tools = reference_payload_for_vlm(
+            ["face_detect"],
+            "orig",
+            {"face_detect": {"face_count": 1, "height_ratio": 0.4, "_images": ["crop"]}},
+        )
+        self.assertEqual(b64, "")
+        assert tools is not None
+        self.assertNotIn("_images", tools["face_detect"])
+        self.assertEqual(tools["face_detect"]["height_ratio"], 0.4)
+
+    def test_face_crop_keeps_only_the_cropped_photo(self) -> None:
+        b64, tools = reference_payload_for_vlm(
+            ["face_crop"],
+            "orig",
+            {"face_crop": {"face_count": 1, "_images": ["crop-a"]}},
+        )
+        self.assertEqual(b64, "")
+        assert tools is not None
+        self.assertEqual(tools["face_crop"]["_images"], ["crop-a"])
+
+    def test_message_uploads_crop_instead_of_reference_original(self) -> None:
+        client = VLMClient.__new__(VLMClient)
+        target = Image.new("RGB", (8, 8), (1, 2, 3))
+        messages = client._messages_with_image(
+            target,
+            "prompt",
+            examples=[
+                (
+                    "eyewear",
+                    "1",
+                    "",
+                    {"face_attribute": {"glasses": "yes"}},
+                ),
+                (
+                    "makeup",
+                    "1",
+                    "",
+                    {"face_crop": {"face_count": 1, "_images": ["crop-b64"]}},
+                ),
+                ("hairstyle", "long", "original-b64", None),
+            ],
+        )
+        content = messages[0]["content"]
+        urls = [
+            part["image_url"]["url"]
+            for part in content
+            if part.get("type") == "image_url"
+        ]
+        self.assertEqual(_image_count(content), 3)
+        self.assertIn("crop-b64", urls[0])
+        self.assertIn("original-b64", urls[1])
+        self.assertNotIn("orig-should-be-absent", "".join(urls))
+        text = "\n".join(
+            part.get("text", "") for part in content if part.get("type") == "text"
+        )
+        self.assertIn("[Reference measurement: face_attribute]", text)
+        self.assertIn("[Reference crop: face_crop face #1]", text)
 
 
 if __name__ == "__main__":
