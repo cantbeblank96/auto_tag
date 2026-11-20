@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 from PIL import Image
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from auto_tag.core.vlm_timing_collector import record as timing_record
 from auto_tag.core.vlm_timing_collector import is_enabled as timing_enabled
@@ -206,6 +205,108 @@ def _example_value_sort_key(value: Any) -> Tuple[int, float, str]:
 class AllModelsFailedError(Exception):
     """所有模型均失败时抛出。"""
     pass
+
+
+class VLMNoFailoverError(Exception):
+    """商汤限流或图片检查暂时失败。已经等待并重试过一次，不再换端点重打。"""
+    pass
+
+
+class PostPacer:
+    """所有 worker 共用的 POST 节流。
+
+    两次请求至少隔开 interval 秒。冷却时间被抬高后，下一次发送要等到冷却结束。
+    """
+
+    def __init__(self) -> None:
+        self.cooldown_until = 0.0
+        self.next_post_at = 0.0
+        self._lock = threading.Lock()
+
+    def wait_turn(
+        self,
+        *,
+        enabled: bool,
+        interval: float,
+        clock,
+        sleep,
+    ) -> None:
+        if not enabled:
+            return
+        gap = max(0.0, float(interval))
+        while True:
+            with self._lock:
+                now = float(clock())
+                ready = max(self.cooldown_until, self.next_post_at)
+                if now >= ready:
+                    self.next_post_at = now + gap
+                    return
+                delay = ready - now
+            sleep(delay)
+
+    def arm_cooldown(self, seconds: float, clock) -> float:
+        wait = max(0.0, float(seconds))
+        with self._lock:
+            until = max(self.cooldown_until, float(clock()) + wait)
+            self.cooldown_until = until
+            return until
+
+
+_POST_PACER = PostPacer()
+
+
+def reset_vlm_post_pacer_for_tests() -> None:
+    global _POST_PACER
+    _POST_PACER = PostPacer()
+
+
+def _is_sensenova_model(model: Dict[str, Any]) -> bool:
+    blob = " ".join(
+        str(model.get(key) or "")
+        for key in ("base_url", "name")
+    ).lower()
+    return "sensenova" in blob
+
+
+def _http_status(exc: BaseException) -> Optional[int]:
+    resp = getattr(exc, "response", None)
+    if resp is None and len(getattr(exc, "args", ())) > 1:
+        resp = exc.args[1]
+    code = getattr(resp, "status_code", None)
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    resp = getattr(exc, "response", None)
+    if resp is None and len(getattr(exc, "args", ())) > 1:
+        resp = exc.args[1]
+    headers = getattr(resp, "headers", None) or {}
+    raw = headers.get("retry-after") or headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_inspection_internal(text: str) -> bool:
+    lowered = (text or "").lower()
+    return "nova inspection" in lowered or (
+        "inspection failed" in lowered and "internal" in lowered
+    )
+
+
+def _pace_settings() -> Tuple[float, float, float]:
+    from auto_tag.core.config import settings as _settings
+
+    interval = float(getattr(_settings, "vlm_min_post_interval_seconds", 3) or 3)
+    cooldown = float(getattr(_settings, "vlm_rate_limit_cooldown_seconds", 20) or 20)
+    inspection = float(getattr(_settings, "vlm_inspection_retry_seconds", 15) or 15)
+    return max(0.0, interval), max(1.0, cooldown), max(1.0, inspection)
 
 
 class EmptyVLMResponseError(Exception):
@@ -523,6 +624,16 @@ class VLMClient:
                 result = self._call_single_model(model, image, profile=profile)
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
+            except VLMNoFailoverError as e:
+                logger.warning(
+                    "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                    endpoint_id,
+                    model.get("name"),
+                    e,
+                )
+                raise AllModelsFailedError(
+                    f"All models failed. Last error: {e}"
+                ) from e
             except Exception as e:
                 self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
@@ -550,6 +661,16 @@ class VLMClient:
                 )
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
+            except VLMNoFailoverError as e:
+                logger.warning(
+                    "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                    endpoint_id,
+                    model.get("name"),
+                    e,
+                )
+                raise AllModelsFailedError(
+                    f"All models failed for subset. Last error: {e}"
+                ) from e
             except Exception as e:
                 self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
@@ -587,6 +708,14 @@ class VLMClient:
             result = self._call_single_model(model, image, profile=profile)
             self.circuit_breaker.record_success(endpoint_id)
             return result
+        except VLMNoFailoverError as e:
+            logger.warning(
+                "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                endpoint_id,
+                model.get("name"),
+                e,
+            )
+            raise AllModelsFailedError(f"All models failed. Last error: {e}") from e
         except Exception as e:
             self.circuit_breaker.record_failure(endpoint_id, str(e))
             logger.warning(
@@ -614,6 +743,16 @@ class VLMClient:
             )
             self.circuit_breaker.record_success(endpoint_id)
             return result
+        except VLMNoFailoverError as e:
+            logger.warning(
+                "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                endpoint_id,
+                model.get("name"),
+                e,
+            )
+            raise AllModelsFailedError(
+                f"All models failed for subset. Last error: {e}"
+            ) from e
         except Exception as e:
             self.circuit_breaker.record_failure(endpoint_id, str(e))
             logger.warning(
@@ -859,15 +998,6 @@ class VLMClient:
         except Exception as e:
             logger.debug("validation chain dump failed: %s", e)
 
-    @retry(
-        stop=stop_after_attempt(4),
-        # 指数退让：2s → 4s → 8s（上限 60s），避免等间隔重试加剧服务端压力
-        wait=wait_exponential(multiplier=2, min=2, max=60),
-        retry=retry_if_exception_type(httpx.HTTPError),
-        before_sleep=lambda rs: logger.warning(
-            f"VLM API network error, retrying in {rs.next_action.sleep}s..."
-        ),
-    )
     def _chat_raw(
         self,
         model: Dict[str, Any],
@@ -875,64 +1005,115 @@ class VLMClient:
         *,
         profile: Optional["PipelineProfile"] = None,
     ) -> Tuple[str, str]:
-        """单次 HTTP 往返，仅在网络错误时重试；不在此处解析 JSON。返回 (content, finish_reason)。"""
+        """单次 HTTP 往返。返回 (content, finish_reason)。
+
+        商汤请求先排队：两次 POST 至少隔开配置的间隔，429 时整池冷却后再重试一次。
+        图片检查服务的 400 Internal 只再试一次。其它网络错误仍按 2/4/8 秒最多重试 4 次。
+        """
         import time as _time
 
-        if timing_enabled():
-            timing_record(
-                "http_start",
-                thread=__import__("threading").current_thread().name,
-                msg_count=len(messages),
-            )
         from auto_tag.core.config import settings as _settings
 
+        sensenova = _is_sensenova_model(model)
+        interval, cooldown, inspection_pause = _pace_settings()
         http_timeout = float(getattr(_settings, "vlm_http_timeout", 60) or 60)
         http_timeout = max(5.0, min(600.0, http_timeout))
-        # 未显式配置时，max_tokens 为模型输出上限的 1/4。
         max_tokens = resolve_max_tokens_for_model(model)
-        t0 = _time.perf_counter()
+        network_attempt = 0
+        rate_retried = False
+        inspection_retried = False
         thread_name = __import__("threading").current_thread().name
-        try:
-            resp = openai_chat_completion(
-                model=model["name"],
-                messages=messages,
-                api_key=model.get("api_key"),
-                base_url=model.get("base_url"),
-                response_format={"type": "json_object"},
-                max_tokens=max_tokens,
-                timeout=http_timeout,
-            )
-        except Exception as e:
-            elapsed = round(_time.perf_counter() - t0, 3)
-            logger.warning(
-                "VLM HTTP call failed after %.1fs: %s: %s",
-                elapsed,
-                type(e).__name__,
-                str(e)[:300],
+
+        while True:
+            _POST_PACER.wait_turn(
+                enabled=sensenova,
+                interval=interval,
+                clock=_time.monotonic,
+                sleep=_time.sleep,
             )
             if timing_enabled():
                 timing_record(
-                    "http_failed",
+                    "http_start",
                     thread=thread_name,
-                    elapsed_s=elapsed,
-                    error_type=type(e).__name__,
-                    error=str(e)[:300],
                     msg_count=len(messages),
                 )
-            raise
-        elapsed = round(_time.perf_counter() - t0, 3)
-        content = _extract_content(resp)
-        finish_reason = _extract_finish_reason(resp)
-        if timing_enabled():
-            timing_record(
-                "http_done",
-                thread=thread_name,
-                elapsed_s=elapsed,
-                resp_chars=len(content),
-            )
-        if profile is not None:
-            profile.increment("vlm_http_calls")
-        return content, finish_reason
+            t0 = _time.perf_counter()
+            try:
+                resp = openai_chat_completion(
+                    model=model["name"],
+                    messages=messages,
+                    api_key=model.get("api_key"),
+                    base_url=model.get("base_url"),
+                    response_format={"type": "json_object"},
+                    max_tokens=max_tokens,
+                    timeout=http_timeout,
+                )
+            except Exception as e:
+                elapsed = round(_time.perf_counter() - t0, 3)
+                logger.warning(
+                    "VLM HTTP call failed after %.1fs: %s: %s",
+                    elapsed,
+                    type(e).__name__,
+                    str(e)[:300],
+                )
+                if timing_enabled():
+                    timing_record(
+                        "http_failed",
+                        thread=thread_name,
+                        elapsed_s=elapsed,
+                        error_type=type(e).__name__,
+                        error=str(e)[:300],
+                        msg_count=len(messages),
+                    )
+                if sensenova and isinstance(e, httpx.HTTPStatusError):
+                    status = _http_status(e)
+                    text = str(e)
+                    if status == 429:
+                        wait = _retry_after_seconds(e) or cooldown
+                        _POST_PACER.arm_cooldown(wait, _time.monotonic)
+                        if rate_retried:
+                            raise VLMNoFailoverError(
+                                f"SenseNova 429 after cooldown: {text[:240]}"
+                            ) from e
+                        rate_retried = True
+                        logger.warning(
+                            "SenseNova 429，整池冷却 %.0f 秒后重试一次", wait
+                        )
+                        continue
+                    if status == 400 and _is_inspection_internal(text):
+                        if inspection_retried:
+                            raise VLMNoFailoverError(
+                                f"SenseNova image inspection failed again: {text[:240]}"
+                            ) from e
+                        inspection_retried = True
+                        _POST_PACER.arm_cooldown(inspection_pause, _time.monotonic)
+                        logger.warning(
+                            "SenseNova 图片检查内部错误，暂停 %.0f 秒后重试一次",
+                            inspection_pause,
+                        )
+                        continue
+                if isinstance(e, httpx.HTTPError) and network_attempt < 3:
+                    network_attempt += 1
+                    delay = min(60.0, float(2 ** network_attempt))
+                    logger.warning(
+                        "VLM API network error, retrying in %.1fs...", delay
+                    )
+                    _time.sleep(delay)
+                    continue
+                raise
+            elapsed = round(_time.perf_counter() - t0, 3)
+            content = _extract_content(resp)
+            finish_reason = _extract_finish_reason(resp)
+            if timing_enabled():
+                timing_record(
+                    "http_done",
+                    thread=thread_name,
+                    elapsed_s=elapsed,
+                    resp_chars=len(content),
+                )
+            if profile is not None:
+                profile.increment("vlm_http_calls")
+            return content, finish_reason
 
     def _annotate_via_conversation(
         self,

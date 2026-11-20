@@ -44,6 +44,39 @@ def _job_cluster() -> str:
 _SENTINEL = object()
 
 
+class ConcurrencyRamp:
+    """开工时只放 1 路标注，每成功 1 张再加 1 路，直到配置的并发上限。"""
+
+    def __init__(self, maximum: int) -> None:
+        self.maximum = max(1, int(maximum))
+        self.limit = 1
+        self.inflight = 0
+        self._stopped = False
+        self._cv = threading.Condition()
+
+    def acquire(self) -> None:
+        with self._cv:
+            while not self._stopped and self.inflight >= self.limit:
+                self._cv.wait(timeout=0.5)
+            self.inflight += 1
+
+    def release(self, success: bool) -> int:
+        with self._cv:
+            self.inflight = max(0, self.inflight - 1)
+            if success and self.limit < self.maximum:
+                self.limit += 1
+                logger.info(
+                    "VLM 并发坡度升至 %d/%d", self.limit, self.maximum
+                )
+            self._cv.notify_all()
+            return self.limit
+
+    def stop(self) -> None:
+        with self._cv:
+            self._stopped = True
+            self._cv.notify_all()
+
+
 @dataclass(frozen=True)
 class AnnotationJob:
     """待 VLM 标注的簇中心任务。"""
@@ -135,6 +168,7 @@ class VlmAnnotationPool:
         self._in_flight_lock = threading.Lock()
         self._stopped = False
         self._workers = max(1, int(getattr(settings, "vlm_concurrency", 1) or 1))
+        self._ramp = ConcurrencyRamp(self._workers)
 
     def start(self) -> None:
         """启动 worker 线程池。"""
@@ -191,6 +225,7 @@ class VlmAnnotationPool:
     def shutdown(self, *, wait: bool = True, cancel_pending: bool = False) -> None:
         """关闭 worker 池。"""
         self._stopped = True
+        self._ramp.stop()
         if cancel_pending:
             while True:
                 try:
@@ -260,9 +295,15 @@ class VlmAnnotationPool:
                     thread=thread_name,
                 )
                 vlm_t0 = time.perf_counter()
-                with prof.span_wall("vlm_annotate"):
-                    with prof.span("vlm_annotate_thread"):
-                        labels_dict = self.vlm.annotate_image(img, profile=prof)
+                self._ramp.acquire()
+                annotate_ok = False
+                try:
+                    with prof.span_wall("vlm_annotate"):
+                        with prof.span("vlm_annotate_thread"):
+                            labels_dict = self.vlm.annotate_image(img, profile=prof)
+                    annotate_ok = isinstance(labels_dict, dict) and bool(labels_dict)
+                finally:
+                    self._ramp.release(annotate_ok)
                 timing_record(
                     "job_vlm_done",
                     cluster_id=job.cluster_id,

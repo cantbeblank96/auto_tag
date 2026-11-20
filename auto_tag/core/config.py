@@ -175,6 +175,18 @@ class Settings(BaseSettings):
         default=max(1, min(32, int(cfg.get("vlm_concurrency", 3) or 3))),
         description="Max parallel VLM annotate workers for the global annotation pool (1=sequential)",
     )
+    vlm_min_post_interval_seconds: float = Field(
+        default=max(0.0, float(cfg.get("vlm_min_post_interval_seconds", 3) or 3)),
+        description="SenseNova：两次 chat/completions POST 的最小间隔秒数",
+    )
+    vlm_rate_limit_cooldown_seconds: float = Field(
+        default=max(1.0, float(cfg.get("vlm_rate_limit_cooldown_seconds", 20) or 20)),
+        description="SenseNova 429 且响应没有 Retry-After 时，整池冷却秒数",
+    )
+    vlm_inspection_retry_seconds: float = Field(
+        default=max(1.0, float(cfg.get("vlm_inspection_retry_seconds", 15) or 15)),
+        description="SenseNova 图片检查 400 Internal 后，整池暂停再重试一次的秒数",
+    )
     vlm_http_timeout: float = Field(
         default=max(5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))),
         description="VLM HTTP read timeout in seconds (httpx)",
@@ -278,6 +290,15 @@ def reload_settings_from_disk() -> None:
         "vlm_models": _cfg_vlm_models(),
         "vlm_strategy": str(cfg.get("vlm_strategy", "round_robin")),
         "vlm_concurrency": max(1, min(32, int(cfg.get("vlm_concurrency", 3) or 3))),
+        "vlm_min_post_interval_seconds": max(
+            0.0, float(cfg.get("vlm_min_post_interval_seconds", 3) or 3)
+        ),
+        "vlm_rate_limit_cooldown_seconds": max(
+            1.0, float(cfg.get("vlm_rate_limit_cooldown_seconds", 20) or 20)
+        ),
+        "vlm_inspection_retry_seconds": max(
+            1.0, float(cfg.get("vlm_inspection_retry_seconds", 15) or 15)
+        ),
         "vlm_http_timeout": max(
             5.0, min(600.0, float(cfg.get("vlm_http_timeout", 60) or 60))
         ),
