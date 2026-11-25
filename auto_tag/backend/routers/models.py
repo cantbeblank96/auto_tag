@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field
 
 from auto_tag.core.config import settings, _AUTO_TAG_DIR
 from auto_tag.core.circuit_breaker import get_circuit_breaker, CircuitBreakerConfig
+from auto_tag.core.vlm_client import chat_template_kwargs_for, is_local_deployment
 from auto_tag.core.vlm_model_utils import vlm_model_endpoint_id
 from auto_tag.core.vlm_endpoint_stats_store import merge_endpoint_stats_for_api
 
@@ -75,11 +76,16 @@ def _run_connectivity_test(model_cfg: Dict[str, Any]) -> Dict[str, Any]:
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    local = is_local_deployment(model_cfg)
     body = {
         "model": model_name,
         "messages": [{"role": "user", "content": "Hello, reply with a single word: ok"}],
-        "max_tokens": 10,
+        # 本地 Qwen 开着思考时，过小的 max_tokens 会让 vLLM 直接 500。
+        "max_tokens": 64 if local else 10,
     }
+    template_kwargs = chat_template_kwargs_for(model_cfg)
+    if template_kwargs:
+        body["chat_template_kwargs"] = template_kwargs
 
     start = time.time()
     try:
@@ -135,6 +141,7 @@ def list_models() -> Dict[str, Any]:
             "api_key": m.get("api_key", ""),
             "priority": int(m.get("priority", 99)),
             "enabled": m.get("enabled", True),
+            "deployment": "local" if is_local_deployment(m) else "cloud",
             "tripped": st.get("tripped", False),
             "tripped_until": st.get("tripped_until", 0),
             "failures_in_window": st.get("failures_in_window", 0),
@@ -200,6 +207,8 @@ class ModelTestBody(BaseModel):
     base_url: Optional[str] = None
     api_key: Optional[str] = ""
     priority: Optional[int] = None
+    deployment: Optional[str] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
 @router.post("/test")
@@ -211,6 +220,8 @@ def test_model_connectivity(body: ModelTestBody) -> Dict[str, Any]:
         "base_url": body.base_url,
         "api_key": body.api_key or "",
         "priority": body.priority,
+        "deployment": body.deployment,
+        "chat_template_kwargs": body.chat_template_kwargs,
     }
     if not str(body.name or "").strip():
         return {"ok": False, "error": "模型名称不能为空"}

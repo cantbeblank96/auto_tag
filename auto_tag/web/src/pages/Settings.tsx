@@ -30,6 +30,8 @@ interface AnnotationToolStatus {
 interface ModelEntry {
   id: string
   name: string; base_url: string | null; api_key: string; priority: number; enabled?: boolean
+  deployment?: 'local' | 'cloud'
+  chat_template_kwargs?: Record<string, unknown>
   max_tokens?: string
   tripped?: boolean; failures_in_window?: number; total_calls?: number
   failure_rate?: number; last_error?: string
@@ -37,6 +39,25 @@ interface ModelEntry {
 
 function newModelId(): string {
   return crypto.randomUUID()
+}
+
+function serializeModel(m: ModelEntry) {
+  const entry: Record<string, unknown> = {
+    id: m.id,
+    name: m.name,
+    base_url: m.base_url,
+    api_key: m.api_key,
+    priority: m.priority,
+    enabled: m.enabled,
+    max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== ''
+      ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null
+      : null,
+  }
+  if (m.deployment === 'local') entry.deployment = 'local'
+  if (m.chat_template_kwargs && Object.keys(m.chat_template_kwargs).length > 0) {
+    entry.chat_template_kwargs = m.chat_template_kwargs
+  }
+  return entry
 }
 
 function normalizeModelEntry(m: Partial<ModelEntry>, index: number): ModelEntry {
@@ -47,6 +68,10 @@ function normalizeModelEntry(m: Partial<ModelEntry>, index: number): ModelEntry 
     api_key: m.api_key || '',
     priority: m.priority ?? index + 1,
     enabled: m.enabled ?? true,
+    deployment: m.deployment === 'local' ? 'local' : 'cloud',
+    chat_template_kwargs: m.chat_template_kwargs && typeof m.chat_template_kwargs === 'object'
+      ? m.chat_template_kwargs
+      : undefined,
     max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? String(m.max_tokens) : '',
     tripped: m.tripped,
     failures_in_window: m.failures_in_window,
@@ -174,11 +199,7 @@ export default function Settings() {
       embedding_subdir: 'embedding_index',
       record_stage1_duplicates: recDup,
       duplicate_links_filename: 'duplicate_links.sqlite',
-      vlm_models: models.map(m => ({
-        id: m.id,
-        name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
-        max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
-      })),
+      vlm_models: models.map(serializeModel),
       questions: questionsObj,
       questions_editor: createQuestionsDocument(questionEntries),
       annotation_tools: annotationToolsCfg,
@@ -315,11 +336,7 @@ export default function Settings() {
           vlm_example_image_max_side: cfg.vlm_example_image_max_side ?? 512,
           annotation_tools_on_examples: questionsHaveExamples(loadedQuestionsObj),
           duplicate_links_filename: cfg.duplicate_links_filename ?? 'duplicate_links.sqlite',
-          vlm_models: loadedModels.map((m) => ({
-            id: m.id,
-            name: m.name, base_url: m.base_url, api_key: m.api_key, priority: m.priority, enabled: m.enabled,
-            max_tokens: m.max_tokens != null && String(m.max_tokens).trim() !== '' ? Math.max(1, Math.floor(Number(m.max_tokens) || 0)) || null : null,
-          })),
+          vlm_models: loadedModels.map(serializeModel),
           questions: loadedQuestionsObj,
           questions_editor: createQuestionsDocument(loadedQuestions),
           annotation_tools: rawToolsCfg,
@@ -525,6 +542,30 @@ export default function Settings() {
     }, models.length)])
     markDirty()
   }
+  const addLocalModel = () => {
+    setModels([...models, normalizeModelEntry({
+      name: 'Qwen3.5-27B',
+      base_url: null,
+      api_key: '',
+      priority: models.length + 1,
+      enabled: false,
+      deployment: 'local',
+      chat_template_kwargs: { enable_thinking: false },
+    }, models.length)])
+    markDirty()
+  }
+  const setDeployment = (idx: number, deployment: 'local' | 'cloud') => {
+    const next = [...models]
+    const cur = { ...next[idx], deployment }
+    if (deployment === 'cloud') {
+      cur.chat_template_kwargs = undefined
+    } else if (!cur.chat_template_kwargs && /qwen/i.test(cur.name || '')) {
+      cur.chat_template_kwargs = { enable_thinking: false }
+    }
+    next[idx] = cur
+    setModels(next)
+    markDirty()
+  }
   const removeModel = (idx: number) => {
     setModels(models.filter((_, i) => i !== idx).map((m, i) => ({ ...m, priority: i + 1 })))
     markDirty()
@@ -561,6 +602,8 @@ export default function Settings() {
         base_url: model.base_url,
         api_key: model.api_key,
         priority: model.priority,
+        deployment: model.deployment,
+        chat_template_kwargs: model.chat_template_kwargs,
       })
       setTestResults(p => ({ ...p, [key]: res }))
     }
@@ -601,6 +644,7 @@ export default function Settings() {
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">VLM 模型管理</h3>
             <div className="flex gap-2">
+              <button onClick={addLocalModel} className="px-3 py-1.5 text-xs border border-blue-300 text-blue-700 rounded hover:bg-blue-50 dark:border-blue-700 dark:text-blue-300 dark:hover:bg-blue-900/30">+ 本地部署</button>
               <button onClick={addModel} className="px-3 py-1.5 text-xs bg-blue-600 text-white rounded hover:bg-blue-700">+ 添加模型</button>
             </div>
           </div>
@@ -626,7 +670,10 @@ export default function Settings() {
             {models.map((m, idx) => (
               <div key={m.id} className={`border rounded-lg p-3 ${(m.enabled ?? true) ? 'border-gray-200 dark:border-gray-600 bg-gray-50 dark:bg-gray-700/50' : 'border-gray-200 dark:border-gray-700 bg-gray-100/50 dark:bg-gray-800/30 opacity-60'}`}>
                 <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-medium text-gray-500 dark:text-gray-400"># {m.priority}</span>
+                  <span className="flex items-center gap-2 text-xs font-medium text-gray-500 dark:text-gray-400">
+                    <span># {m.priority}{m.name ? ` · ${m.name}` : ''}</span>
+                    {m.deployment === 'local' && <span className="px-1.5 py-0.5 rounded-full bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300">本地部署</span>}
+                  </span>
                   <div className="flex gap-1">
                     <button onClick={() => moveModel(idx, -1)} disabled={idx === 0} className="px-2 py-0.5 text-xs border rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-30 dark:text-gray-300 dark:border-gray-600">↑</button>
                     <button onClick={() => moveModel(idx, 1)} disabled={idx === models.length - 1} className="px-2 py-0.5 text-xs border rounded hover:bg-gray-100 dark:hover:bg-gray-600 disabled:opacity-30 dark:text-gray-300 dark:border-gray-600">↓</button>
@@ -634,11 +681,24 @@ export default function Settings() {
                     <button onClick={() => removeModel(idx)} className="px-2 py-0.5 text-xs text-red-600 border border-red-200 rounded hover:bg-red-50 dark:text-red-400 dark:border-red-800 dark:hover:bg-red-900/30">删除</button>
                   </div>
                 </div>
+                {m.deployment === 'local' && (
+                  <p className="mb-2 text-xs text-indigo-600 dark:text-indigo-300">不使用商汤的请求间隔、429 冷却和图片检查暂停。地址写在 Base URL，需带 /v1。</p>
+                )}
+                {!(m.enabled ?? true) && m.base_url && (
+                  <p className="text-xs font-mono text-gray-400 truncate" title={m.base_url}>{m.base_url}</p>
+                )}
                 {(m.enabled ?? true) && (<>
                 <div className="grid grid-cols-3 gap-3">
-                  <div><label className={labelCls}>模型名称</label><input type="text" value={m.name} onChange={e => updateModel(idx, 'name', e.target.value)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder="gemini/gemini-2.5-flash" className={inputCls} /></div>
-                  <div><label className={labelCls}>Base URL（可选）</label><input type="text" value={m.base_url || ''} onChange={e => updateModel(idx, 'base_url', e.target.value || null)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder="https://..." className={inputCls} /></div>
-                  <div><label className={labelCls}>API Key</label><input type="password" value={m.api_key} onChange={e => updateModel(idx, 'api_key', e.target.value)} placeholder="your-api-key" className={inputCls} /></div>
+                  <div>
+                    <label className={labelCls}>部署方式</label>
+                    <select value={m.deployment === 'local' ? 'local' : 'cloud'} onChange={e => setDeployment(idx, e.target.value === 'local' ? 'local' : 'cloud')} className={inputCls}>
+                      <option value="cloud">云端 API</option>
+                      <option value="local">本地部署</option>
+                    </select>
+                  </div>
+                  <div><label className={labelCls}>模型名称</label><input type="text" value={m.name} onChange={e => updateModel(idx, 'name', e.target.value)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder={m.deployment === 'local' ? 'Qwen3.5-27B' : 'gemini/gemini-2.5-flash'} className={inputCls} /></div>
+                  <div><label className={labelCls}>{m.deployment === 'local' ? 'Base URL' : 'Base URL（可选）'}</label><input type="text" value={m.base_url || ''} onChange={e => updateModel(idx, 'base_url', e.target.value || null)} onBlur={() => refreshResolvedMaxOutput(models[idx])} placeholder={m.deployment === 'local' ? 'http://host:8000/v1' : 'https://...'} className={inputCls} /></div>
+                  <div className="col-span-3"><label className={labelCls}>{m.deployment === 'local' ? 'API Key（本地服务可留空）' : 'API Key'}</label><input type="password" value={m.api_key} onChange={e => updateModel(idx, 'api_key', e.target.value)} placeholder={m.deployment === 'local' ? '可留空' : 'your-api-key'} className={inputCls} /></div>
                 </div>
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <label className="text-xs text-gray-500 dark:text-gray-400">最大输出 tokens</label>

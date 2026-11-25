@@ -456,6 +456,8 @@ export const api = {
     base_url?: string | null
     api_key?: string
     priority?: number
+    deployment?: string
+    chat_template_kwargs?: Record<string, unknown>
   }) => fetchJSON<any>('/models/test', { method: 'POST', body: JSON.stringify(body) }),
   resolveMaxOutput: (body: {
     name: string

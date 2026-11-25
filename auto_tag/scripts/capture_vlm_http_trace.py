@@ -104,6 +104,7 @@ def _capturing_openai_chat_completion(
     response_format: Optional[Dict[str, str]] = None,
     max_tokens: int = 4096,
     timeout: float = 120.0,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """仅对目标线程的 HTTP 调用落盘 request/response/error。"""
     thread_name = threading.current_thread().name
@@ -121,6 +122,8 @@ def _capturing_openai_chat_completion(
     }
     if response_format:
         body["response_format"] = response_format
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
 
     attempt = 0
     if is_target:

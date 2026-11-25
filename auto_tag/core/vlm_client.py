@@ -268,6 +268,41 @@ def _is_sensenova_model(model: Dict[str, Any]) -> bool:
     return "sensenova" in blob
 
 
+def is_local_deployment(model: Dict[str, Any]) -> bool:
+    """config 里 deployment=local 的端点，例如集群上的 vLLM。"""
+    return str(model.get("deployment") or "").strip().lower() == "local"
+
+
+def model_uses_sensenova_pace(model: Dict[str, Any]) -> bool:
+    """商汤的 POST 间隔、429 冷却和图片检查暂停。本地部署不走这套限制。"""
+    if is_local_deployment(model):
+        return False
+    return _is_sensenova_model(model)
+
+
+def enabled_models_need_sensenova_pace(models: List[Dict[str, Any]]) -> bool:
+    """启用列表里只要还有商汤端点，标注池就保留开工并发坡度。"""
+    enabled = [
+        m for m in models
+        if isinstance(m, dict) and m.get("enabled") is not False
+    ]
+    return any(model_uses_sensenova_pace(m) for m in enabled)
+
+
+def chat_template_kwargs_for(model: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """转发模型条目上的 chat_template_kwargs。
+
+    本地 Qwen 默认关闭思考：思考和答案共用 max_tokens，开着思考时短回复可能空内容，
+    过小的 max_tokens 还曾让 vLLM 返回 500。
+    """
+    raw = model.get("chat_template_kwargs")
+    if isinstance(raw, dict) and raw:
+        return dict(raw)
+    if is_local_deployment(model) and "qwen" in str(model.get("name") or "").lower():
+        return {"enable_thinking": False}
+    return None
+
+
 def _http_status(exc: BaseException) -> Optional[int]:
     resp = getattr(exc, "response", None)
     if resp is None and len(getattr(exc, "args", ())) > 1:
@@ -327,6 +362,7 @@ def openai_chat_completion(
     response_format: Optional[Dict[str, str]] = None,
     max_tokens: int = 4096,
     timeout: float = 60.0,
+    chat_template_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     直接调用 OpenAI 兼容的 Chat Completions API，替代 litellm。
@@ -339,6 +375,7 @@ def openai_chat_completion(
         response_format: 响应格式（可选，如 {"type": "json_object"}）
         max_tokens: 最大 token 数
         timeout: 超时秒数
+        chat_template_kwargs: 传给兼容服务的模板参数（如 Qwen enable_thinking）
 
     Returns:
         API 响应的 JSON 字典
@@ -357,6 +394,8 @@ def openai_chat_completion(
     }
     if response_format:
         body["response_format"] = response_format
+    if chat_template_kwargs:
+        body["chat_template_kwargs"] = chat_template_kwargs
 
     logger.debug(f"POST {url} model={model}")
     with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
@@ -612,28 +651,29 @@ class VLMClient:
         self,
         image: Image.Image,
         profile: Optional["PipelineProfile"] = None,
+        skip_endpoint_ids: Optional[set] = None,
     ) -> Dict[str, Any]:
         last_error = ""
+        skipped = skip_endpoint_ids or set()
         for idx, model in enumerate(self.models):
             if not self._is_enabled(model):
                 continue
             endpoint_id = vlm_model_endpoint_id(model, idx)
-            if self.circuit_breaker.is_tripped(endpoint_id):
+            if endpoint_id in skipped or self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
                 result = self._call_single_model(model, image, profile=profile)
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
             except VLMNoFailoverError as e:
+                last_error = str(e)
                 logger.warning(
-                    "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                    "Endpoint '%s' (model=%s) 冷却后仍限流，改试下一个端点: %s",
                     endpoint_id,
                     model.get("name"),
                     e,
                 )
-                raise AllModelsFailedError(
-                    f"All models failed. Last error: {e}"
-                ) from e
+                continue
             except Exception as e:
                 self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
@@ -647,13 +687,15 @@ class VLMClient:
         image: Image.Image,
         keys: List[str],
         profile: Optional["PipelineProfile"] = None,
+        skip_endpoint_ids: Optional[set] = None,
     ) -> Dict[str, Any]:
         last_error = ""
+        skipped = skip_endpoint_ids or set()
         for idx, model in enumerate(self.models):
             if not self._is_enabled(model):
                 continue
             endpoint_id = vlm_model_endpoint_id(model, idx)
-            if self.circuit_breaker.is_tripped(endpoint_id):
+            if endpoint_id in skipped or self.circuit_breaker.is_tripped(endpoint_id):
                 continue
             try:
                 result = self._call_single_model_subset(
@@ -662,15 +704,14 @@ class VLMClient:
                 self.circuit_breaker.record_success(endpoint_id)
                 return result
             except VLMNoFailoverError as e:
+                last_error = str(e)
                 logger.warning(
-                    "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                    "Endpoint '%s' (model=%s) 冷却后仍限流，改试下一个端点: %s",
                     endpoint_id,
                     model.get("name"),
                     e,
                 )
-                raise AllModelsFailedError(
-                    f"All models failed for subset. Last error: {e}"
-                ) from e
+                continue
             except Exception as e:
                 self.circuit_breaker.record_failure(endpoint_id, str(e))
                 last_error = str(e)
@@ -710,12 +751,14 @@ class VLMClient:
             return result
         except VLMNoFailoverError as e:
             logger.warning(
-                "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                "Endpoint '%s' (model=%s) 冷却后仍限流，改试其他端点: %s",
                 endpoint_id,
                 model.get("name"),
                 e,
             )
-            raise AllModelsFailedError(f"All models failed. Last error: {e}") from e
+            return self._annotate_with_failover(
+                image, profile=profile, skip_endpoint_ids={endpoint_id}
+            )
         except Exception as e:
             self.circuit_breaker.record_failure(endpoint_id, str(e))
             logger.warning(
@@ -745,14 +788,17 @@ class VLMClient:
             return result
         except VLMNoFailoverError as e:
             logger.warning(
-                "Endpoint '%s' (model=%s) 已冷却并重试，不再换端点: %s",
+                "Endpoint '%s' (model=%s) 冷却后仍限流，改试其他端点: %s",
                 endpoint_id,
                 model.get("name"),
                 e,
             )
-            raise AllModelsFailedError(
-                f"All models failed for subset. Last error: {e}"
-            ) from e
+            return self._annotate_subset_with_failover(
+                image,
+                keys,
+                profile=profile,
+                skip_endpoint_ids={endpoint_id},
+            )
         except Exception as e:
             self.circuit_breaker.record_failure(endpoint_id, str(e))
             logger.warning(
@@ -1014,7 +1060,8 @@ class VLMClient:
 
         from auto_tag.core.config import settings as _settings
 
-        sensenova = _is_sensenova_model(model)
+        sensenova = model_uses_sensenova_pace(model)
+        template_kwargs = chat_template_kwargs_for(model)
         interval, cooldown, inspection_pause = _pace_settings()
         http_timeout = float(getattr(_settings, "vlm_http_timeout", 60) or 60)
         http_timeout = max(5.0, min(600.0, http_timeout))
@@ -1047,6 +1094,7 @@ class VLMClient:
                     response_format={"type": "json_object"},
                     max_tokens=max_tokens,
                     timeout=http_timeout,
+                    chat_template_kwargs=template_kwargs,
                 )
             except Exception as e:
                 elapsed = round(_time.perf_counter() - t0, 3)

@@ -207,6 +207,10 @@ export default function TutorialContent() {
               <li>
                 <strong>priority / enabled</strong> — Failover 顺序与是否启用
               </li>
+              <li>
+                <strong>deployment</strong> — <code className={codeCls}>local</code> 表示集群或本机上的 OpenAI 兼容服务。只改{' '}
+                <code className={codeCls}>base_url</code> 即可换地址。这类端点不使用商汤的请求间隔和冷却。
+              </li>
             </ul>
             <p>熔断器会在端点连续失败时自动暂时停用（可在「设置」中调整时间窗口与失败率阈值）。</p>
           </div>

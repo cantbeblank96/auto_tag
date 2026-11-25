@@ -63,6 +63,7 @@ def _extract_json_object(content: str) -> Dict[str, Any]:
 def analyze_tools_for_questions(body: AnalyzeBody) -> Dict[str, Any]:
     """由 VLM 分析问题定义，建议每个问题应绑定的标注工具。"""
     from auto_tag.core.vlm_client import (
+        chat_template_kwargs_for,
         openai_chat_completion,
         resolve_max_tokens_for_model,
     )
@@ -111,6 +112,7 @@ Only use tool names from the list above. Do not include any other text."""
             timeout=60,
             # 与设置页配置一致：模型条目 max_tokens > 全局 vlm_max_tokens > 模型上限的 1/4
             max_tokens=resolve_max_tokens_for_model(model),
+            chat_template_kwargs=chat_template_kwargs_for(model),
         )
     except HTTPException:
         raise

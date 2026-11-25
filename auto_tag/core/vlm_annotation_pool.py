@@ -15,7 +15,7 @@ from auto_tag.core.config import settings
 from auto_tag.core.image_load_context import ImageLoadContext
 from auto_tag.core.pipeline_profile import PipelineProfile
 from auto_tag.core.vector_db import VectorDB
-from auto_tag.core.vlm_client import VLMClient
+from auto_tag.core.vlm_client import VLMClient, enabled_models_need_sensenova_pace
 from auto_tag.core.vlm_timing_collector import record as timing_record
 
 logger = logging.getLogger(__name__)
@@ -47,9 +47,9 @@ _SENTINEL = object()
 class ConcurrencyRamp:
     """开工时只放 1 路标注，每成功 1 张再加 1 路，直到配置的并发上限。"""
 
-    def __init__(self, maximum: int) -> None:
+    def __init__(self, maximum: int, *, start_at_maximum: bool = False) -> None:
         self.maximum = max(1, int(maximum))
-        self.limit = 1
+        self.limit = self.maximum if start_at_maximum else 1
         self.inflight = 0
         self._stopped = False
         self._cv = threading.Condition()
@@ -168,7 +168,12 @@ class VlmAnnotationPool:
         self._in_flight_lock = threading.Lock()
         self._stopped = False
         self._workers = max(1, int(getattr(settings, "vlm_concurrency", 1) or 1))
-        self._ramp = ConcurrencyRamp(self._workers)
+        configured = getattr(vlm, "models", None)
+        # 启用端点全是本地部署时，不再从 1 路慢慢爬到并发上限。
+        open_full = configured is not None and not enabled_models_need_sensenova_pace(
+            list(configured)
+        )
+        self._ramp = ConcurrencyRamp(self._workers, start_at_maximum=open_full)
 
     def start(self) -> None:
         """启动 worker 线程池。"""

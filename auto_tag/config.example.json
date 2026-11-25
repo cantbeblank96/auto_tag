@@ -16,6 +16,19 @@
             "priority": 1,
             "enabled": true,
             "max_tokens": null
+        },
+        {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "name": "Qwen3.5-27B",
+            "base_url": "http://127.0.0.1:8000/v1",
+            "api_key": "",
+            "priority": 2,
+            "enabled": false,
+            "max_tokens": null,
+            "deployment": "local",
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            }
         }
     ],
     "questions": {
