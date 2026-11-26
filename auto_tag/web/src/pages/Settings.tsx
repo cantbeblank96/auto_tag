@@ -729,11 +729,24 @@ export default function Settings() {
               </div>
             ))}
           </div>
-          {models.length > 0 && (
-            <div className="mt-3">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            <button
+              onClick={async () => {
+                if (models.some(m => !String(m.name || '').trim())) {
+                  showMsg('请先填写每个模型的名称，再保存', 'error')
+                  return
+                }
+                await saveAll()
+              }}
+              className="px-4 py-2 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
+            >
+              保存 VLM 设置
+            </button>
+            <span className="text-xs text-gray-400 dark:text-gray-500">写入 config.json。下次启动会沿用这里的模型、调用策略和并发数。</span>
+            {models.length > 0 && (
               <button onClick={async () => { try { await api.resetCircuitBreaker(); showMsg('已重置所有模型熔断状态') } catch (e: any) { showMsg(`重置失败: ${e.message}`, 'error') } }} className="px-4 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700 dark:text-gray-300">重置全部熔断</button>
-            </div>
-          )}
+            )}
+          </div>
         </section>
 
         {/* ═══ 熔断参数 ═══ */}
